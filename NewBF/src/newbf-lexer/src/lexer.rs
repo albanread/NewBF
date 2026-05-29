@@ -273,6 +273,8 @@ impl Lexer<'_> {
             b'.' => {
                 if self.at(1) == b'.' && self.at(2) == b'.' {
                     tok!(3, DotDotDot)
+                } else if self.at(1) == b'.' && self.at(2) == b'<' {
+                    tok!(3, DotDotLess)
                 } else if self.at(1) == b'.' {
                     tok!(2, DotDot)
                 } else {
@@ -361,6 +363,8 @@ impl Lexer<'_> {
             b'<' => {
                 if self.at(1) == b'<' && self.at(2) == b'=' {
                     tok!(3, ShlEq)
+                } else if self.at(1) == b'=' && self.at(2) == b'>' {
+                    tok!(3, Spaceship)
                 } else if self.at(1) == b'<' {
                     tok!(2, Shl)
                 } else if self.at(1) == b'=' {

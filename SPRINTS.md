@@ -105,16 +105,28 @@ the code with attribution. Each sprint flags what is lifted vs. fresh.
 **Length:** 2 weeks · **Phase:** 1
 
 ### Deliverables
-- [ ] Pratt/precedence expression parser (operators, calls, indexers,
-      member access, `new`/`scope`/`delete` expressions, casts,
-      generics).
-- [ ] Statement parser (`if`/`while`/`for`/`switch`/`return`/`defer`/
-      blocks/locals).
-- [ ] `dump-parse` report.
+- [x] Pratt/precedence expression parser with Beef's exact precedence
+      table (grounded in `BfAst.cpp`): unary/postfix, calls, indexers,
+      member (`.`/`?.`), binary (incl. ranges `..<`/`...`, `is`/`as`,
+      `<=>`), ternary, assignment, `new`/`scope`/`delete`/`ref`/… prefix
+      forms with `:qualifier`.
+- [x] Statement parser: block, expr, empty, `var`/`let` locals, `if`/
+      `else`, `while`, `do`/`repeat`-`while`, C-style `for`, `for`-each,
+      `return`, `break`, `continue`, `defer`. Never panics (error nodes +
+      diagnostics, guaranteed progress).
+- [x] `dump-parse` report + `newbf-driver dump-parse`.
+- [x] Extensive tests: precedence/associativity matrix, per-construct
+      expr+stmt, dangling-else, error recovery, 2000-iter no-panic fuzz.
+
+**Deferred to Sprint 04** (need the type grammar / patterns): `switch`,
+typed locals (`int x = …`; only `var`/`let` for now), and
+generic-argument disambiguation in expressions (`Foo<T>(x)` — `<`/`>`
+parse as comparisons until then). NewBF also folds Beef's raw-tree →
+`BfReducer` step into a single AST-producing pass (documented divergence).
 
 ### Acceptance criteria
-- Parses the statement/expression bodies of the curated corlib subset
-  without error; `dump-parse` schema-stable.
+- [x] Expression/statement snippets parse to a schema-stable `dump-parse`
+  AST; whole-file parsing waits for declarations (Sprint 04).
 
 ### Sibling-project leverage
 - Parser scaffolding conventions from `newm2-parser`.

@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn range_and_spaceship_operators() {
+        use TokenKind::*;
+        // `..<` (exclusive range), `...` (closed range), `<=>` (compare)
+        // must each be single maximal-munch tokens — distinct from `..`,
+        // `<=`/`<`/`>`. These feed the Beef precedence table (range=8,
+        // compare=6).
+        assert_eq!(
+            kinds("..< ... <=> <= < > .."),
+            [DotDotLess, DotDotDot, Spaceship, Le, Lt, Gt, DotDot]
+        );
+        assert_eq!(kinds("0..<10"), [Int, DotDotLess, Int]);
+        assert_eq!(kinds("0...10"), [Int, DotDotDot, Int]);
+    }
+
+    #[test]
     fn destructor_tilde_this() {
         use Keyword::This;
         use TokenKind::{Keyword as K, Tilde};

@@ -156,7 +156,8 @@ pub enum TokenKind {
     Comma,
     Dot,
     DotDot,
-    DotDotDot,
+    DotDotDot,  // ... (closed/inclusive range)
+    DotDotLess, // ..< (half-open/exclusive range)
     Colon,
     ColonColon,
     Question,
@@ -195,6 +196,7 @@ pub enum TokenKind {
     Gt,
     Le,
     Ge,
+    Spaceship, // <=> (three-way compare)
     AmpAmp,
     PipePipe,
     Shl,

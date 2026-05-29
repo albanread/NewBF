@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 newbf-lexer.workspace = true
+newbf-parser.workspace = true
 
 [lints]
 workspace = true
