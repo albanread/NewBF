@@ -1,0 +1,10 @@
+[package]
+name = "newbf-compat-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: faithful-tribute regression against curated Beef sample programs."
+publish = false
+
+[lints]
+workspace = true

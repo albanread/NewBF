@@ -1,0 +1,9 @@
+[package]
+name = "newbf-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: parser — tokens into a parse tree, reduced to an AST."
+
+[lints]
+workspace = true

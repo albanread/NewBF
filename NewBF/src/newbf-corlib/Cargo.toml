@@ -1,0 +1,9 @@
+[package]
+name = "newbf-corlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: the Beef-side standard library (.bf sources), ported from corlib."
+
+[lints]
+workspace = true

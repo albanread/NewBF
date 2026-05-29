@@ -1,0 +1,16 @@
+[package]
+name = "newbf-winapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: vendored Win32 API metadata for the FFI surface (from E:\\windows_api)."
+
+# At the winapi sprint (SPRINTS.md Sprint 27) this gains a build.rs that
+# reads a vendored data/windows_api.db snapshot and emits a postcard+zstd
+# blob, mirroring NewOpenDylan's nod-winapi:
+#   [dependencies]      postcard, serde, zstd
+#   [build-dependencies] rusqlite (bundled), postcard, serde, zstd
+[dependencies]
+
+[lints]
+workspace = true

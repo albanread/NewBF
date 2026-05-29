@@ -1,0 +1,9 @@
+[package]
+name = "newbf-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: tokenizer — Beef source into a typed token stream with spans."
+
+[lints]
+workspace = true

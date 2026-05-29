@@ -1,0 +1,9 @@
+[package]
+name = "newbf-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: typed SSA mid-level IR (Beef-IR-shaped)."
+
+[lints]
+workspace = true

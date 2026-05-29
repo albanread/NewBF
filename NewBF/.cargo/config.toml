@@ -1,0 +1,18 @@
+# Workstation-local LLVM install prefix (static build), shared across the
+# portfolio (NewM2, NewCormanLisp, NewOpenDylan). `inkwell` / `llvm-sys`
+# read LLVM_SYS_221_PREFIX at build time to find the LLVM headers and
+# static libs. Verified present here: LLVM 22.1.4.
+#
+# This "grabs" LLVM for NewBF: the toolchain is wired now. The
+# `inkwell` / `llvm-sys` dependencies in `newbf-llvm` activate at
+# SPRINTS.md Sprint 07; until then this variable is set but unused
+# (harmless). Bump the prefix in lockstep with NewM2 / NCL.
+#
+# Update the path if your LLVM install lives elsewhere.
+[env]
+LLVM_SYS_221_PREFIX = "C:\\projects\\LLVM\\install"
+
+# Windows: increase main-thread stack to 16 MiB. Debug codegen frames can
+# blow the default 1 MiB during recursive IR lowering. Portfolio-standard.
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-arg=/STACK:16777216"]

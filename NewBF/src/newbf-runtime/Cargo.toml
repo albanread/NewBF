@@ -1,0 +1,9 @@
+[package]
+name = "newbf-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: manual-memory runtime, debug memory guard, reflection, FFI."
+
+[lints]
+workspace = true

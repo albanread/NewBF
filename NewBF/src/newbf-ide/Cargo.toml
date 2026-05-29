@@ -1,0 +1,22 @@
+[package]
+name = "newbf-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: Rust iGui two-thread IDE (Direct2D/DirectWrite MDI)."
+
+[[bin]]
+name = "newbf-ide"
+path = "src/main.rs"
+
+# At the IDE sprint this gains path deps on our VENDORED iGui stack
+# (../../crates/*, owned in this repo — not linked to WF64), plus the
+# language session crates:
+#   igui    = { path = "../../crates/igui" }     # GUI thread (D2D/DWrite MDI)
+#   docpane = { path = "../../crates/docpane" }  # DocCrate markdown doc pane
+#   selkie  = { path = "../../crates/selkie" }   # editor / diagram widget
+#   newbf-driver / newbf-runtime  for the language worker Session
+[dependencies]
+
+[lints]
+workspace = true

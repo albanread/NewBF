@@ -1,0 +1,9 @@
+[package]
+name = "newbf-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: module graph, incremental compilation, hot-swap generations."
+
+[lints]
+workspace = true

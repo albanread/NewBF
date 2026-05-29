@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = [
+    "src/newbf-driver",
+    "src/newbf-lexer",
+    "src/newbf-parser",
+    "src/newbf-sema",
+    "src/newbf-comptime",
+    "src/newbf-ir",
+    "src/newbf-llvm",
+    "src/newbf-loader",
+    "src/newbf-runtime",
+    "src/newbf-winapi",
+    "src/newbf-corlib",
+    "src/newbf-ide",
+    "src/newbf-test-matrix",
+    "tests/newbf-tests",
+    "tests/newbf-compat-tests",
+]
+# Vendored iGui IDE stack (igui → docpane → selkie, plus doc-crate),
+# forked from WF64/NewFactor and owned here — not path-linked to WF64.
+# Excluded from the active workspace build for now: the IDE is
+# compiler-first (SPRINTS.md), and these pull heavy Direct2D/windows-rs
+# deps we don't want in the skeleton build. `newbf-ide` path-deps them
+# (our local copies) when the IDE sprint activates. They build standalone
+# in the meantime.
+exclude = ["crates"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.0.1"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Shared dependencies. Versions and the LLVM pin are chosen to match the
+# sibling-compiler portfolio (NewM2, NewCormanLisp, NewOpenDylan) so the
+# JIT memory manager, loader, and codegen helpers can be lifted across
+# projects without version drift. Bump the LLVM pin in lockstep with
+# NewM2 / NCL.
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+# LLVM backend — pinned to the portfolio major (LLVM 22.1). INACTIVE
+# until the LLVM sprint (SPRINTS.md, Sprint 07): no crate references
+# these yet, so `cargo build --workspace` succeeds without LLVM
+# installed. To activate, add `inkwell` / `llvm-sys` to newbf-llvm's
+# [dependencies] and wire the JIT memory manager lifted from NewM2.
+inkwell  = { version = "=0.9.0", features = ["llvm22-1"] }
+llvm-sys = { version = "=221.0.1", features = ["force-static"] }
+
+# Internal crates, referenced by the driver as the pipeline is wired up
+# sprint by sprint (path deps so edits are picked up without publishing).
+newbf-lexer    = { path = "src/newbf-lexer" }
+newbf-parser   = { path = "src/newbf-parser" }
+newbf-sema     = { path = "src/newbf-sema" }
+newbf-comptime = { path = "src/newbf-comptime" }
+newbf-ir       = { path = "src/newbf-ir" }
+newbf-llvm     = { path = "src/newbf-llvm" }
+newbf-loader   = { path = "src/newbf-loader" }
+newbf-runtime  = { path = "src/newbf-runtime" }
+newbf-winapi   = { path = "src/newbf-winapi" }
+newbf-corlib   = { path = "src/newbf-corlib" }

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Vendored Win32 metadata snapshot is regenerated from E:\windows_api at
+# the winapi sprint; ignore the build-time artifacts but keep the .db.
+/data/*.bin
+/data/*.zst
+
+# Vendored iGui crates (crates/*) build standalone for verification;
+# ignore their target dirs and throwaway lockfiles — they rejoin the
+# workspace lockfile when the IDE sprint folds them in.
+/crates/*/target
+/crates/*/Cargo.lock

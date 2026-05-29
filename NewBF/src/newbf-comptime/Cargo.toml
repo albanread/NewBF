@@ -1,0 +1,9 @@
+[package]
+name = "newbf-comptime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: compile-time execution engine (Beef's CeMachine)."
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "newbf-sema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: semantic analysis — resolution, generics, dispatch, ownership."
+
+[lints]
+workspace = true

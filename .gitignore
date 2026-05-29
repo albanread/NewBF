@@ -1,0 +1,5 @@
+# NewBF repository root. The Rust workspace lives in NewBF/ with its own
+# .gitignore; these broad rules catch build output at any depth.
+target/
+*.pdb
+*.rs.bk

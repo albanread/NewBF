@@ -1,0 +1,15 @@
+[package]
+name = "newbf-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NewBF: LLVM lowering, JIT, and AOT object/executable emission."
+
+# LLVM is pinned but INACTIVE until Sprint 07. When activating, add:
+#   inkwell.workspace  = true
+#   llvm-sys.workspace = true
+# and lift the JIT memory manager + Win64 SEH registration from NewM2.
+[dependencies]
+
+[lints]
+workspace = true
