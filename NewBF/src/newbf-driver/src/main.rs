@@ -32,7 +32,7 @@ enum Command {
     },
     /// Start the REPL (the JIT). Lands in phase 3.
     Repl,
-    /// Dump the token stream for a .bf file. Lands in Sprint 02.
+    /// Dump the token stream for a .bf file (the lexer phase report).
     DumpTokens {
         /// Path to a `.bf` source file.
         input: String,
@@ -53,8 +53,15 @@ fn main() {
         Some(Command::Repl) => {
             eprintln!("repl: not yet implemented (SPRINTS.md phase 3)");
         }
-        Some(Command::DumpTokens { input }) => {
-            eprintln!("dump-tokens {input}: not yet implemented (SPRINTS.md Sprint 02)");
-        }
+        Some(Command::DumpTokens { input }) => match std::fs::read_to_string(&input) {
+            Ok(src) => {
+                let tokens = newbf_lexer::lex(&src, newbf_lexer::FileId(0));
+                print!("{}", newbf_lexer::format_tokens(&src, &tokens));
+            }
+            Err(e) => {
+                eprintln!("dump-tokens: cannot read {input}: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 }
