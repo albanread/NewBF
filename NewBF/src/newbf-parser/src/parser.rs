@@ -54,6 +54,12 @@ struct Parser<'a> {
     /// History of `>>`→`>` mutations made by [`Parser::close_gt`], so
     /// speculative parses (generic-arg disambiguation) can roll them back.
     splits: Vec<(usize, Token)>,
+    /// When set, a trailing `{ … }` after an expression is *not* treated as
+    /// an object initializer (it belongs to an enclosing construct — e.g. a
+    /// constructor chain `: base(args) { body }`, where the `{` opens the
+    /// ctor body, not an initializer of `base(args)`). Reset inside `()`/`[]`
+    /// so initializers in arguments still parse.
+    suppress_init: bool,
 }
 
 /// Snapshot of parser state used by speculative parses.
@@ -78,6 +84,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             diagnostics: Vec::new(),
             splits: Vec::new(),
+            suppress_init: false,
         }
     }
 
@@ -447,6 +454,18 @@ impl<'a> Parser<'a> {
                         args,
                     };
                 }
+                // `name!<T>(args)` — forced generic mixin call (`Get!<int>()`).
+                // The `!` disambiguates, so the `<…>` is unambiguously a
+                // generic-arg list; the following `(` becomes the call.
+                TokenKind::Bang if matches!(self.nth_kind(1), TokenKind::Lt) => {
+                    self.bump(); // !
+                    let args = self.type_args();
+                    e = Expr::Generic {
+                        span: self.finish(lo),
+                        base: Box::new(e),
+                        args,
+                    };
+                }
                 TokenKind::MinusMinus => {
                     self.bump();
                     e = Expr::PostDec {
@@ -461,10 +480,42 @@ impl<'a> Parser<'a> {
                         break; // not a generic — let the binary loop handle `<`
                     }
                 }
+                // Object / collection initializer: `StructB { mA = 2 }`,
+                // `new T() { 1, 2, 3 }`. Only after a constructible base; the
+                // initializer is consumed and dropped for now (a later sprint
+                // records it). Control-flow bodies never reach here — their
+                // conditions are parenthesised, so the `{` follows the `)`.
+                TokenKind::LBrace if !self.suppress_init && self.initializer_follows(&e) => {
+                    self.consume_initializer();
+                }
                 _ => break,
             }
         }
         e
+    }
+
+    /// Whether a `{ … }` immediately after expr `e` (current token is `{`)
+    /// is an object/collection initializer rather than an unrelated block.
+    ///
+    /// Allocations and call/generic/dot-ctor results take an initializer
+    /// unconditionally (`new T() { … }`, `T<G> { … }`, `.() { … }`). A bare
+    /// `Ident`/`Member` is the ambiguous case (`StructB { mA = 2 }` vs. a
+    /// following block), so it only counts when the brace *looks* like an
+    /// initializer: empty `{}`, or it opens with `ident =`.
+    fn initializer_follows(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Generic { .. }
+            | Expr::Call { .. }
+            | Expr::Index { .. }
+            | Expr::DotIdent { .. }
+            | Expr::Prefix { .. } => true,
+            Expr::Ident(_) | Expr::Member { .. } => {
+                self.nth_kind(1) == TokenKind::RBrace
+                    || (self.nth_kind(1) == TokenKind::Ident
+                        && self.nth_kind(2) == TokenKind::Assign)
+            }
+            _ => false,
+        }
     }
 
     /// Only `Ident`, `Member`, and `Generic` (chained) can sensibly be
@@ -558,6 +609,10 @@ impl<'a> Parser<'a> {
     }
 
     fn arg_list(&mut self, close: TokenKind) -> Vec<Expr> {
+        // Inside `()`/`[]`, a trailing `{` is an initializer again, even if
+        // we entered while suppressing one for an enclosing construct.
+        let prev_suppress = self.suppress_init;
+        self.suppress_init = false;
         let mut args = Vec::new();
         while !self.at(close) && !self.at(TokenKind::Eof) {
             let before = self.pos;
@@ -569,6 +624,7 @@ impl<'a> Parser<'a> {
                 break; // safety: guarantee progress
             }
         }
+        self.suppress_init = prev_suppress;
         args
     }
 
@@ -619,6 +675,13 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Keyword(k) => self.primary_keyword(k, span),
             TokenKind::LParen => self.paren_or_cast(),
+            // Lambda capture clause: `[&] (a,b) => …`, `[=] => …`,
+            // `[x, &y] z => …`. The captures are consumed and dropped for
+            // now; the lambda expression that follows is parsed normally.
+            TokenKind::LBracket => {
+                self.skip_capture_clause();
+                self.unary()
+            }
             // `?` — Beef "uninitialized" placeholder (e.g. `int x = ?;`).
             TokenKind::Question => {
                 self.bump();
@@ -649,6 +712,32 @@ impl<'a> Parser<'a> {
                 // Recovery: consume one token so callers make progress.
                 self.bump();
                 Expr::Error(span)
+            }
+        }
+    }
+
+    /// Consume a balanced `[ … ]` lambda capture clause (current token is
+    /// `[`). Nested brackets are tracked so a capture like `[obj[0]]`
+    /// closes correctly.
+    fn skip_capture_clause(&mut self) {
+        let mut depth = 0u32;
+        loop {
+            match self.kind() {
+                TokenKind::LBracket => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RBracket => {
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Eof => break,
+                _ => {
+                    self.bump();
+                }
             }
         }
     }
@@ -2440,8 +2529,14 @@ impl<'a> Parser<'a> {
             };
             // Optional constructor chain: `: this(args)` / `: base(args)` /
             // `: this[Friend](args)` etc. We just consume an expression.
+            // Suppress trailing-`{` initializer parsing so the chain doesn't
+            // swallow the constructor body `{ … }` (it's still allowed inside
+            // the chain's argument parens).
             if self.eat(TokenKind::Colon) {
+                let prev = self.suppress_init;
+                self.suppress_init = true;
                 let _ = self.expr();
+                self.suppress_init = prev;
             }
             let body = self.method_body();
             return Member::Constructor {

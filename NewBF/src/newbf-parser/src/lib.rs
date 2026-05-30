@@ -387,6 +387,33 @@ mod tests {
     }
 
     #[test]
+    fn object_initializers() {
+        // Initializer is consumed and dropped for now, so the expr is just
+        // the constructed value — but it must parse without diagnostics.
+        assert_eq!(ok("StructB { mA = 2 }"), "StructB");
+        assert_eq!(ok("new Foo() { mA = 1, mB = 2 }"), "(new (call Foo))");
+        assert_eq!(ok("new int[3] { 1, 2, 3 }"), "(new (index int 3))");
+        // A bare `Ident` followed by a block-shaped `{` is NOT an initializer.
+        assert_eq!(ok_stmt("x;"), "(expr x)");
+    }
+
+    #[test]
+    fn ctor_chain_does_not_swallow_body() {
+        // The `{ }` is the constructor body, not an initializer of `base(x)`.
+        let unit = ok_file("class C { public this(int x) : base(x) { } }");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert!(matches!(
+            &td.members[0],
+            Member::Constructor {
+                body: MethodBody::Block(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn named_arguments() {
         // Beef named args: `name: value`, mixable with positional args.
         assert_eq!(
