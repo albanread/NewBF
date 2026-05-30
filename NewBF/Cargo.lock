@@ -319,6 +319,7 @@ dependencies = [
  "newbf-parser",
  "newbf-runtime",
  "newbf-sema",
+ "newbf-winapi",
 ]
 
 [[package]]

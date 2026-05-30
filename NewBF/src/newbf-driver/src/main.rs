@@ -25,10 +25,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile a .bf file (JIT or AOT). Lands in phase 3 (Sprint 08).
+    /// Compile a .bf file or directory to a native `.exe` (AOT): parse →
+    /// analyze → lower → emit object → link. Win32 imports the program calls
+    /// are discovered via sema and their import libs linked automatically.
     Compile {
-        /// Path to a `.bf` source file.
+        /// Path to a `.bf` source file or a directory.
         input: String,
+        /// Output `.exe` path (default: the input with a `.exe` extension).
+        #[arg(short, long)]
+        output: Option<String>,
     },
     /// Start the REPL (the JIT). Lands in phase 3.
     Repl,
@@ -86,9 +91,7 @@ fn main() {
             // the Sprint 01 demo works either way.
             println!("newbf-driver {VERSION_BANNER}");
         }
-        Some(Command::Compile { input }) => {
-            eprintln!("compile {input}: not yet implemented (SPRINTS.md phase 3)");
-        }
+        Some(Command::Compile { input, output }) => compile(&input, output.as_deref()),
         Some(Command::Repl) => {
             eprintln!("repl: not yet implemented (SPRINTS.md phase 3)");
         }
@@ -319,4 +322,126 @@ fn dump_llvm(input: &str) {
             paths.len()
         );
     }
+}
+
+fn compile(input: &str, output: Option<&str>) {
+    let root = std::path::Path::new(input);
+    let mut paths = Vec::new();
+    if root.is_file() {
+        paths.push(root.to_path_buf());
+    } else {
+        collect_bf(root, &mut paths);
+    }
+    if paths.is_empty() {
+        eprintln!("compile: no .bf files at {input}");
+        std::process::exit(1);
+    }
+
+    let mut srcs: Vec<String> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(s) => srcs.push(s),
+            Err(e) => {
+                eprintln!("compile: cannot read {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut units = Vec::with_capacity(paths.len());
+    let mut parse_diags = 0usize;
+    for (i, src) in srcs.iter().enumerate() {
+        let (unit, diags) = newbf_parser::parse_file(src, newbf_lexer::FileId(i as u32));
+        parse_diags += diags.len();
+        units.push(unit);
+    }
+    let files: Vec<newbf_sema::SourceFile<'_>> = srcs
+        .iter()
+        .zip(units.iter())
+        .enumerate()
+        .map(|(i, (src, unit))| newbf_sema::SourceFile {
+            file: newbf_lexer::FileId(i as u32),
+            src,
+            unit,
+        })
+        .collect();
+
+    let program = newbf_sema::analyze(&files);
+    let mut module = newbf_sema::lower_program(&files, &program);
+
+    // Discover the Win32 APIs the program imports, resolve them against the
+    // oracle, and collect the import libs the linker needs for the IAT.
+    let imports = newbf_sema::discover_extern_methods(&program);
+    let resolved = newbf_sema::resolve_apis(imports, |name| {
+        newbf_winapi::find_function_any_dll(name).map(|f| (f.dll.clone(), f.params.len()))
+    });
+    let mut import_libs: Vec<String> = resolved
+        .iter()
+        .filter_map(|r| r.dll.as_deref().and_then(newbf_winapi::import_lib_for_dll))
+        .collect();
+    import_libs.sort();
+    import_libs.dedup();
+
+    // Emit the C `main` entry stub forwarding to the Beef entry point.
+    add_main_stub(&mut module);
+
+    let exe = match output {
+        Some(o) => std::path::PathBuf::from(o),
+        None => std::path::Path::new(input).with_extension("exe"),
+    };
+    let obj = exe.with_extension("obj");
+
+    if let Err(e) = newbf_llvm::emit_object(&module, &obj) {
+        eprintln!("compile: emitting object failed: {e}");
+        std::process::exit(1);
+    }
+    let lib_refs: Vec<&str> = import_libs.iter().map(String::as_str).collect();
+    if let Err(e) = newbf_llvm::link_executable(&[obj.as_path()], &exe, &lib_refs) {
+        eprintln!("compile: link failed: {e}");
+        std::process::exit(1);
+    }
+    let _ = std::fs::remove_file(&obj);
+
+    if parse_diags > 0 {
+        eprintln!(
+            "(note: {parse_diags} parse diagnostics across {} files)",
+            paths.len()
+        );
+    }
+    if !import_libs.is_empty() {
+        eprintln!(
+            "(linked {} Win32 import lib(s): {})",
+            import_libs.len(),
+            import_libs.join(", ")
+        );
+    }
+    println!("compiled: {}", exe.display());
+}
+
+/// Emit a C `i32 main()` entry stub forwarding to the Beef entry point (a
+/// lowered `*.Main` function) so the linked exe has the CRT-expected entry.
+/// If the entry returns `int32`, its value becomes the exit code; otherwise
+/// the stub returns 0. (Entry args / wider return types: a later sprint.)
+fn add_main_stub(module: &mut newbf_ir::Module) {
+    use newbf_ir::{FunctionBuilder, IrType, Value};
+
+    let entry = module
+        .funcs
+        .iter()
+        .find(|f| !f.is_extern && f.name.ends_with(".Main"))
+        .map(|f| (f.name.clone(), f.ret));
+
+    let mut f = FunctionBuilder::new("main", vec![], IrType::I32);
+    let code = match entry {
+        Some((name, ret)) => {
+            let r = f.call(name, vec![], ret);
+            if ret == IrType::I32 {
+                r
+            } else {
+                Value::int(0, IrType::I32)
+            }
+        }
+        None => Value::int(0, IrType::I32),
+    };
+    f.ret(Some(code));
+    module.add_function(f.finish());
 }

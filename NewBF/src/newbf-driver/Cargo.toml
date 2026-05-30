@@ -17,6 +17,7 @@ newbf-sema.workspace = true
 newbf-ir.workspace = true
 newbf-llvm.workspace = true
 newbf-runtime.workspace = true
+newbf-winapi.workspace = true
 
 [lints]
 workspace = true
