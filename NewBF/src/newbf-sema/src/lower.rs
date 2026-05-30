@@ -179,6 +179,10 @@ struct Lowerer<'a> {
     terminated: bool,
     /// Sibling methods (same type), for resolving bare-name calls.
     methods: &'a HashMap<String, MethodSig>,
+    /// Enclosing-loop target stack: `(continue_target, break_target)`. The
+    /// innermost loop is last; `break`/`continue` branch to it. (Loop labels
+    /// aren't honoured yet — the kernel always targets the innermost loop.)
+    loops: Vec<(BlockId, BlockId)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -189,6 +193,7 @@ impl<'a> Lowerer<'a> {
             scopes: vec![HashMap::new()],
             terminated: false,
             methods,
+            loops: Vec::new(),
         }
     }
 
@@ -323,15 +328,95 @@ impl<'a> Lowerer<'a> {
                 self.fb.cond_br(cond_v, body_b, exit);
                 self.terminated = true;
                 self.switch(body_b);
+                self.loops.push((head, exit)); // continue → re-test the head
                 self.stmt(body, src);
+                self.loops.pop();
                 if !self.terminated {
                     self.fb.br(head);
                 }
                 self.switch(exit);
             }
-            // do/repeat, for, foreach, switch, break/continue, defer,
-            // local-function — not in the primitive kernel yet. Skipped
-            // (no IR emitted), never panicking.
+            Stmt::DoWhile { body, cond, .. } => {
+                // Body runs once before the test. `continue` re-tests the cond.
+                let body_b = self.fb.create_block("do.body");
+                let cond_b = self.fb.create_block("do.cond");
+                let exit = self.fb.create_block("do.exit");
+                self.fb.br(body_b);
+                self.switch(body_b);
+                self.loops.push((cond_b, exit));
+                self.stmt(body, src);
+                self.loops.pop();
+                if !self.terminated {
+                    self.fb.br(cond_b);
+                }
+                self.switch(cond_b);
+                let (cv, ct) = self.expr(cond, src);
+                let cond_v = self.coerce_bool(cv, ct);
+                self.fb.cond_br(cond_v, body_b, exit);
+                self.terminated = true;
+                self.switch(exit);
+            }
+            Stmt::For {
+                init,
+                cond,
+                update,
+                body,
+                ..
+            } => {
+                // C-style `for (init; cond; update) body`. The loop variable
+                // lives in its own scope; `continue` runs `update` then re-tests.
+                self.scopes.push(HashMap::new());
+                if let Some(init) = init {
+                    self.stmt(init, src);
+                }
+                let head = self.fb.create_block("for.head");
+                let body_b = self.fb.create_block("for.body");
+                let cont = self.fb.create_block("for.cont");
+                let exit = self.fb.create_block("for.exit");
+                self.fb.br(head);
+                // head: test the cond (an absent cond loops unconditionally).
+                self.switch(head);
+                let cond_v = match cond {
+                    Some(c) => {
+                        let (cv, ct) = self.expr(c, src);
+                        self.coerce_bool(cv, ct)
+                    }
+                    None => Value::bool(true),
+                };
+                self.fb.cond_br(cond_v, body_b, exit);
+                self.terminated = true;
+                // body → cont
+                self.switch(body_b);
+                self.loops.push((cont, exit));
+                self.stmt(body, src);
+                self.loops.pop();
+                if !self.terminated {
+                    self.fb.br(cont);
+                }
+                // cont: run the update, then back to the head.
+                self.switch(cont);
+                if let Some(u) = update {
+                    self.expr(u, src);
+                }
+                self.fb.br(head);
+                self.switch(exit);
+                self.scopes.pop();
+            }
+            Stmt::Break { .. } => {
+                if let Some(&(_, brk)) = self.loops.last() {
+                    self.fb.br(brk);
+                    self.terminated = true;
+                }
+            }
+            Stmt::Continue { .. } => {
+                if let Some(&(cont, _)) = self.loops.last() {
+                    self.fb.br(cont);
+                    self.terminated = true;
+                }
+            }
+            // foreach (needs iterators), switch (arms/patterns), defer
+            // (scope-exit ordering), local-function — not in the kernel yet.
+            // Skipped (no IR emitted), never panicking.
             _ => {}
         }
     }
@@ -355,6 +440,8 @@ impl<'a> Lowerer<'a> {
                 None => (undef(IrType::I64), IrType::I64),
             },
             Expr::Unary { op, operand, .. } => self.unary(*op, operand, src),
+            Expr::PostInc { operand, .. } => self.incdec(operand, 1, false, src),
+            Expr::PostDec { operand, .. } => self.incdec(operand, -1, false, src),
             Expr::Binary { op, lhs, rhs, .. } => self.binary(*op, lhs, rhs, src),
             Expr::Assign {
                 op, target, value, ..
@@ -402,6 +489,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn unary(&mut self, op: UnOp, operand: &Expr, src: &str) -> (Value, IrType) {
+        // Prefix `++`/`--` mutate an lvalue, so resolve the slot directly
+        // rather than evaluating the operand to a loaded rvalue first.
+        match op {
+            UnOp::PreInc => return self.incdec(operand, 1, true, src),
+            UnOp::PreDec => return self.incdec(operand, -1, true, src),
+            _ => {}
+        }
         let (v, t) = self.expr(operand, src);
         match op {
             UnOp::Pos => (v, t),
@@ -415,7 +509,8 @@ impl<'a> Lowerer<'a> {
             UnOp::BitNot if t.is_int() => (self.fb.bin(IrBin::Xor, v, Value::int(-1, t), t), t),
             UnOp::Neg | UnOp::BitNot => (undef(t), t),
             UnOp::Not => (self.fb.cmp(CmpPred::Eq, v, zero_of(t)), IrType::Bool),
-            // ++/--/*deref/&addr-of — later.
+            // `*deref` / `&addr-of` need pointer lvalues — later. (PreInc/
+            // PreDec are handled above; PostInc/PostDec are separate exprs.)
             _ => (undef(t), t),
         }
     }
@@ -532,6 +627,27 @@ impl<'a> Lowerer<'a> {
         }
         // Non-local lvalue (field/index/etc.) — not lowered yet.
         (rhs, rhs_ty)
+    }
+
+    /// Lower `++`/`--` against a local lvalue: load, add/sub one, store. `pre`
+    /// selects the prefix form (result is the *new* value) over postfix (the
+    /// *old* value). On a non-local operand (a field/index — not lowered yet)
+    /// it just evaluates the operand for its value, emitting no store.
+    fn incdec(&mut self, operand: &Expr, delta: i128, pre: bool, src: &str) -> (Value, IrType) {
+        if let Expr::Ident(s) = operand
+            && let Some((slot, ty)) = self.lookup(s.text(src))
+        {
+            let cur = self.fb.load(slot.clone(), ty);
+            let (op, one) = if ty.is_float() {
+                (IrBin::FAdd, Value::float(delta as f64, ty))
+            } else {
+                (IrBin::Add, Value::int(delta, ty))
+            };
+            let next = self.fb.bin(op, cur.clone(), one, ty);
+            self.fb.store(slot, next.clone());
+            return (if pre { next } else { cur }, ty);
+        }
+        self.expr(operand, src)
     }
 
     /// Coerce a value to `i1`: comparisons already are; otherwise `!= 0`.
