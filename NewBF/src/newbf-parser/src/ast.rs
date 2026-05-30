@@ -514,6 +514,19 @@ pub enum Type {
         return_ty: Box<Type>,
         params: Vec<Type>,
     },
+    /// A type computed from an expression: `comptype(e)` / `decltype(e)` /
+    /// `rettype(e)` / `alloctype(e)`.
+    Computed {
+        span: Span,
+        kind: ComputedKind,
+        expr: Box<Expr>,
+    },
+    /// An anonymous type used in type position: `struct { … }`, `enum { … }`,
+    /// `enum : Base { … }`. The full declaration (members, base) is kept.
+    Anonymous(Box<TypeDecl>),
+    /// A const-value generic argument in a type-argument list: the `16` in
+    /// `Foo<16>` / `Foo<const 16>` / `Foo<"+">`. Only valid as a generic arg.
+    ConstArg { span: Span, value: Box<Expr> },
     /// `var` used as a type position (inferred local)
     Var(Span),
     /// recovery placeholder for a malformed type
@@ -530,7 +543,30 @@ impl Type {
             | Type::Array { span, .. }
             | Type::Sized { span, .. }
             | Type::Tuple { span, .. }
-            | Type::Function { span, .. } => *span,
+            | Type::Function { span, .. }
+            | Type::Computed { span, .. }
+            | Type::ConstArg { span, .. } => *span,
+            Type::Anonymous(td) => td.span,
+        }
+    }
+}
+
+/// The flavour of a computed type ([`Type::Computed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComputedKind {
+    Comptype,
+    Decltype,
+    RetType,
+    Alloctype,
+}
+
+impl ComputedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComputedKind::Comptype => "comptype",
+            ComputedKind::Decltype => "decltype",
+            ComputedKind::RetType => "rettype",
+            ComputedKind::Alloctype => "alloctype",
         }
     }
 }
@@ -547,11 +583,14 @@ pub struct CompUnit {
 /// A top-level (or namespace-nested) item.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Item {
-    /// `using NS;` / `using static NS;` / `using A = NS.Type;`
+    /// `using NS;` / `using static NS;` / `using A = NS.Type;` /
+    /// `using internal NS;`
     Using {
         span: Span,
         attributes: Vec<Attribute>,
         is_static: bool,
+        /// Access modifier on the directive (`using internal NS;`).
+        access: Option<Modifier>,
         alias: Option<Span>,
         target: Type,
     },
@@ -726,6 +765,9 @@ pub enum Member {
         ty: Type,
         name: Span,
         init: Option<Expr>,
+        /// `true` for a `using` field (member forwarding):
+        /// `using public ClassA mInst;`.
+        is_using: bool,
     },
     /// `Type name<G…>(params) where … { body }` — block or expression body.
     Method {
@@ -743,12 +785,14 @@ pub enum Member {
         /// `name` is the final segment; this is the part before it.
         explicit_iface: Option<Type>,
     },
-    /// `this(params) { body }` (constructor).
+    /// `this[<G…>](params) [where …] { body }` (constructor).
     Constructor {
         span: Span,
         attributes: Vec<Attribute>,
         modifiers: Vec<(Modifier, Span)>,
+        generic_params: Vec<GenericParam>,
         params: Vec<Param>,
+        constraints: Vec<WhereClause>,
         body: MethodBody,
     },
     /// `~this() { body }` (destructor).

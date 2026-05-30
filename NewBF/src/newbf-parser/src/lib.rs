@@ -16,9 +16,9 @@ mod preprocess;
 mod print;
 
 pub use ast::{
-    Accessor, AccessorKind, AssignOp, Attribute, BinOp, CompUnit, Expr, GenericParam, Item, Member,
-    MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm, Type, TypeDecl,
-    TypeKind, TypeSeg, UnOp, WhereClause,
+    Accessor, AccessorKind, AssignOp, Attribute, BinOp, CompUnit, ComputedKind, Expr, GenericParam,
+    Item, Member, MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm, Type,
+    TypeDecl, TypeKind, TypeSeg, UnOp, WhereClause,
 };
 pub use parser::{
     Diagnostic, parse_expr, parse_file, parse_file_with_trivia, parse_fragment, parse_type,
@@ -204,6 +204,11 @@ mod tests {
                 s.push(')');
                 s
             }
+            Type::Computed { kind, expr, .. } => {
+                format!("({} {})", kind.as_str(), sx(src, expr))
+            }
+            Type::Anonymous(td) => format!("(anon-{} {})", td.kind.as_str(), td.members.len()),
+            Type::ConstArg { value, .. } => format!("(const {})", sx(src, value)),
         }
     }
 
@@ -609,9 +614,9 @@ mod tests {
     fn const_generic_arguments() {
         // `const N` and bare literal generic args (placeholder `var` stands
         // in for the const value).
-        assert_eq!(ok_type("StructV<const 16>"), "StructV<var>");
-        assert_eq!(ok_type("Array<int, const 4>"), "Array<int,var>");
-        assert_eq!(ok_type("Foo<16>"), "Foo<var>");
+        assert_eq!(ok_type("StructV<const 16>"), "StructV<(const 16)>");
+        assert_eq!(ok_type("Array<int, const 4>"), "Array<int,(const 4)>");
+        assert_eq!(ok_type("Foo<16>"), "Foo<(const 16)>");
     }
 
     #[test]

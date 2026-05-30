@@ -1029,9 +1029,11 @@ impl<'a> Parser<'a> {
             | Type::Sized { .. }
             | Type::Tuple { .. }
             | Type::Function { .. }
+            | Type::Computed { .. }
+            | Type::Anonymous(_)
             | Type::Var(_) => true,
             Type::Path { segments, .. } => segments.iter().any(|s| !s.args.is_empty()),
-            Type::Error(_) => false,
+            Type::ConstArg { .. } | Type::Error(_) => false,
         }
     }
 
@@ -2003,25 +2005,43 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::Var(s)
             }
-            // `comptype(expr)` / `decltype(expr)` — type computed at
-            // compile-time from an expression. Modeled as a Var
-            // placeholder for now.
-            TokenKind::Keyword(Keyword::Comptype)
-            | TokenKind::Keyword(Keyword::Decltype)
-            | TokenKind::Keyword(Keyword::RetType)
-            | TokenKind::Keyword(Keyword::AllocType)
-            | TokenKind::Keyword(Keyword::Nullable) => {
+            // `nullable(T)` is sugar for `T?` — parse the inner *type*.
+            TokenKind::Keyword(Keyword::Nullable) => {
+                self.bump();
+                self.expect(TokenKind::LParen, "`(` after nullable");
+                let inner = Box::new(self.ty());
+                self.expect(TokenKind::RParen, "`)` after nullable argument");
+                Type::Nullable {
+                    span: self.finish(lo),
+                    inner,
+                }
+            }
+            // `comptype(e)` / `decltype(e)` / `rettype(e)` / `alloctype(e)` —
+            // a type computed from an expression. The expression is kept.
+            TokenKind::Keyword(
+                k @ (Keyword::Comptype | Keyword::Decltype | Keyword::RetType | Keyword::AllocType),
+            ) => {
+                let kind = match k {
+                    Keyword::Comptype => ComputedKind::Comptype,
+                    Keyword::Decltype => ComputedKind::Decltype,
+                    Keyword::RetType => ComputedKind::RetType,
+                    _ => ComputedKind::Alloctype,
+                };
                 self.bump();
                 self.expect(
                     TokenKind::LParen,
                     "`(` after comptype/decltype/rettype/alloctype",
                 );
-                let _e = self.expr();
+                let expr = Box::new(self.expr());
                 self.expect(
                     TokenKind::RParen,
                     "`)` after comptype/decltype/rettype/alloctype argument",
                 );
-                Type::Var(self.finish(lo))
+                Type::Computed {
+                    span: self.finish(lo),
+                    kind,
+                    expr,
+                }
             }
             // Function/delegate types: `delegate Ret(params)`,
             // `function Ret(params)`, optionally with attributes between the
@@ -2072,29 +2092,45 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an anonymous type used in type position: `struct { members }`,
-    /// `enum { cases }`, `enum : Base { cases }`. The body's members are
-    /// parsed (to balance braces) and dropped; a `Var` placeholder stands in
-    /// for the anonymous type for now.
+    /// `enum { cases }`, `enum : Base { cases }`. Captured as a nameless
+    /// [`TypeDecl`] (its members and base are kept) wrapped in
+    /// [`Type::Anonymous`].
     fn anonymous_type(&mut self, lo: u32) -> Type {
+        // Anonymous types have no name — a zero-width span (interns to the
+        // empty symbol) so they don't collide in duplicate-name checks.
+        let name = Span::new(self.file, lo, lo);
         let kind = self.type_kind().unwrap_or(TypeKind::Struct);
-        // Optional `: …` clause — an underlying/base type (`enum : int`), or
-        // an inline constructor for an anonymous class
-        // (`class : this(int x, int y)`).
+        // Optional `: …` clause — base type(s) (`enum : int`), or an inline
+        // constructor for an anonymous class (`class : this(int x, int y)`).
+        let mut bases = Vec::new();
         if self.eat(TokenKind::Colon) {
             if self.at_kw(Keyword::This) {
-                self.bump(); // this
+                self.bump(); // this — inline ctor signature
                 if self.at(TokenKind::LParen) {
                     let _ = self.params();
                 }
             } else {
-                let _ = self.ty();
+                bases.push(self.ty());
             }
         }
-        if self.eat(TokenKind::LBrace) {
-            let _ = self.members(kind);
+        let members = if self.eat(TokenKind::LBrace) {
+            let m = self.members(kind);
             self.expect(TokenKind::RBrace, "`}` to close anonymous type");
-        }
-        Type::Var(self.finish(lo))
+            m
+        } else {
+            Vec::new()
+        };
+        Type::Anonymous(Box::new(TypeDecl {
+            span: self.finish(lo),
+            attributes: Vec::new(),
+            modifiers: Vec::new(),
+            kind,
+            name,
+            generic_params: Vec::new(),
+            bases,
+            constraints: Vec::new(),
+            members,
+        }))
     }
 
     fn path_type(&mut self, lo: u32) -> Type {
@@ -2159,13 +2195,16 @@ impl<'a> Parser<'a> {
                             | TokenKind::Minus
                     )
                 {
-                    let s = self.cur().span;
+                    let arg_lo = self.start();
                     let _ = self.eat_kw(Keyword::Const);
                     // Parse the const value at a precedence above comparison
                     // (binding power 6) so `>` closes the generic list rather
                     // than being read as greater-than: `<const TSize + 100>`.
-                    let _ = self.binary(6);
-                    Type::Var(s)
+                    let value = Box::new(self.binary(6));
+                    Type::ConstArg {
+                        span: self.finish(arg_lo),
+                        value,
+                    }
                 } else {
                     self.ty()
                 };
@@ -2417,11 +2456,18 @@ impl<'a> Parser<'a> {
     fn using_item(&mut self, lo: u32, attributes: Vec<Attribute>) -> Item {
         self.bump(); // using
         // Optional access modifier on the directive: `using internal NS;`,
-        // `using public NS;`. Consumed (not modeled separately yet).
-        let _ = self.eat_kw(Keyword::Internal)
-            || self.eat_kw(Keyword::Public)
-            || self.eat_kw(Keyword::Private)
-            || self.eat_kw(Keyword::Protected);
+        // `using public NS;`.
+        let access = if self.eat_kw(Keyword::Internal) {
+            Some(Modifier::Internal)
+        } else if self.eat_kw(Keyword::Public) {
+            Some(Modifier::Public)
+        } else if self.eat_kw(Keyword::Private) {
+            Some(Modifier::Private)
+        } else if self.eat_kw(Keyword::Protected) {
+            Some(Modifier::Protected)
+        } else {
+            None
+        };
         let is_static = self.eat_kw(Keyword::Static);
         let first_lo = self.start();
         let first = self.path_type(first_lo);
@@ -2448,6 +2494,7 @@ impl<'a> Parser<'a> {
             span: self.finish(lo),
             attributes,
             is_static,
+            access,
             alias,
             target,
         }
@@ -2543,21 +2590,24 @@ impl<'a> Parser<'a> {
 
     /// Parse attributes and modifiers in any order / interleaved (Beef
     /// allows `public [Inline] static`, `[Union] public`, etc.).
-    fn attrs_and_modifiers(&mut self) -> (Vec<Attribute>, Vec<(Modifier, Span)>) {
+    fn attrs_and_modifiers(&mut self) -> (Vec<Attribute>, Vec<(Modifier, Span)>, bool) {
         let mut attributes = Vec::new();
         let mut modifiers = Vec::new();
+        let mut is_using = false;
         loop {
             let before = self.pos;
             attributes.extend(self.attributes());
             modifiers.extend(self.modifiers());
             // `using` field qualifier (member forwarding):
-            // `using public ClassA mInst;`. Consumed; not modeled yet.
-            let _ = self.eat_kw(Keyword::Using);
+            // `using public ClassA mInst;`.
+            if self.eat_kw(Keyword::Using) {
+                is_using = true;
+            }
             if self.pos == before {
                 break;
             }
         }
-        (attributes, modifiers)
+        (attributes, modifiers, is_using)
     }
 
     fn at_type_kind_kw(&self) -> bool {
@@ -2865,7 +2915,7 @@ impl<'a> Parser<'a> {
 
     fn member(&mut self, kind: TypeKind) -> Member {
         let lo = self.start();
-        let (attributes, modifiers) = self.attrs_and_modifiers();
+        let (attributes, modifiers, is_using) = self.attrs_and_modifiers();
 
         // Enum case: `case Name [(payload)] [= value];`
         if kind == TypeKind::Enum && self.at_kw(Keyword::Case) {
@@ -2975,9 +3025,11 @@ impl<'a> Parser<'a> {
         {
             self.bump(); // this
             // Optional generic parameters: `this<T3>(…)`.
-            if self.at(TokenKind::Lt) {
-                let _ = self.generic_params();
-            }
+            let generic_params = if self.at(TokenKind::Lt) {
+                self.generic_params()
+            } else {
+                Vec::new()
+            };
             let params = if self.at(TokenKind::LParen) {
                 self.params()
             } else {
@@ -2995,13 +3047,15 @@ impl<'a> Parser<'a> {
                 self.suppress_init = prev;
             }
             // Optional `where` constraints on a generic constructor.
-            let _ = self.where_clauses();
+            let constraints = self.where_clauses();
             let body = self.method_body();
             return Member::Constructor {
                 span: self.finish(lo),
                 attributes,
                 modifiers,
+                generic_params,
                 params,
+                constraints,
                 body,
             };
         }
@@ -3064,6 +3118,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 init: None,
+                is_using,
             };
         }
 
@@ -3319,6 +3374,7 @@ impl<'a> Parser<'a> {
                     ty,
                     name,
                     init,
+                    is_using,
                 }
             }
         }

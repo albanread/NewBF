@@ -188,6 +188,8 @@ pub struct FieldDef {
     pub modifiers: Vec<Modifier>,
     pub attributes: Vec<AttrRef>,
     pub has_init: bool,
+    /// `true` for a `using` field (member forwarding).
+    pub is_using: bool,
     pub span: Span,
 }
 
@@ -316,6 +318,8 @@ pub struct UsingDef {
     pub file: FileId,
     pub span: Span,
     pub is_static: bool,
+    /// Access modifier on the directive (`using internal NS;`).
+    pub access: Option<Modifier>,
     pub alias: Option<Symbol>,
     pub target: TypeRef,
     pub resolution: UsingRes,
@@ -363,8 +367,55 @@ pub enum TypeRef {
         return_ty: Box<TypeRef>,
         params: Vec<TypeRef>,
     },
+    /// `comptype(e)` / `decltype(e)` / `rettype(e)` / `alloctype(e)` — a type
+    /// computed from an expression. The expression is comptime-evaluated in a
+    /// later phase; the kind and span are recorded here.
+    Computed {
+        span: Span,
+        kind: ComputedKindD,
+    },
+    /// An anonymous type used in type position (`struct { … }`) — captured as
+    /// a real nameless nested [`TypeDef`] in the graph, referenced by id (so
+    /// its members are not lost).
+    Anonymous(TypeId),
+    /// A const-value generic argument (`Foo<16>`): the value is an expression
+    /// (recoverable from `span`), evaluated during monomorphization.
+    ConstArg {
+        span: Span,
+    },
     Var(Span),
     Error(Span),
+}
+
+/// The flavour of a [`TypeRef::Computed`] (mirrors the parser's
+/// `ComputedKind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ComputedKindD {
+    Comptype,
+    Decltype,
+    RetType,
+    Alloctype,
+}
+
+impl ComputedKindD {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComputedKindD::Comptype => "comptype",
+            ComputedKindD::Decltype => "decltype",
+            ComputedKindD::RetType => "rettype",
+            ComputedKindD::Alloctype => "alloctype",
+        }
+    }
+
+    pub fn from_parser(k: newbf_parser::ComputedKind) -> Self {
+        use newbf_parser::ComputedKind as K;
+        match k {
+            K::Comptype => ComputedKindD::Comptype,
+            K::Decltype => ComputedKindD::Decltype,
+            K::RetType => ComputedKindD::RetType,
+            K::Alloctype => ComputedKindD::Alloctype,
+        }
+    }
 }
 
 impl TypeRef {
@@ -377,7 +428,12 @@ impl TypeRef {
             | TypeRef::Array { span, .. }
             | TypeRef::Sized { span, .. }
             | TypeRef::Tuple { span, .. }
-            | TypeRef::Function { span, .. } => *span,
+            | TypeRef::Function { span, .. }
+            | TypeRef::Computed { span, .. }
+            | TypeRef::ConstArg { span } => *span,
+            // An anonymous type's span lives on its TypeDef; callers that
+            // need it look it up by id.
+            TypeRef::Anonymous(_) => Span::new(FileId(0), 0, 0),
         }
     }
 }

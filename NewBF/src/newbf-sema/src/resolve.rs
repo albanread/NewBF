@@ -103,8 +103,11 @@ impl Builder {
     fn check_duplicate_types(&self, diags: &mut Vec<Diagnostic>) {
         // container key: (0, ns_id) for namespace-level, (1, type_id) for nested.
         let mut seen: HashMap<(u8, u32, Symbol, u32), ()> = HashMap::new();
+        let empty = self.interner.empty();
         for t in &self.types {
-            if t.kind == TypeKindD::Extension {
+            // Extensions reopen an existing type; anonymous types (empty
+            // name) have no name to collide on — both are exempt.
+            if t.kind == TypeKindD::Extension || t.name == empty {
                 continue;
             }
             let (ck, cid) = match t.enclosing_type {

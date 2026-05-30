@@ -277,5 +277,8 @@ fn fmt_typeref(it: &Interner, t: &TypeRef) -> String {
             let ps: Vec<String> = params.iter().map(|p| fmt_typeref(it, p)).collect();
             format!("{kw} {}({})", fmt_typeref(it, return_ty), ps.join(", "))
         }
+        TypeRef::Computed { kind, .. } => format!("{}(…)", kind.as_str()),
+        TypeRef::Anonymous(tid) => format!("<anon type #{}>", tid.0),
+        TypeRef::ConstArg { .. } => "<const>".to_string(),
     }
 }

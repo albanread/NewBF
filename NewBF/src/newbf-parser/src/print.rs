@@ -280,6 +280,20 @@ impl Printer<'_> {
                     }
                 }
             }
+            Type::Computed { kind, expr, .. } => {
+                self.line(d, &format!("TyComputed {}", kind.as_str()));
+                self.expr(expr, d + 1);
+            }
+            Type::Anonymous(td) => {
+                self.line(d, &format!("TyAnonymous {}", td.kind.as_str()));
+                for m in &td.members {
+                    self.member(m, d + 1);
+                }
+            }
+            Type::ConstArg { value, .. } => {
+                self.line(d, "TyConstArg");
+                self.expr(value, d + 1);
+            }
         }
     }
 

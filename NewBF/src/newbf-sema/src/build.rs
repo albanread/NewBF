@@ -27,6 +27,10 @@ pub(crate) struct Builder {
     pub members: Vec<MemberDef>,
     pub usings: Vec<UsingDef>,
     pub ns_index: HashMap<String, NsId>,
+    /// Current lowering context, so `lower_type` can build anonymous types
+    /// (`struct { … }` used as a member type) as real nested `TypeDef`s.
+    cur_ns: NsId,
+    cur_enclosing: Option<TypeId>,
 }
 
 impl Builder {
@@ -49,6 +53,8 @@ impl Builder {
             members: Vec::new(),
             usings: Vec::new(),
             ns_index,
+            cur_ns: NsId(0),
+            cur_enclosing: None,
         }
     }
 
@@ -68,10 +74,14 @@ impl Builder {
     fn build_items(&mut self, items: &[Item], enclosing_ns: NsId, f: &SourceFile<'_>) {
         let mut current = enclosing_ns;
         for item in items {
+            // Namespace-level lowering context (no enclosing type).
+            self.cur_ns = current;
+            self.cur_enclosing = None;
             match item {
                 Item::Using {
                     span,
                     is_static,
+                    access,
                     alias,
                     target,
                     ..
@@ -82,6 +92,7 @@ impl Builder {
                         file: f.file,
                         span: *span,
                         is_static: *is_static,
+                        access: *access,
                         alias,
                         target,
                         resolution: UsingRes::External,
@@ -217,6 +228,14 @@ impl Builder {
             self.namespaces[parent_ns.0 as usize].types.push(tid);
         }
 
+        // Lowering context for anonymous member types (`struct { … } f;`):
+        // they become nested `TypeDef`s under this type. Saved/restored so
+        // nested and anonymous types don't clobber the caller's context.
+        let saved_ns = self.cur_ns;
+        let saved_enc = self.cur_enclosing;
+        self.cur_ns = parent_ns;
+        self.cur_enclosing = Some(tid);
+
         let mut member_ids = Vec::new();
         let mut nested_ids = Vec::new();
         for m in &td.members {
@@ -228,6 +247,7 @@ impl Builder {
                     ty,
                     name,
                     init,
+                    is_using,
                 } => {
                     let ty = self.lower_type(ty, f);
                     let attrs = self.lower_attrs(attributes, f);
@@ -239,6 +259,7 @@ impl Builder {
                         modifiers: strip_mods(modifiers),
                         attributes: attrs,
                         has_init: init.is_some(),
+                        is_using: *is_using,
                         span: *span,
                     })));
                 }
@@ -280,11 +301,15 @@ impl Builder {
                     span,
                     attributes,
                     modifiers,
+                    generic_params,
                     params,
+                    constraints,
                     body,
                 } => {
                     let attrs = self.lower_attrs(attributes, f);
+                    let gps = self.lower_generic_params(generic_params, f);
                     let params = self.lower_params(params, f);
+                    let constraints = self.lower_where(constraints, f);
                     let name_sym = self.interner.intern("this");
                     member_ids.push(self.push_member(MemberDef::Method(MethodDef {
                         owner: tid,
@@ -293,9 +318,9 @@ impl Builder {
                         modifiers: strip_mods(modifiers),
                         attributes: attrs,
                         return_ty: None,
-                        generic_params: Vec::new(),
+                        generic_params: gps,
                         params,
-                        constraints: Vec::new(),
+                        constraints,
                         body: body_kind(body),
                         explicit_iface: None,
                         span: *span,
@@ -416,6 +441,8 @@ impl Builder {
 
         self.types[tid.0 as usize].members = member_ids;
         self.types[tid.0 as usize].nested_types = nested_ids;
+        self.cur_ns = saved_ns;
+        self.cur_enclosing = saved_enc;
         tid
     }
 
@@ -553,6 +580,18 @@ impl Builder {
                 return_ty: Box::new(self.lower_type(return_ty, f)),
                 params: params.iter().map(|p| self.lower_type(p, f)).collect(),
             },
+            Type::Computed { span, kind, .. } => TypeRef::Computed {
+                span: *span,
+                kind: ComputedKindD::from_parser(*kind),
+            },
+            // An anonymous type becomes a real nameless nested `TypeDef` in
+            // the graph (under the current type / namespace), so its members
+            // are captured, not dropped.
+            Type::Anonymous(td) => {
+                let tid = self.build_type(td, self.cur_ns, self.cur_enclosing, f);
+                TypeRef::Anonymous(tid)
+            }
+            Type::ConstArg { span, .. } => TypeRef::ConstArg { span: *span },
             Type::Var(s) => TypeRef::Var(*s),
             Type::Error(s) => TypeRef::Error(*s),
         }
