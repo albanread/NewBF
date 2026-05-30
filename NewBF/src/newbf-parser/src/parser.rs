@@ -695,7 +695,13 @@ impl<'a> Parser<'a> {
         let mut args = Vec::new();
         while !self.at(close) && !self.at(TokenKind::Eof) {
             let before = self.pos;
-            args.push(self.arg());
+            // Empty slot (a multidim array index `arr[,]` / `.[,]`): a bare
+            // comma with no expression. Stand a placeholder in for it.
+            if self.at(TokenKind::Comma) {
+                args.push(Expr::Ident(self.cur().span));
+            } else {
+                args.push(self.arg());
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
