@@ -122,11 +122,16 @@ NewBF is **manual-memory-first**, **Rust-for-the-substrate**,
    Beef's "debuggable program with a few red-hot methods at `-O3`"
    promise is preserved rather than flattened to a whole-program switch.
 
-10. **Comptime is first-class.** A compile-time execution engine
-    (`newbf-comptime`, modelling `CeMachine`) evaluates Beef at compile
-    time for const-eval, `[Comptime]` methods, and type generation. It is
-    a genuine interpreter — the one place in the system that is *not* the
-    JIT — because that is what comptime is.
+10. **Comptime is first-class, and runs on the JIT.** A compile-time
+    execution engine (`newbf-comptime`) evaluates Beef at compile time for
+    const-eval, `[Comptime]` methods, and type generation. Upstream Beef's
+    `CeMachine` is a bytecode *interpreter*; NewBF instead **JIT-compiles
+    comptime code and runs it as native code**, because we already have a
+    JIT and it is faster. The cost we take on deliberately: comptime
+    execution must run behind a **comptime-safe boundary** — no I/O, no
+    nondeterminism, and a fault in comptime code is reported as a compile
+    error rather than crashing the compiler. (Beef's interpreter gets that
+    sandbox for free; we enforce it.)
 
 11. **Reflection is first-class.** Type metadata is emitted and queryable
     at runtime, with opt-in/strip controls per type (mirroring Beef's
@@ -378,6 +383,11 @@ What we lift, with attribution:
   bridge, and buffer marshalling — the *machinery* of making a foreign
   call, used for Beef's `[CallingConvention]` / `[Import]` interop and the
   runtime's OS calls.
+- **COM + DirectX** — Beef's COM-style interop (the bulk of `Windows.bf`)
+  maps onto the Rust `windows` crate's first-class COM support. COM
+  vtable calls, `IUnknown`/`QueryInterface`, and DirectX interfaces are a
+  supported target, not dead weight — exposed to Beef code through the FFI
+  stack above. (DirectX support is an explicit goal.)
 - **Win32 API metadata** — the API *surface* (constants and function
   signatures) is vendored from the shared
   [`E:\windows_api`](file:///E:/windows_api) repository (a SQLite

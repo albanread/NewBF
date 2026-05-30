@@ -72,11 +72,13 @@ fn parser_does_not_panic_on_real_beef() {
 
     // No-panic gate.
     assert!(!files.is_empty(), "no .bf fixtures found");
-    // Soft threshold: at least some files must parse cleanly. The bar
-    // rises as the declaration grammar fills in.
+    // Coverage ratchet: the bar rises as Beef-syntax coverage fills in.
+    // Target (Path B, full Beef faithfulness) is ~70%; this floor locks
+    // in current progress so coverage can't silently regress.
+    let floor = files.len() * 35 / 100;
     assert!(
-        clean >= files.len() / 20,
-        "expected at least 5% of files to parse cleanly, got {clean} / {}",
+        clean >= floor,
+        "parser clean-parse coverage regressed: {clean} / {} (floor {floor})",
         files.len()
     );
 }

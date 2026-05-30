@@ -293,6 +293,16 @@ impl<'a> Parser<'a> {
                 None
             };
             let operand = self.unary();
+            // Allocation types can carry trailing pointer suffix that the
+            // expression grammar doesn't see: `new uint8[size]*`.
+            if matches!(
+                kw,
+                PrefixKw::New | PrefixKw::Scope | PrefixKw::Append | PrefixKw::Box
+            ) {
+                while self.at(TokenKind::Star) {
+                    self.bump();
+                }
+            }
             return Expr::Prefix {
                 span: self.finish(lo),
                 kw,
@@ -334,6 +344,18 @@ impl<'a> Parser<'a> {
                         base: Box::new(e),
                         name,
                         conditional: true,
+                    };
+                }
+                // `global::Foo` / `A::B` — `::` namespace qualifier,
+                // treated like `.` for parsing.
+                TokenKind::ColonColon => {
+                    self.bump();
+                    let name = self.expect_ident_span("name after `::`");
+                    e = Expr::Member {
+                        span: self.finish(lo),
+                        base: Box::new(e),
+                        name,
+                        conditional: false,
                     };
                 }
                 TokenKind::LParen => {
@@ -739,6 +761,47 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Defer) => self.defer_stmt(),
             TokenKind::Keyword(Keyword::Var) | TokenKind::Keyword(Keyword::Let) => self.local(true),
             TokenKind::Keyword(Keyword::Switch) => self.switch_stmt(),
+            // `const`/`readonly`/`static` local: consume the modifier(s)
+            // then parse `Type name = init;` (or `var`/`let`).
+            TokenKind::Keyword(Keyword::Const)
+            | TokenKind::Keyword(Keyword::ReadOnly)
+            | TokenKind::Keyword(Keyword::Static)
+                if matches!(
+                    self.nth_kind(1),
+                    TokenKind::Ident
+                        | TokenKind::Keyword(Keyword::Var)
+                        | TokenKind::Keyword(Keyword::Let)
+                ) =>
+            {
+                let lo = self.start();
+                while matches!(
+                    self.kind(),
+                    TokenKind::Keyword(Keyword::Const)
+                        | TokenKind::Keyword(Keyword::ReadOnly)
+                        | TokenKind::Keyword(Keyword::Static)
+                ) {
+                    self.bump();
+                }
+                if self.at_kw(Keyword::Var) || self.at_kw(Keyword::Let) {
+                    self.local(true)
+                } else {
+                    let ty = self.ty();
+                    let name = self.expect_ident_span("variable name");
+                    let init = if self.eat(TokenKind::Assign) {
+                        Some(self.expr())
+                    } else {
+                        None
+                    };
+                    self.expect(TokenKind::Semicolon, "`;` after local variable");
+                    Stmt::Local {
+                        span: self.finish(lo),
+                        is_let: false,
+                        ty: Some(ty),
+                        name,
+                        init,
+                    }
+                }
+            }
             _ => {
                 if let Some(s) = self.try_local_function() {
                     s
@@ -1160,6 +1223,13 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RParen, "`)` after comptype/decltype argument");
                 Type::Var(self.finish(lo))
             }
+            // Bare `.` in type position = inferred type — the `(.)`
+            // cast-to-inferred-type, `StructA v = .();` etc.
+            TokenKind::Dot if self.nth_kind(1) != TokenKind::Ident => {
+                let s = self.cur().span;
+                self.bump();
+                Type::Var(s)
+            }
             TokenKind::Ident => self.path_type(lo),
             _ => {
                 self.error("expected a type");
@@ -1306,6 +1376,11 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
             let before = self.pos;
             elems.push(self.ty());
+            // Named tuple element: `(K key, V value)` — consume the
+            // optional element name.
+            if self.at(TokenKind::Ident) {
+                self.bump();
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -1624,7 +1699,8 @@ impl<'a> Parser<'a> {
             Keyword::Ref => Modifier::Ref,
             Keyword::New => Modifier::New,
             Keyword::Inline => Modifier::Inline,
-            Keyword::Mixin => Modifier::Mixin,
+            // NB: `mixin` is NOT a modifier — it's a member kind
+            // (`mixin Name(…)`), handled in `member`.
             Keyword::Append => Modifier::Append,
             Keyword::Concrete => Modifier::Concrete,
             Keyword::Implicit => Modifier::Implicit,
@@ -1716,6 +1792,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 return self.ty();
             }
+            // `where T : operator T <=> T` / `where bool : operator T == T`
+            // — operator constraint; consume to the next clause boundary.
+            if k == Keyword::Operator {
+                let op_lo = self.start();
+                self.bump(); // operator
+                while !matches!(
+                    self.kind(),
+                    TokenKind::Comma | TokenKind::LBrace | TokenKind::Semicolon | TokenKind::Eof
+                ) && !self.at_kw(Keyword::Where)
+                {
+                    self.bump();
+                }
+                return Type::Var(self.finish(op_lo));
+            }
             if matches!(
                 k,
                 Keyword::Class | Keyword::Struct | Keyword::New | Keyword::Delete | Keyword::Var
@@ -1792,10 +1882,63 @@ impl<'a> Parser<'a> {
             return Member::Nested(self.type_decl(lo, attributes, modifiers));
         }
 
-        // Constructor: `this(...)`
-        if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LParen {
+        // Static initializer block: `static { … }` (a bare block member,
+        // modelled as a parameterless constructor).
+        if self.at(TokenKind::LBrace) {
+            let body = self.block();
+            return Member::Constructor {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                params: Vec::new(),
+                body: MethodBody::Block(body),
+            };
+        }
+
+        // Mixin member: `[mods] mixin Name(params) body` (no return type).
+        if self.at_kw(Keyword::Mixin) {
+            self.bump(); // mixin
+            let name = if self.at(TokenKind::Ident) {
+                self.bump().span
+            } else {
+                self.error("expected mixin name");
+                self.cur().span
+            };
+            let generic_params = if self.at(TokenKind::Lt) {
+                self.generic_params()
+            } else {
+                Vec::new()
+            };
+            let params = if self.at(TokenKind::LParen) {
+                self.params()
+            } else {
+                Vec::new()
+            };
+            let _ = self.where_clauses();
+            let body = self.method_body();
+            return Member::Method {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                return_ty: Type::Error(name),
+                name,
+                generic_params,
+                params,
+                constraints: Vec::new(),
+                body,
+            };
+        }
+
+        // Constructor: `this(...)` or paren-less `this { … }`.
+        if self.at_kw(Keyword::This)
+            && matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::LBrace)
+        {
             self.bump(); // this
-            let params = self.params();
+            let params = if self.at(TokenKind::LParen) {
+                self.params()
+            } else {
+                Vec::new()
+            };
             // Optional constructor chain: `: this(args)` / `: base(args)` /
             // `: this[Friend](args)` etc. We just consume an expression.
             if self.eat(TokenKind::Colon) {
@@ -1928,13 +2071,57 @@ impl<'a> Parser<'a> {
         // name (the qualifier is dropped — interface-impl info is
         // recovered later in sema).
         let mut name = name;
-        while self.at(TokenKind::Dot) && matches!(self.nth_kind(1), TokenKind::Ident) {
+        while self.at(TokenKind::Dot)
+            && matches!(
+                self.nth_kind(1),
+                TokenKind::Ident | TokenKind::Keyword(Keyword::This)
+            )
+        {
             self.bump(); // .
-            name = self.bump().span;
+            name = self.bump().span; // Ident or `this` (explicit-iface indexer)
             generic_params = if self.at(TokenKind::Lt) {
                 self.generic_params()
             } else {
                 Vec::new()
+            };
+        }
+
+        // Explicit-interface indexer: `Ret IFoo.this[params] { … }`.
+        if self.at(TokenKind::LBracket) {
+            let _params = self.bracketed_params();
+            let accessors = if self.eat(TokenKind::LBrace) {
+                let mut accs = Vec::new();
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let before = self.pos;
+                    accs.push(self.accessor());
+                    if self.pos == before {
+                        self.bump();
+                    }
+                }
+                self.expect(TokenKind::RBrace, "`}` to close indexer body");
+                accs
+            } else if self.eat(TokenKind::FatArrow) {
+                let acc_span = self.finish(lo);
+                let e = self.expr();
+                self.expect(TokenKind::Semicolon, "`;` after expression-bodied indexer");
+                vec![Accessor {
+                    span: acc_span,
+                    attributes: Vec::new(),
+                    modifiers: Vec::new(),
+                    kind: AccessorKind::Get,
+                    body: MethodBody::Expr(e),
+                }]
+            } else {
+                self.expect(TokenKind::Semicolon, "`{ … }` or `=> expr;` for indexer");
+                Vec::new()
+            };
+            return Member::Property {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                ty,
+                name,
+                accessors,
             };
         }
 
