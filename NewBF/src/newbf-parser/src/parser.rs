@@ -876,6 +876,10 @@ impl<'a> Parser<'a> {
                             | TokenKind::Plus
                             | TokenKind::PlusPlus
                             | TokenKind::MinusMinus
+                            // `(void*)[Friend]x` — a definite type can't be
+                            // indexed as a value, so `[` means a cast operand
+                            // (an attributed/capture expression).
+                            | TokenKind::LBracket
                     ));
             if commit {
                 let operand = self.unary();
