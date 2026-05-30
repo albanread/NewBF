@@ -276,7 +276,24 @@ impl<'a> Parser<'a> {
             // `is`/`as`/`case` take a type or pattern on the right; we
             // parse it as a unary expression (a type/pattern stand-in).
             let rhs = if matches!(op, BinOp::Is | BinOp::As | BinOp::Case) {
-                self.unary()
+                let r = self.unary();
+                // Nullable type suffix on the `is`/`as` right-hand type:
+                // `x as ClosedRange?` — consume the `?` when it terminates a
+                // type (followed by `)`/`,`/`;`/`]`/`}`), not a ternary.
+                if matches!(op, BinOp::Is | BinOp::As)
+                    && self.at(TokenKind::Question)
+                    && matches!(
+                        self.nth_kind(1),
+                        TokenKind::RParen
+                            | TokenKind::Comma
+                            | TokenKind::Semicolon
+                            | TokenKind::RBracket
+                            | TokenKind::RBrace
+                    )
+                {
+                    self.bump(); // ?
+                }
+                r
             } else if matches!(op, BinOp::Range | BinOp::ClosedRange)
                 && !Self::can_start_unary(self.kind())
             {
@@ -1880,7 +1897,8 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Comptype)
             | TokenKind::Keyword(Keyword::Decltype)
             | TokenKind::Keyword(Keyword::RetType)
-            | TokenKind::Keyword(Keyword::AllocType) => {
+            | TokenKind::Keyword(Keyword::AllocType)
+            | TokenKind::Keyword(Keyword::Nullable) => {
                 self.bump();
                 self.expect(
                     TokenKind::LParen,
@@ -2270,6 +2288,12 @@ impl<'a> Parser<'a> {
 
     fn using_item(&mut self, lo: u32, attributes: Vec<Attribute>) -> Item {
         self.bump(); // using
+        // Optional access modifier on the directive: `using internal NS;`,
+        // `using public NS;`. Consumed (not modeled separately yet).
+        let _ = self.eat_kw(Keyword::Internal)
+            || self.eat_kw(Keyword::Public)
+            || self.eat_kw(Keyword::Private)
+            || self.eat_kw(Keyword::Protected);
         let is_static = self.eat_kw(Keyword::Static);
         let first_lo = self.start();
         let first = self.path_type(first_lo);
