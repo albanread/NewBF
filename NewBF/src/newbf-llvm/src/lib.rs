@@ -19,7 +19,9 @@ mod aot;
 mod jit;
 mod jit_mm;
 mod lower;
+mod mapsym;
 
 pub use aot::{emit_object, emit_object_to_memory, link_executable};
 pub use jit::OrcJit;
 pub use lower::{emit_module, lower_to_string, verify_module};
+pub use mapsym::symbolicate;

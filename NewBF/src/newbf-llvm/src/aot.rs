@@ -102,6 +102,9 @@ pub fn link_executable(
     cmd.arg("/NXCOMPAT");
     cmd.arg("/DYNAMICBASE");
     cmd.arg("/HIGHENTROPYVA");
+    // Emit a `.map` (symbol → Rva+Base) next to the exe so crash-dump IPs can
+    // be named offline via `symbolicate` (our own frames, no dbghelp/PDB).
+    cmd.arg(format!("/MAP:{}.map", output.display()));
     // The CRT + kernel import libs a freestanding `main` needs; %LIB% (set by
     // the discovered link.exe) resolves them from the SDK.
     for lib in [
@@ -239,5 +242,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&obj);
         let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(exe.with_extension("exe.map"));
+    }
+
+    /// End-to-end symbolication: link with `/MAP`, then resolve our own `main`
+    /// from the real `.map` — the names-our-own-code path that the in-box
+    /// dbghelp can't do. Proves the whole loop: emit → link → .map → name.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn map_names_our_own_function() {
+        use super::{emit_object, link_executable};
+        use crate::symbolicate;
+        use newbf_ir::Value;
+
+        let mut f = FunctionBuilder::new("main", vec![], IrType::I32);
+        f.ret(Some(Value::int(42, IrType::I32)));
+        let mut m = IrModule::new("mapt");
+        m.add_function(f.finish());
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let obj = dir.join(format!("newbf_map_{pid}.obj"));
+        let exe = dir.join(format!("newbf_map_{pid}.exe"));
+        let map = dir.join(format!("newbf_map_{pid}.exe.map"));
+
+        emit_object(&m, &obj).expect("emit object");
+        link_executable(&[obj.as_path()], &exe, &[]).expect("link exe");
+        let map_text = std::fs::read_to_string(&map).expect("link emitted a .map");
+
+        // Pull `main`'s real Rva+Base from the produced .map and confirm a dump
+        // line referencing that address symbolicates back to `main`.
+        let rva = map_text
+            .lines()
+            .find_map(|l| {
+                let t: Vec<&str> = l.split_whitespace().collect();
+                if t.get(1) == Some(&"main") {
+                    t.iter()
+                        .rev()
+                        .find(|x| x.len() == 16 && x.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .copied()
+                } else {
+                    None
+                }
+            })
+            .expect("`main` row in .map");
+        let dump = format!("crashed at 0x{rva}");
+        let out = symbolicate(&dump, &map_text, None).expect("symbolicate");
+        assert!(out.contains("main+0x0"), "did not name main:\n{out}");
+
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(&map);
     }
 }
