@@ -133,6 +133,7 @@ mod tests {
                 s.push(')');
                 s
             }
+            Expr::Lambda { body, .. } => format!("(lambda {})", sxs(src, body)),
         }
     }
 

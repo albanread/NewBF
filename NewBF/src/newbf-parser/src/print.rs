@@ -199,6 +199,10 @@ impl Printer<'_> {
                     self.expr(e, d + 1);
                 }
             }
+            Expr::Lambda { body, .. } => {
+                self.line(d, "Lambda");
+                self.stmt(body, d + 1);
+            }
         }
     }
 

@@ -273,6 +273,11 @@ impl<'a> Parser<'a> {
             self.bump();
             return self.unary();
         }
+        // Paramless / inferred-param lambda: `=> expr` / `=> { … }`
+        // (also the operand of `scope => …`).
+        if self.at(TokenKind::FatArrow) {
+            return self.lambda_body(lo);
+        }
         if let Some(op) = self.peek_unary_op() {
             self.bump();
             let operand = self.unary();
@@ -508,6 +513,26 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Parse a lambda body after `=>` (current token is `=>`). `lo` is the
+    /// lambda's start offset (covering any params already consumed).
+    fn lambda_body(&mut self, lo: u32) -> Expr {
+        self.bump(); // =>
+        let body = if self.at(TokenKind::LBrace) {
+            self.block()
+        } else {
+            let blo = self.start();
+            let e = self.expr();
+            Stmt::Expr {
+                span: self.finish(blo),
+                expr: e,
+            }
+        };
+        Expr::Lambda {
+            span: self.finish(lo),
+            body: Box::new(body),
+        }
+    }
+
     /// Consume an object/collection initializer `{ a = 1, b, … }`
     /// (contents discarded for now — recovered in sema). Assumes the
     /// current token is `{`.
@@ -562,6 +587,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident => {
                 self.bump();
+                // Single-parameter lambda: `x => body`.
+                if self.at(TokenKind::FatArrow) {
+                    return self.lambda_body(span.lo);
+                }
                 Expr::Ident(span)
             }
             TokenKind::Keyword(k) => self.primary_keyword(k, span),
@@ -622,8 +651,19 @@ impl<'a> Parser<'a> {
         }
         self.restore(save);
         self.bump(); // (
+        // Empty `()` — unit, or a zero-param lambda `() => …`.
+        if self.at(TokenKind::RParen) {
+            self.bump();
+            if self.at(TokenKind::FatArrow) {
+                return self.lambda_body(lo);
+            }
+            return Expr::Tuple {
+                span: self.finish(lo),
+                elems: Vec::new(),
+            };
+        }
         let inner = self.expr();
-        // Tuple literal: `(a, b, …)`. If a comma follows, collect the rest.
+        // Tuple literal `(a, b, …)` or lambda params `(a, b) => …`.
         if self.at(TokenKind::Comma) {
             let mut elems = vec![inner];
             while self.eat(TokenKind::Comma) {
@@ -637,12 +677,19 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(TokenKind::RParen, "`)` to close tuple literal");
+            if self.at(TokenKind::FatArrow) {
+                return self.lambda_body(lo);
+            }
             return Expr::Tuple {
                 span: self.finish(lo),
                 elems,
             };
         }
         self.expect(TokenKind::RParen, "`)` to close parenthesized expression");
+        // `(x) => …` — single-param lambda.
+        if self.at(TokenKind::FatArrow) {
+            return self.lambda_body(lo);
+        }
         Expr::Paren {
             span: self.finish(lo),
             inner: Box::new(inner),
@@ -957,7 +1004,16 @@ impl<'a> Parser<'a> {
     fn try_local_function(&mut self) -> Option<Stmt> {
         if !matches!(
             self.kind(),
-            TokenKind::Ident | TokenKind::LParen | TokenKind::Keyword(Keyword::Var)
+            TokenKind::Ident
+                | TokenKind::LParen
+                | TokenKind::Keyword(
+                    Keyword::Var
+                        | Keyword::Delegate
+                        | Keyword::Function
+                        | Keyword::Comptype
+                        | Keyword::Decltype
+                        | Keyword::RetType
+                )
         ) {
             return None;
         }
@@ -1034,7 +1090,16 @@ impl<'a> Parser<'a> {
         // Only attempt if the current token could plausibly start a type.
         if !matches!(
             self.kind(),
-            TokenKind::Ident | TokenKind::LParen | TokenKind::Keyword(Keyword::Var)
+            TokenKind::Ident
+                | TokenKind::LParen
+                | TokenKind::Keyword(
+                    Keyword::Var
+                        | Keyword::Delegate
+                        | Keyword::Function
+                        | Keyword::Comptype
+                        | Keyword::Decltype
+                        | Keyword::RetType
+                )
         ) {
             return None;
         }

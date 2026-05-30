@@ -310,6 +310,12 @@ pub enum Expr {
         span: Span,
         elems: Vec<Expr>,
     },
+    /// A lambda / closure: `x => e`, `(a, b) => e`, `=> { … }`. The
+    /// parameters are parsed and discarded for now; `body` is retained.
+    Lambda {
+        span: Span,
+        body: Box<Stmt>,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
 }
@@ -341,7 +347,8 @@ impl Expr {
             | Expr::Generic { span, .. }
             | Expr::Cast { span, .. }
             | Expr::DotIdent { span, .. }
-            | Expr::Tuple { span, .. } => *span,
+            | Expr::Tuple { span, .. }
+            | Expr::Lambda { span, .. } => *span,
         }
     }
 }
