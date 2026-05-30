@@ -139,6 +139,9 @@ version = "0.0.1"
 [[package]]
 name = "newbf-ir"
 version = "0.0.1"
+dependencies = [
+ "newbf-lexer",
+]
 
 [[package]]
 name = "newbf-lexer"
