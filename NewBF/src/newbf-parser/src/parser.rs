@@ -902,15 +902,23 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Base(span)
             }
-            // Builtin "function-like" keywords are treated as primaries so
-            // `sizeof(T)` / `typeof(T)` / `default(T)` parse as calls.
-            // `var`/`let` here covers pattern bindings inside `case`
-            // patterns (e.g. `case .Ok(var val):`).
-            Keyword::SizeOf
-            | Keyword::AlignOf
-            | Keyword::StrideOf
-            | Keyword::TypeOf
-            | Keyword::NameOf
+            // `sizeof`/`typeof`/`alignof`/`strideof` take a *type* argument,
+            // which can use type-only syntax an expression can't (`char8*`,
+            // `int[]`, `List<T>`). Parse `( type )` and drop it for now (the
+            // result is a placeholder primary; the type is recovered later).
+            Keyword::SizeOf | Keyword::AlignOf | Keyword::StrideOf | Keyword::TypeOf => {
+                self.bump();
+                if self.eat(TokenKind::LParen) {
+                    let _ty = self.ty();
+                    self.expect(TokenKind::RParen, "`)` after type argument");
+                }
+                Expr::Ident(span)
+            }
+            // These take an *expression* (or optional) argument, so the
+            // postfix `(…)` Call handles them: `nameof(x)`, `default(T)`,
+            // `comptype(e)`. Treated as a primary. `var`/`let` below cover
+            // pattern bindings (e.g. `case .Ok(var val):`).
+            Keyword::NameOf
             | Keyword::Comptype
             | Keyword::Decltype
             | Keyword::RetType

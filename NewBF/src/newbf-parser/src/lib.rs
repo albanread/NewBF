@@ -432,9 +432,12 @@ mod tests {
         assert_eq!(ok("new Foo(1)"), "(new (call Foo 1))");
         assert_eq!(ok("delete x"), "(delete x)");
         assert_eq!(ok("ref x"), "(ref x)");
-        // sizeof/typeof/default are primaries, so they parse as calls
-        assert_eq!(ok("sizeof(int)"), "(call sizeof int)");
-        assert_eq!(ok("typeof(T)"), "(call typeof T)");
+        // sizeof/typeof take a *type* argument (consumed; placeholder primary)
+        assert_eq!(ok("sizeof(int)"), "sizeof");
+        assert_eq!(ok("typeof(T)"), "typeof");
+        assert_eq!(ok("sizeof(char8*)"), "sizeof");
+        // default/nameof still parse their `(…)` as a call (expression arg)
+        assert_eq!(ok("default(T)"), "(call default T)");
     }
 
     #[test]
