@@ -278,10 +278,12 @@ impl<'a> Parser<'a> {
         }
         if let Some(kw) = self.peek_prefix_kw() {
             self.bump();
-            // optional `:qualifier` (allocator/scope qualifier)
-            let qualifier = if self.eat(TokenKind::Colon) {
+            // optional qualifier: `new:alloc`, `delete:null`, `scope:mixin`,
+            // or `scope::` (outer/enclosing-scope marker).
+            let qualifier = if self.eat(TokenKind::ColonColon) {
+                None // `scope::` — enclosing scope; no named qualifier
+            } else if self.eat(TokenKind::Colon) {
                 let q = self.cur().span;
-                // qualifier is an identifier or a keyword like `null`
                 if matches!(self.kind(), TokenKind::Ident | TokenKind::Keyword(_)) {
                     self.bump();
                     Some(q)
@@ -753,11 +755,11 @@ impl<'a> Parser<'a> {
 
     fn peek_binop(&self) -> Option<BinOp> {
         Some(match self.kind() {
-            TokenKind::Star => BinOp::Mul,
+            TokenKind::Star | TokenKind::AmpStar => BinOp::Mul,
             TokenKind::Slash => BinOp::Div,
             TokenKind::Percent => BinOp::Mod,
-            TokenKind::Plus => BinOp::Add,
-            TokenKind::Minus => BinOp::Sub,
+            TokenKind::Plus | TokenKind::AmpPlus => BinOp::Add,
+            TokenKind::Minus | TokenKind::AmpMinus => BinOp::Sub,
             TokenKind::Shl => BinOp::Shl,
             TokenKind::Shr => BinOp::Shr,
             TokenKind::Amp => BinOp::BitAnd,
@@ -785,9 +787,9 @@ impl<'a> Parser<'a> {
     fn peek_assign_op(&self) -> Option<AssignOp> {
         Some(match self.kind() {
             TokenKind::Assign => AssignOp::Assign,
-            TokenKind::PlusEq => AssignOp::Add,
-            TokenKind::MinusEq => AssignOp::Sub,
-            TokenKind::StarEq => AssignOp::Mul,
+            TokenKind::PlusEq | TokenKind::AmpPlusEq => AssignOp::Add,
+            TokenKind::MinusEq | TokenKind::AmpMinusEq => AssignOp::Sub,
+            TokenKind::StarEq | TokenKind::AmpStarEq => AssignOp::Mul,
             TokenKind::SlashEq => AssignOp::Div,
             TokenKind::PercentEq => AssignOp::Mod,
             TokenKind::AmpEq => AssignOp::And,
@@ -1007,7 +1009,20 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let arm_lo = self.start();
             let pattern = if self.eat_kw(Keyword::Case) {
-                Some(self.expr())
+                let first = self.expr();
+                // Multiple values per case: `case a, b, c:` — keep the
+                // first, consume the rest.
+                while self.eat(TokenKind::Comma) {
+                    if self.at(TokenKind::Colon) {
+                        break;
+                    }
+                    let before = self.pos;
+                    let _ = self.expr();
+                    if self.pos == before {
+                        break;
+                    }
+                }
+                Some(first)
             } else if self.eat_kw(Keyword::Default) {
                 None
             } else {

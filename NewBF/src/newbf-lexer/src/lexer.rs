@@ -399,6 +399,13 @@ impl Lexer<'_> {
             b'&' => match self.at(1) {
                 b'&' => tok!(2, AmpAmp),
                 b'=' => tok!(2, AmpEq),
+                // Overflow arithmetic: `&+` `&-` `&*` and `&+=` etc.
+                b'+' if self.at(2) == b'=' => tok!(3, AmpPlusEq),
+                b'+' => tok!(2, AmpPlus),
+                b'-' if self.at(2) == b'=' => tok!(3, AmpMinusEq),
+                b'-' => tok!(2, AmpMinus),
+                b'*' if self.at(2) == b'=' => tok!(3, AmpStarEq),
+                b'*' => tok!(2, AmpStar),
                 _ => tok!(1, Amp),
             },
             b'|' => match self.at(1) {

@@ -206,6 +206,13 @@ pub enum TokenKind {
     Shr,
     PlusPlus,
     MinusMinus,
+    // Beef overflow arithmetic operators.
+    AmpPlus,    // &+
+    AmpMinus,   // &-
+    AmpStar,    // &*
+    AmpPlusEq,  // &+=
+    AmpMinusEq, // &-=
+    AmpStarEq,  // &*=
     At,
     Dollar,
 
