@@ -152,7 +152,16 @@ impl<'ctx> Codegen<'ctx, '_> {
         for f in &ir.funcs {
             if self.module.get_function(&f.name).is_none() {
                 let fty = self.fn_type(&f.params, f.ret);
-                self.module.add_function(&f.name, fty, None);
+                let fv = self.module.add_function(&f.name, fty, None);
+                // Defined functions carry async (`2`) unwind tables so LLVM
+                // emits `.pdata`/`.xdata` — the JIT memory manager registers
+                // these with `RtlAddFunctionTable` so exceptions unwind
+                // through JIT'd frames (MANIFESTO core decision 16).
+                if !f.is_extern {
+                    let kind = inkwell::attributes::Attribute::get_named_enum_kind_id("uwtable");
+                    let attr = self.ctx.create_enum_attribute(kind, 2);
+                    fv.add_attribute(inkwell::attributes::AttributeLoc::Function, attr);
+                }
             }
         }
     }

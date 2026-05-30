@@ -232,6 +232,7 @@ name = "newbf-llvm"
 version = "0.0.1"
 dependencies = [
  "inkwell",
+ "llvm-sys",
  "newbf-ir",
 ]
 

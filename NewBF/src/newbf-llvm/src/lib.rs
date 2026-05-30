@@ -15,6 +15,9 @@
 //! [`emit_module`]). The JIT memory manager + Win64 SEH registration are
 //! lifted from NewM2's `newm2-llvm` when the ORC JIT spike lands.
 
+mod jit;
+mod jit_mm;
 mod lower;
 
+pub use jit::OrcJit;
 pub use lower::{emit_module, lower_to_string, verify_module};

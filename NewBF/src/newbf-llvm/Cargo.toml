@@ -5,12 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "NewBF: LLVM lowering, JIT, and AOT object/executable emission."
 
-# LLVM is ACTIVE as of Sprint 07: IR→LLVM lowering + the dump-llvm report.
-# llvm-sys (to drive the ORCv2 layer) and the NewM2 SEH manager land with the
-# ORC JIT spike later in the sprint.
+# LLVM is ACTIVE as of Sprint 07. inkwell builds modules; llvm-sys drives the
+# ORCv2 LLJIT layer directly (inkwell's ORCv2 coverage is partial), and is used
+# for the Win64-SEH unwind-registration memory manager ported from NewM2.
 [dependencies]
 newbf-ir.workspace = true
 inkwell.workspace  = true
+llvm-sys.workspace = true
 
 [lints]
 workspace = true
