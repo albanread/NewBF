@@ -213,6 +213,7 @@ dependencies = [
  "newbf-lexer",
  "newbf-llvm",
  "newbf-parser",
+ "newbf-runtime",
  "newbf-sema",
 ]
 

@@ -74,6 +74,11 @@ enum Command {
 }
 
 fn main() {
+    // Arm the compiler process first thing: a fault (ours, or a JIT'd /
+    // comptime fault running in-process) prints a signal-safe crash dump
+    // instead of dying silently (MANIFESTO core decision 16).
+    newbf_runtime::install_crash_handler();
+
     let cli = Cli::parse();
     match cli.command {
         None => {
