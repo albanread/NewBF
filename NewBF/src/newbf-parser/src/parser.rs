@@ -1592,14 +1592,17 @@ impl<'a> Parser<'a> {
         let lo = self.start();
         self.bump(); // do / repeat
         let body = Box::new(self.stmt());
-        self.expect(
-            TokenKind::Keyword(Keyword::While),
-            "`while` after loop body",
-        );
-        self.expect(TokenKind::LParen, "`(` after `while`");
-        let cond = self.expr();
-        self.expect(TokenKind::RParen, "`)` after while-condition");
-        self.eat(TokenKind::Semicolon);
+        // A Beef `do { … }` may be a plain breakable block with no trailing
+        // `while`; only consume the condition when `while` is present.
+        let cond = if self.eat_kw(Keyword::While) {
+            self.expect(TokenKind::LParen, "`(` after `while`");
+            let c = self.expr();
+            self.expect(TokenKind::RParen, "`)` after while-condition");
+            self.eat(TokenKind::Semicolon);
+            c
+        } else {
+            Expr::Ident(Span::new(self.file, lo, lo))
+        };
         Stmt::DoWhile {
             span: self.finish(lo),
             body,
