@@ -64,6 +64,13 @@ enum Command {
         /// Path to a `.bf` source file or a directory.
         input: String,
     },
+    /// Dump the LLVM IR for a .bf file or directory (the backend phase
+    /// report). Lowers the typed SSA IR to LLVM via inkwell; the same
+    /// module feeds the ORC JIT and AOT object emission.
+    DumpLlvm {
+        /// Path to a `.bf` source file or a directory.
+        input: String,
+    },
 }
 
 fn main() {
@@ -124,6 +131,7 @@ fn main() {
         },
         Some(Command::DumpDefs { input }) => dump_defs(&input),
         Some(Command::DumpIr { input }) => dump_ir(&input),
+        Some(Command::DumpLlvm { input }) => dump_llvm(&input),
     }
 }
 
@@ -246,6 +254,59 @@ fn dump_ir(input: &str) {
     let program = newbf_sema::analyze(&files);
     let module = newbf_sema::lower_program(&files, &program);
     print!("{}", newbf_ir::format_ir(&module));
+
+    if parse_diags > 0 {
+        eprintln!(
+            "(note: {parse_diags} parse diagnostics across {} files)",
+            paths.len()
+        );
+    }
+}
+
+fn dump_llvm(input: &str) {
+    let root = std::path::Path::new(input);
+    let mut paths = Vec::new();
+    if root.is_file() {
+        paths.push(root.to_path_buf());
+    } else {
+        collect_bf(root, &mut paths);
+    }
+    if paths.is_empty() {
+        eprintln!("dump-llvm: no .bf files at {input}");
+        std::process::exit(1);
+    }
+
+    let mut srcs: Vec<String> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(s) => srcs.push(s),
+            Err(e) => {
+                eprintln!("dump-llvm: cannot read {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut units = Vec::with_capacity(paths.len());
+    let mut parse_diags = 0usize;
+    for (i, src) in srcs.iter().enumerate() {
+        let (unit, diags) = newbf_parser::parse_file(src, newbf_lexer::FileId(i as u32));
+        parse_diags += diags.len();
+        units.push(unit);
+    }
+    let files: Vec<newbf_sema::SourceFile<'_>> = srcs
+        .iter()
+        .zip(units.iter())
+        .enumerate()
+        .map(|(i, (src, unit))| newbf_sema::SourceFile {
+            file: newbf_lexer::FileId(i as u32),
+            src,
+            unit,
+        })
+        .collect();
+
+    let program = newbf_sema::analyze(&files);
+    let module = newbf_sema::lower_program(&files, &program);
+    print!("{}", newbf_llvm::lower_to_string(&module));
 
     if parse_diags > 0 {
         eprintln!(

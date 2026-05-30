@@ -15,6 +15,7 @@ newbf-lexer.workspace = true
 newbf-parser.workspace = true
 newbf-sema.workspace = true
 newbf-ir.workspace = true
+newbf-llvm.workspace = true
 
 [lints]
 workspace = true

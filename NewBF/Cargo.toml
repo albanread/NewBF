@@ -48,8 +48,8 @@ clap = { version = "4.5", features = ["derive"] }
 # these yet, so `cargo build --workspace` succeeds without LLVM
 # installed. To activate, add `inkwell` / `llvm-sys` to newbf-llvm's
 # [dependencies] and wire the JIT memory manager lifted from NewM2.
-inkwell  = { version = "=0.9.0", features = ["llvm22-1"] }
-llvm-sys = { version = "=221.0.1", features = ["force-static"] }
+inkwell  = { version = "=0.9.0", default-features = false, features = ["llvm22-1", "target-x86"] }
+llvm-sys = { version = "=221.0.1", default-features = false, features = ["force-static"] }
 
 # Internal crates, referenced by the driver as the pipeline is wired up
 # sprint by sprint (path deps so edits are picked up without publishing).

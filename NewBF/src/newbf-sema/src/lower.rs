@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CmpPred, Const, Function, FunctionBuilder, IrType, Module,
+    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, Function, FunctionBuilder, IrType, Module,
     Param as IrParam, Value,
 };
 use newbf_parser::{
@@ -113,8 +113,13 @@ fn lower_method(
     match body_stmt {
         MethodBody::Block(stmt) => lw.stmt(stmt, src),
         MethodBody::Expr(expr) => {
-            let (v, _) = lw.expr(expr, src);
-            lw.ret(Some(v));
+            let (v, t) = lw.expr(expr, src);
+            if lw.ret_ty == IrType::Void {
+                lw.ret(None);
+            } else {
+                let cv = lw.coerce(v, t, lw.ret_ty);
+                lw.ret(Some(cv));
+            }
         }
         MethodBody::None => unreachable!(),
     }
@@ -214,7 +219,17 @@ impl Lowerer {
                 self.bind(name.text(src), slot, slot_ty);
             }
             Stmt::Return { value, .. } => {
-                let v = value.as_ref().map(|e| self.expr(e, src).0);
+                // Coerce the returned value to the function's return type so
+                // the IR's `ret` always matches the signature (a void function
+                // discards any value).
+                let v = if self.ret_ty == IrType::Void {
+                    None
+                } else {
+                    value.as_ref().map(|e| {
+                        let (v, t) = self.expr(e, src);
+                        self.coerce(v, t, self.ret_ty)
+                    })
+                };
                 self.ret(v);
             }
             Stmt::If {
@@ -315,16 +330,16 @@ impl Lowerer {
         let (v, t) = self.expr(operand, src);
         match op {
             UnOp::Pos => (v, t),
-            UnOp::Neg => {
-                let op = if t.is_float() {
-                    IrBin::FSub
-                } else {
-                    IrBin::Sub
-                };
-                (self.fb.bin(op, zero_of(t), v, t), t)
-            }
+            // Negation and bit-complement are numeric (LLVM has no pointer
+            // arithmetic op). `is_int()` includes `bool`. On a pointer /
+            // aggregate / void there is no meaningful kernel lowering, so
+            // yield a typed `undef` instead of an integer op that lies about
+            // its result type.
+            UnOp::Neg if t.is_float() => (self.fb.bin(IrBin::FSub, zero_of(t), v, t), t),
+            UnOp::Neg if t.is_int() => (self.fb.bin(IrBin::Sub, zero_of(t), v, t), t),
+            UnOp::BitNot if t.is_int() => (self.fb.bin(IrBin::Xor, v, Value::int(-1, t), t), t),
+            UnOp::Neg | UnOp::BitNot => (undef(t), t),
             UnOp::Not => (self.fb.cmp(CmpPred::Eq, v, zero_of(t)), IrType::Bool),
-            UnOp::BitNot => (self.fb.bin(IrBin::Xor, v, Value::int(-1, t), t), t),
             // ++/--/*deref/&addr-of — later.
             _ => (undef(t), t),
         }
@@ -332,20 +347,48 @@ impl Lowerer {
 
     fn binary(&mut self, op: AstBin, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
         let (l, lt) = self.expr(lhs, src);
-        let (r, _rt) = self.expr(rhs, src);
+        let (r, rt) = self.expr(rhs, src);
         match op {
-            AstBin::Add | AstBin::Sub | AstBin::Mul | AstBin::Div | AstBin::Mod => {
-                (self.arith(op, l, r, lt), lt)
+            AstBin::Add
+            | AstBin::Sub
+            | AstBin::Mul
+            | AstBin::Div
+            | AstBin::Mod
+            | AstBin::BitAnd
+            | AstBin::BitOr
+            | AstBin::BitXor => {
+                // Promote both operands to a common type so the IR op has
+                // matching, well-typed operands (LLVM requires it).
+                let ct = common_type(lt, rt);
+                let l = self.coerce(l, lt, ct);
+                let r = self.coerce(r, rt, ct);
+                (self.arith(op, l, r, ct), ct)
             }
-            AstBin::BitAnd | AstBin::BitOr | AstBin::BitXor | AstBin::Shl | AstBin::Shr => {
-                (self.arith(op, l, r, lt), lt)
+            // Shifts keep the shifted value's type; only the shift amount is
+            // coerced to match it.
+            AstBin::Shl | AstBin::Shr => {
+                let st = if lt == IrType::Ptr { IrType::I64 } else { lt };
+                let l = self.coerce(l, lt, st);
+                let r = self.coerce(r, rt, st);
+                (self.arith(op, l, r, st), st)
             }
             // `&&`/`||` lowered as bitwise on i1 for the kernel (no
-            // short-circuit side effects yet).
-            AstBin::And => (self.fb.bin(IrBin::And, l, r, IrType::Bool), IrType::Bool),
-            AstBin::Or => (self.fb.bin(IrBin::Or, l, r, IrType::Bool), IrType::Bool),
+            // short-circuit side effects yet); both sides become `i1`.
+            AstBin::And => {
+                let l = self.coerce_bool(l, lt);
+                let r = self.coerce_bool(r, rt);
+                (self.fb.bin(IrBin::And, l, r, IrType::Bool), IrType::Bool)
+            }
+            AstBin::Or => {
+                let l = self.coerce_bool(l, lt);
+                let r = self.coerce_bool(r, rt);
+                (self.fb.bin(IrBin::Or, l, r, IrType::Bool), IrType::Bool)
+            }
             AstBin::Lt | AstBin::Le | AstBin::Gt | AstBin::Ge | AstBin::Eq | AstBin::Ne => {
-                (self.fb.cmp(cmp_pred(op, lt), l, r), IrType::Bool)
+                let ct = common_type(lt, rt);
+                let l = self.coerce(l, lt, ct);
+                let r = self.coerce(r, rt, ct);
+                (self.fb.cmp(cmp_pred(op, ct), l, r), IrType::Bool)
             }
             // ranges, is/as/case, <=>, ?? — later.
             _ => (undef(lt), lt),
@@ -399,6 +442,9 @@ impl Lowerer {
         if let Expr::Ident(s) = target
             && let Some((slot, ty)) = self.lookup(s.text(src))
         {
+            // The stored value must have the slot's type for later loads to be
+            // consistent; coerce the RHS to it.
+            let rhs = self.coerce(rhs, rhs_ty, ty);
             let stored = match compound_op(op) {
                 Some(astbin) => {
                     let cur = self.fb.load(slot.clone(), ty);
@@ -421,10 +467,101 @@ impl Lowerer {
             self.fb.cmp(CmpPred::Ne, v, zero_of(ty))
         }
     }
+
+    /// Convert `v` (currently of type `from`) to type `to`, emitting the
+    /// appropriate IR cast. Keeps the IR well-typed at every use site; when no
+    /// single cast bridges the two (e.g. `ptr`↔`float`) it yields a typed
+    /// `undef` rather than emitting an ill-typed instruction.
+    fn coerce(&mut self, v: Value, from: IrType, to: IrType) -> Value {
+        if from == to {
+            return v;
+        }
+        // To bool is a truthiness test, not a bit-level cast.
+        if to == IrType::Bool {
+            return self.coerce_bool(v, from);
+        }
+        match (from, to) {
+            // Same-width integers share one LLVM type (signedness isn't in the
+            // type), so no cast is needed.
+            (a, b) if a.is_int() && b.is_int() && a.bit_width() == b.bit_width() => v,
+            (a, b) if a.is_int() && b.is_int() => {
+                let kind = if b.bit_width() > a.bit_width() {
+                    if a.is_signed() {
+                        CastKind::SExt
+                    } else {
+                        CastKind::ZExt
+                    }
+                } else {
+                    CastKind::Trunc
+                };
+                self.fb.cast(kind, v, to)
+            }
+            (a, b) if a.is_int() && b.is_float() => {
+                let kind = if a.is_signed() {
+                    CastKind::SiToFp
+                } else {
+                    CastKind::UiToFp
+                };
+                self.fb.cast(kind, v, to)
+            }
+            (a, b) if a.is_float() && b.is_int() => {
+                let kind = if b.is_signed() {
+                    CastKind::FpToSi
+                } else {
+                    CastKind::FpToUi
+                };
+                self.fb.cast(kind, v, to)
+            }
+            (a, b) if a.is_float() && b.is_float() => {
+                let kind = if b.bit_width() > a.bit_width() {
+                    CastKind::FpExt
+                } else {
+                    CastKind::FpTrunc
+                };
+                self.fb.cast(kind, v, to)
+            }
+            (IrType::Ptr, b) if b.is_int() => self.fb.cast(CastKind::PtrToInt, v, to),
+            (a, IrType::Ptr) if a.is_int() => self.fb.cast(CastKind::IntToPtr, v, to),
+            // No single cast bridges the gap — stay well-typed with an undef.
+            _ => undef(to),
+        }
+    }
 }
 
 fn with_float(is_float: bool, int_op: IrBin, float_op: IrBin) -> IrBin {
     if is_float { float_op } else { int_op }
+}
+
+/// Float bit width, or 0 for non-floats (helper for [`common_type`]).
+fn float_bits(t: IrType) -> u16 {
+    if t.is_float() { t.bit_width() } else { 0 }
+}
+
+/// The common type two operands are promoted to for a binary op. Mirrors a
+/// C-like promotion: any float wins; otherwise the wider integer (signed if
+/// either is). Pointers have no LLVM arithmetic/compare ops, so a pointer
+/// operand drops into the integer domain (address arithmetic).
+fn common_type(a: IrType, b: IrType) -> IrType {
+    let t = match (a, b) {
+        _ if a == b => a,
+        (x, y) if x.is_float() || y.is_float() => IrType::Float {
+            bits: float_bits(x).max(float_bits(y)).max(32),
+        },
+        (x, y) if x.is_int() && y.is_int() => {
+            let bits = x.bit_width().max(y.bit_width()).max(1);
+            if bits <= 1 {
+                IrType::Bool
+            } else {
+                IrType::Int {
+                    bits,
+                    signed: x.is_signed() || y.is_signed(),
+                }
+            }
+        }
+        // ptr/int mix, ptr/float, void, … → integer domain.
+        _ => IrType::I64,
+    };
+    if t == IrType::Ptr { IrType::I64 } else { t }
 }
 
 fn cmp_pred(op: AstBin, ty: IrType) -> CmpPred {

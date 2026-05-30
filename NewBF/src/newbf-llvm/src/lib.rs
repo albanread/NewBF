@@ -11,6 +11,10 @@
 //! per-function LLVM pass pipelines. Emits LLVM IR, mixed-opt, and asm
 //! reports.
 //!
-//! Lands in SPRINTS.md Sprint 07. LLVM is pinned to the portfolio major
-//! (22.1) but the dependency is inactive until then. The JIT memory
-//! manager + Win64 SEH registration are lifted from NewM2's `newm2-llvm`.
+//! Sprint 07: IR→LLVM lowering + the `dump-llvm` report (this file's
+//! [`emit_module`]). The JIT memory manager + Win64 SEH registration are
+//! lifted from NewM2's `newm2-llvm` when the ORC JIT spike lands.
+
+mod lower;
+
+pub use lower::{emit_module, lower_to_string, verify_module};

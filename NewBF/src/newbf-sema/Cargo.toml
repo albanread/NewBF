@@ -10,5 +10,9 @@ newbf-lexer.workspace = true
 newbf-parser.workspace = true
 newbf-ir.workspace = true
 
+[dev-dependencies]
+# The LLVM backend, used by the corpus verify gate (lower → emit → verify).
+newbf-llvm.workspace = true
+
 [lints]
 workspace = true

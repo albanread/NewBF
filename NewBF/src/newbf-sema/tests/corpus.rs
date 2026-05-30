@@ -139,3 +139,58 @@ fn lowering_does_not_panic_on_real_beef() {
     );
     assert!(total_funcs > 0, "lowering produced no functions");
 }
+
+/// LLVM lowering must (1) never panic and (2) produce a module that passes
+/// LLVM's own verifier, on every real Beef file. The verifier is the
+/// correctness backstop: a clean verify means the typed SSA IR we emit is
+/// internally consistent (types match at every use, every block is
+/// terminated, phis are well-formed).
+#[test]
+fn llvm_lowering_verifies_on_real_beef() {
+    let mut files = Vec::new();
+    collect_bf(&root().join("corlib-slice"), &mut files);
+    collect_bf(&root().join("feature-suite/src"), &mut files);
+    assert!(!files.is_empty(), "no .bf fixtures found");
+
+    let mut clean = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for path in &files {
+        let src = std::fs::read_to_string(path).unwrap();
+        let (unit, _pdiags) = parse_file(&src, FileId(0));
+        let srcs = [SourceFile {
+            file: FileId(0),
+            src: &src,
+            unit: &unit,
+        }];
+        let program = analyze(&srcs);
+        let module = lower_program(&srcs, &program);
+        match newbf_llvm::verify_module(&module) {
+            Ok(()) => clean += 1,
+            Err(e) => {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                // Keep only the first line of the verifier message.
+                let first = e.lines().next().unwrap_or("").to_string();
+                failed.push((name, first));
+            }
+        }
+    }
+
+    eprintln!(
+        "llvm verify: {clean} / {} modules verified clean ({} failed)",
+        files.len(),
+        failed.len()
+    );
+    for (name, msg) in failed.iter().take(15) {
+        eprintln!("    {name}: {msg}");
+    }
+
+    // Clean-verify ratchet: every Beef file must lower to a verifiable LLVM
+    // module. The floor is 100%.
+    assert_eq!(
+        clean,
+        files.len(),
+        "llvm clean-verify coverage regressed below 100%: {clean} / {}",
+        files.len()
+    );
+}
