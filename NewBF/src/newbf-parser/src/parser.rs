@@ -1890,7 +1890,28 @@ impl<'a> Parser<'a> {
         if !self.at(TokenKind::Gt) && !self.at(TokenKind::Shr) {
             loop {
                 let before = self.pos;
-                args.push(self.ty());
+                // Const generic argument: `Foo<const N>`, or a bare literal
+                // value (`Foo<16>`, `Foo<true>`). A type never starts with a
+                // numeric/char/bool literal, so this is unambiguous. Parse the
+                // value expression and stand a placeholder type in for it.
+                let arg = if self.at_kw(Keyword::Const)
+                    || matches!(
+                        self.kind(),
+                        TokenKind::Int
+                            | TokenKind::Float
+                            | TokenKind::Char
+                            | TokenKind::Keyword(Keyword::True)
+                            | TokenKind::Keyword(Keyword::False)
+                            | TokenKind::Minus
+                    ) {
+                    let s = self.cur().span;
+                    let _ = self.eat_kw(Keyword::Const);
+                    let _ = self.unary();
+                    Type::Var(s)
+                } else {
+                    self.ty()
+                };
+                args.push(arg);
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }

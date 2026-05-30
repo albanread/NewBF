@@ -590,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn const_generic_arguments() {
+        // `const N` and bare literal generic args (placeholder `var` stands
+        // in for the const value).
+        assert_eq!(ok_type("StructV<const 16>"), "StructV<var>");
+        assert_eq!(ok_type("Array<int, const 4>"), "Array<int,var>");
+        assert_eq!(ok_type("Foo<16>"), "Foo<var>");
+    }
+
+    #[test]
     fn tuple_types() {
         assert_eq!(ok_type("(int, int)"), "(tup int int)");
         assert_eq!(ok_type("(A, B, C<T>)"), "(tup A B C<T>)");
