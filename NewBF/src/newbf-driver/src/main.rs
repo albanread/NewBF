@@ -76,6 +76,22 @@ enum Command {
         /// Path to a `.bf` source file or a directory.
         input: String,
     },
+    /// Symbolicate a crash dump's raw hex IPs against a linker `.map` —
+    /// frames-with-names for our own code, no dbghelp/PDB needed.
+    Symbolicate {
+        /// `.map` emitted by the linker; `compile` produces `<exe>.map`.
+        #[arg(short, long)]
+        map: String,
+        /// Crash-dump file to rewrite (default: stdin).
+        input: Option<String>,
+        /// Write the rewritten dump here (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Runtime exe base in hex for the ASLR slide (default: the `.map`'s
+        /// preferred base).
+        #[arg(long)]
+        runtime_base: Option<String>,
+    },
 }
 
 fn main() {
@@ -140,6 +156,17 @@ fn main() {
         Some(Command::DumpDefs { input }) => dump_defs(&input),
         Some(Command::DumpIr { input }) => dump_ir(&input),
         Some(Command::DumpLlvm { input }) => dump_llvm(&input),
+        Some(Command::Symbolicate {
+            map,
+            input,
+            output,
+            runtime_base,
+        }) => symbolicate_cmd(
+            &map,
+            input.as_deref(),
+            output.as_deref(),
+            runtime_base.as_deref(),
+        ),
     }
 }
 
@@ -444,4 +471,65 @@ fn add_main_stub(module: &mut newbf_ir::Module) {
     };
     f.ret(Some(code));
     module.add_function(f.finish());
+}
+
+fn symbolicate_cmd(
+    map: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    runtime_base: Option<&str>,
+) {
+    use std::io::{Read, Write};
+
+    let map_text = match std::fs::read_to_string(map) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("symbolicate: read {map}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let rt_base = match runtime_base {
+        None => None,
+        Some(s) => match u64::from_str_radix(s.trim_start_matches("0x"), 16) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("symbolicate: --runtime-base `{s}` is not hex: {e}");
+                std::process::exit(1);
+            }
+        },
+    };
+    let crash_text = match input {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("symbolicate: read {p}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            let mut s = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                eprintln!("symbolicate: stdin: {e}");
+                std::process::exit(1);
+            }
+            s
+        }
+    };
+    match newbf_llvm::symbolicate(&crash_text, &map_text, rt_base) {
+        Ok(out) => match output {
+            Some(p) => {
+                if let Err(e) = std::fs::write(p, out) {
+                    eprintln!("symbolicate: write {p}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                let _ = std::io::stdout().write_all(out.as_bytes());
+            }
+        },
+        Err(e) => {
+            eprintln!("symbolicate: {e}");
+            std::process::exit(1);
+        }
+    }
 }
