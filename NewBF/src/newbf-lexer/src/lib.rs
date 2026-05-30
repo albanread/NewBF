@@ -159,6 +159,23 @@ mod tests {
     }
 
     #[test]
+    fn overflow_strict_and_digit_separators() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("&+ &- &* &+= &-= &*= === !=="),
+            [
+                AmpPlus, AmpMinus, AmpStar, AmpPlusEq, AmpMinusEq, AmpStarEq, StrictEq, StrictNeq
+            ]
+        );
+        // `'` digit separators: each is a single Int token.
+        assert_eq!(kinds("0xFFFF'FFFF"), [Int]);
+        assert_eq!(kinds("1'000'000"), [Int]);
+        assert_eq!(kinds("0b1010'1010"), [Int]);
+        // a `'` not between digits still starts a char literal.
+        assert_eq!(kinds("5 'a'"), [Int, Char]);
+    }
+
+    #[test]
     fn range_and_spaceship_operators() {
         use TokenKind::*;
         // `..<` (exclusive range), `...` (closed range), `<=>` (compare)

@@ -853,14 +853,21 @@ impl<'a> Parser<'a> {
                 } else {
                     Vec::new()
                 };
-                let params = if self.at(TokenKind::LParen) { self.params() } else { Vec::new() };
+                let params = if self.at(TokenKind::LParen) {
+                    self.params()
+                } else {
+                    Vec::new()
+                };
                 let body = if self.at(TokenKind::LBrace) {
                     self.block()
                 } else if self.eat(TokenKind::FatArrow) {
                     let blo = self.start();
                     let e = self.expr();
                     self.expect(TokenKind::Semicolon, "`;` after `=> expr` body");
-                    Stmt::Expr { span: self.finish(blo), expr: e }
+                    Stmt::Expr {
+                        span: self.finish(blo),
+                        expr: e,
+                    }
                 } else {
                     self.expect(TokenKind::Semicolon, "mixin body");
                     Stmt::Empty(self.cur().span)
