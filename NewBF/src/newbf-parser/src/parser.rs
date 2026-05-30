@@ -267,6 +267,12 @@ impl<'a> Parser<'a> {
 
     fn unary(&mut self) -> Expr {
         let lo = self.start();
+        // `..expr` — Beef spread/append-to-target prefix (e.g. argument
+        // `f(.. new T())`). Consume the `..`; operand carries the value.
+        if self.at(TokenKind::DotDot) {
+            self.bump();
+            return self.unary();
+        }
         if let Some(op) = self.peek_unary_op() {
             self.bump();
             let operand = self.unary();
@@ -819,6 +825,17 @@ impl<'a> Parser<'a> {
     // ── statements ──────────────────────────────────────────────────────
 
     fn stmt(&mut self) -> Stmt {
+        // Attributes on a statement: `[Inline] { … }`, `[IgnoreErrors] …`.
+        if self.at(TokenKind::LBracket) {
+            let _ = self.attributes();
+            return self.stmt();
+        }
+        // Labeled statement: `label: stmt` (e.g. `outer: for (…)`).
+        if self.at(TokenKind::Ident) && self.nth_kind(1) == TokenKind::Colon {
+            self.bump(); // label
+            self.bump(); // :
+            return self.stmt();
+        }
         match self.kind() {
             TokenKind::LBrace => self.block(),
             TokenKind::Semicolon => {
@@ -1043,7 +1060,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // Multiple declarators: `int a, b = 2, c;` — keep first, consume rest.
         if consume_semi {
+            while self.eat(TokenKind::Comma) {
+                if !self.at(TokenKind::Ident) {
+                    break;
+                }
+                self.bump(); // name
+                if self.eat(TokenKind::Assign) {
+                    let _ = self.expr();
+                }
+            }
             self.expect(TokenKind::Semicolon, "`;` after local variable");
         }
         Some(Stmt::Local {
@@ -1375,11 +1402,26 @@ impl<'a> Parser<'a> {
             // `comptype(expr)` / `decltype(expr)` — type computed at
             // compile-time from an expression. Modeled as a Var
             // placeholder for now.
-            TokenKind::Keyword(Keyword::Comptype) | TokenKind::Keyword(Keyword::Decltype) => {
+            TokenKind::Keyword(Keyword::Comptype)
+            | TokenKind::Keyword(Keyword::Decltype)
+            | TokenKind::Keyword(Keyword::RetType) => {
                 self.bump();
-                self.expect(TokenKind::LParen, "`(` after comptype/decltype");
+                self.expect(TokenKind::LParen, "`(` after comptype/decltype/rettype");
                 let _e = self.expr();
-                self.expect(TokenKind::RParen, "`)` after comptype/decltype argument");
+                self.expect(
+                    TokenKind::RParen,
+                    "`)` after comptype/decltype/rettype argument",
+                );
+                Type::Var(self.finish(lo))
+            }
+            // Function/delegate types: `delegate Ret(params)`,
+            // `function Ret(params)`.
+            TokenKind::Keyword(Keyword::Delegate) | TokenKind::Keyword(Keyword::Function) => {
+                self.bump();
+                let _ret = self.ty();
+                if self.at(TokenKind::LParen) {
+                    let _ = self.params();
+                }
                 Type::Var(self.finish(lo))
             }
             // Bare `.` in type position = inferred type — the `(.)`
