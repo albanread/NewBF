@@ -356,6 +356,13 @@ pub enum TypeRef {
         span: Span,
         elems: Vec<TypeRef>,
     },
+    /// `function Ret(params)` / `delegate Ret(params)`.
+    Function {
+        span: Span,
+        is_delegate: bool,
+        return_ty: Box<TypeRef>,
+        params: Vec<TypeRef>,
+    },
     Var(Span),
     Error(Span),
 }
@@ -369,7 +376,8 @@ impl TypeRef {
             | TypeRef::Nullable { span, .. }
             | TypeRef::Array { span, .. }
             | TypeRef::Sized { span, .. }
-            | TypeRef::Tuple { span, .. } => *span,
+            | TypeRef::Tuple { span, .. }
+            | TypeRef::Function { span, .. } => *span,
         }
     }
 }

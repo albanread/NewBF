@@ -316,6 +316,13 @@ pub enum Expr {
         span: Span,
         body: Box<Stmt>,
     },
+    /// A named argument in a call/index/attribute argument list:
+    /// `name: value`. Only valid in argument position.
+    Named {
+        span: Span,
+        name: Span,
+        value: Box<Expr>,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
 }
@@ -348,7 +355,8 @@ impl Expr {
             | Expr::Cast { span, .. }
             | Expr::DotIdent { span, .. }
             | Expr::Tuple { span, .. }
-            | Expr::Lambda { span, .. } => *span,
+            | Expr::Lambda { span, .. }
+            | Expr::Named { span, .. } => *span,
         }
     }
 }
@@ -497,6 +505,15 @@ pub enum Type {
     },
     /// `(A, B, …)` tuple type
     Tuple { span: Span, elems: Vec<Type> },
+    /// `function Ret(params)` / `delegate Ret(params)` — a function-pointer
+    /// or delegate type. Parameter names (if any) are dropped; only the
+    /// parameter types are part of the type.
+    Function {
+        span: Span,
+        is_delegate: bool,
+        return_ty: Box<Type>,
+        params: Vec<Type>,
+    },
     /// `var` used as a type position (inferred local)
     Var(Span),
     /// recovery placeholder for a malformed type
@@ -512,7 +529,8 @@ impl Type {
             | Type::Nullable { span, .. }
             | Type::Array { span, .. }
             | Type::Sized { span, .. }
-            | Type::Tuple { span, .. } => *span,
+            | Type::Tuple { span, .. }
+            | Type::Function { span, .. } => *span,
         }
     }
 }

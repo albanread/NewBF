@@ -561,7 +561,7 @@ impl<'a> Parser<'a> {
         let mut args = Vec::new();
         while !self.at(close) && !self.at(TokenKind::Eof) {
             let before = self.pos;
-            args.push(self.expr());
+            args.push(self.arg());
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -570,6 +570,24 @@ impl<'a> Parser<'a> {
             }
         }
         args
+    }
+
+    /// One argument: a plain expression, or a named argument `name: value`
+    /// (Beef call syntax). A leading `Ident :` at argument start is always a
+    /// named argument — a ternary would carry a `?`, and `::` is one token.
+    fn arg(&mut self) -> Expr {
+        if self.at(TokenKind::Ident) && self.nth_kind(1) == TokenKind::Colon {
+            let name = self.bump().span; // name
+            self.bump(); // :
+            let value = self.expr();
+            let span = Span::new(self.file, name.lo, value.span().hi);
+            return Expr::Named {
+                span,
+                name,
+                value: Box::new(value),
+            };
+        }
+        self.expr()
     }
 
     fn primary(&mut self) -> Expr {
@@ -728,6 +746,7 @@ impl<'a> Parser<'a> {
             | Type::Array { .. }
             | Type::Sized { .. }
             | Type::Tuple { .. }
+            | Type::Function { .. }
             | Type::Var(_) => true,
             Type::Path { segments, .. } => segments.iter().any(|s| !s.args.is_empty()),
             Type::Error(_) => false,
@@ -1363,6 +1382,32 @@ impl<'a> Parser<'a> {
         }
         self.pos = checkpoint; // not a for-each; rewind
 
+        // Typed for-each: `(Type IDENT in EXPR)` — e.g. `for (int i in 0..<10)`.
+        // (The binding type is dropped for now, like the count-loop below;
+        // a later sprint records it on `ForEach`.)
+        {
+            let save = self.save();
+            let _ = self.eat_kw(Keyword::Var) || self.eat_kw(Keyword::Let);
+            let _ty = self.ty();
+            if self.diagnostics.len() == save.diag_len
+                && self.at(TokenKind::Ident)
+                && self.nth_kind(1) == TokenKind::Keyword(Keyword::In)
+            {
+                let name = self.bump().span;
+                self.bump(); // in
+                let iter = self.expr();
+                self.expect(TokenKind::RParen, "`)` after for-each");
+                let body = Box::new(self.stmt());
+                return Stmt::ForEach {
+                    span: self.finish(lo),
+                    name,
+                    iter,
+                    body,
+                };
+            }
+            self.restore(save);
+        }
+
         // Beef count-loop: `for (var? Type name < EXPR)` — shorthand for
         // `for (Type name = 0; name < EXPR; name++)`. Modeled as ForEach
         // (the bound goes in `iter`; sema reinterprets).
@@ -1559,14 +1604,25 @@ impl<'a> Parser<'a> {
                 Type::Var(self.finish(lo))
             }
             // Function/delegate types: `delegate Ret(params)`,
-            // `function Ret(params)`.
+            // `function Ret(params)`, optionally with attributes between the
+            // keyword and the return type (`function [CallingConvention(.Cdecl)]
+            // void(StructC)`).
             TokenKind::Keyword(Keyword::Delegate) | TokenKind::Keyword(Keyword::Function) => {
+                let is_delegate = self.at_kw(Keyword::Delegate);
                 self.bump();
-                let _ret = self.ty();
-                if self.at(TokenKind::LParen) {
-                    let _ = self.params();
+                let _attrs = self.attributes();
+                let return_ty = Box::new(self.ty());
+                let params = if self.at(TokenKind::LParen) {
+                    self.params().into_iter().map(|p| p.ty).collect()
+                } else {
+                    Vec::new()
+                };
+                Type::Function {
+                    span: self.finish(lo),
+                    is_delegate,
+                    return_ty,
+                    params,
                 }
-                Type::Var(self.finish(lo))
             }
             // Bare `.` in type position = inferred type — the `(.)`
             // cast-to-inferred-type, `StructA v = .();` etc.
@@ -2838,7 +2894,9 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         let ty = self.ty();
-        let name = if self.at(TokenKind::Ident) {
+        // The name may be `this` (the explicit instance parameter of a
+        // function/delegate type or extension method: `StructB this`).
+        let name = if self.at(TokenKind::Ident) || self.at_kw(Keyword::This) {
             Some(self.bump().span)
         } else {
             None

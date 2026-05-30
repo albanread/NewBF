@@ -135,6 +135,9 @@ mod tests {
                 s
             }
             Expr::Lambda { body, .. } => format!("(lambda {})", sxs(src, body)),
+            Expr::Named { name, value, .. } => {
+                format!("(named {} {})", name.text(src), sx(src, value))
+            }
         }
     }
 
@@ -180,6 +183,21 @@ mod tests {
                 for e in elems {
                     s.push(' ');
                     s.push_str(&sxt(src, e));
+                }
+                s.push(')');
+                s
+            }
+            Type::Function {
+                is_delegate,
+                return_ty,
+                params,
+                ..
+            } => {
+                let kw = if *is_delegate { "delegate" } else { "function" };
+                let mut s = format!("({kw} {}", sxt(src, return_ty));
+                for p in params {
+                    s.push(' ');
+                    s.push_str(&sxt(src, p));
                 }
                 s.push(')');
                 s
@@ -368,6 +386,18 @@ mod tests {
         assert_eq!(ok("f(a + b, c)"), "(call f (+ a b) c)");
     }
 
+    #[test]
+    fn named_arguments() {
+        // Beef named args: `name: value`, mixable with positional args.
+        assert_eq!(
+            ok("f(p1: 1, 2, p3: 3)"),
+            "(call f (named p1 1) 2 (named p3 3))"
+        );
+        assert_eq!(ok("Named(p0: 1, 2, 3)"), "(call Named (named p0 1) 2 3)");
+        // A ternary argument is not mistaken for a named arg.
+        assert_eq!(ok("f(a ? b : c)"), "(call f (?: a b c))");
+    }
+
     // ── prefix keyword forms ────────────────────────────────────────────
 
     #[test]
@@ -533,6 +563,18 @@ mod tests {
     fn tuple_types() {
         assert_eq!(ok_type("(int, int)"), "(tup int int)");
         assert_eq!(ok_type("(A, B, C<T>)"), "(tup A B C<T>)");
+    }
+
+    #[test]
+    fn function_and_delegate_types() {
+        assert_eq!(ok_type("function void()"), "(function void)");
+        assert_eq!(ok_type("function int(int, int)"), "(function int int int)");
+        assert_eq!(ok_type("delegate void(StructC)"), "(delegate void StructC)");
+        // Attributes between the keyword and return type are tolerated.
+        assert_eq!(
+            ok_type("function [CallingConvention(.Cdecl)] void(StructC)"),
+            "(function void StructC)"
+        );
     }
 
     #[test]

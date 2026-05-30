@@ -542,6 +542,17 @@ impl Builder {
                 span: *span,
                 elems: elems.iter().map(|e| self.lower_type(e, f)).collect(),
             },
+            Type::Function {
+                span,
+                is_delegate,
+                return_ty,
+                params,
+            } => TypeRef::Function {
+                span: *span,
+                is_delegate: *is_delegate,
+                return_ty: Box::new(self.lower_type(return_ty, f)),
+                params: params.iter().map(|p| self.lower_type(p, f)).collect(),
+            },
             Type::Var(s) => TypeRef::Var(*s),
             Type::Error(s) => TypeRef::Error(*s),
         }

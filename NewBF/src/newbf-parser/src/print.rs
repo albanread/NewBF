@@ -203,6 +203,10 @@ impl Printer<'_> {
                 self.line(d, "Lambda");
                 self.stmt(body, d + 1);
             }
+            Expr::Named { name, value, .. } => {
+                self.line(d, &format!("Named {}", self.txt(*name)));
+                self.expr(value, d + 1);
+            }
         }
     }
 
@@ -251,6 +255,29 @@ impl Printer<'_> {
                 self.line(d, "TyTuple");
                 for e in elems {
                     self.ty(e, d + 1);
+                }
+            }
+            Type::Function {
+                is_delegate,
+                return_ty,
+                params,
+                ..
+            } => {
+                self.line(
+                    d,
+                    if *is_delegate {
+                        "TyDelegate"
+                    } else {
+                        "TyFunction"
+                    },
+                );
+                self.line(d + 1, "returns:");
+                self.ty(return_ty, d + 2);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.ty(p, d + 2);
+                    }
                 }
             }
         }

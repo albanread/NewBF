@@ -267,5 +267,15 @@ fn fmt_typeref(it: &Interner, t: &TypeRef) -> String {
             let es: Vec<String> = elems.iter().map(|e| fmt_typeref(it, e)).collect();
             format!("({})", es.join(", "))
         }
+        TypeRef::Function {
+            is_delegate,
+            return_ty,
+            params,
+            ..
+        } => {
+            let kw = if *is_delegate { "delegate" } else { "function" };
+            let ps: Vec<String> = params.iter().map(|p| fmt_typeref(it, p)).collect();
+            format!("{kw} {}({})", fmt_typeref(it, return_ty), ps.join(", "))
+        }
     }
 }
