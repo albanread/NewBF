@@ -509,10 +509,14 @@ impl<'a> Parser<'a> {
                     };
                 }
                 // `name!(args)` — Beef mixin/macro invocation. Modeled as
-                // a Call for now (the `!` is lost at this phase).
-                TokenKind::Bang if matches!(self.nth_kind(1), TokenKind::LParen) => {
+                // a Call for now (the `!` is lost at this phase). `name!::(…)`
+                // carries a `::` scope qualifier on the mixin.
+                TokenKind::Bang
+                    if matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::ColonColon) =>
+                {
                     self.bump(); // !
-                    self.bump(); // (
+                    let _ = self.eat(TokenKind::ColonColon); // optional `::`
+                    self.expect(TokenKind::LParen, "`(` for mixin call");
                     let args = self.arg_list(TokenKind::RParen);
                     self.expect(TokenKind::RParen, "`)` to close mixin call");
                     e = Expr::Call {
@@ -2051,6 +2055,9 @@ impl<'a> Parser<'a> {
                         TokenKind::Int
                             | TokenKind::Float
                             | TokenKind::Char
+                            | TokenKind::Str
+                            | TokenKind::VerbatimStr
+                            | TokenKind::InterpStr
                             | TokenKind::Keyword(Keyword::True)
                             | TokenKind::Keyword(Keyword::False)
                             | TokenKind::Minus
