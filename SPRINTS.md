@@ -186,6 +186,28 @@ parse whole real files.
 emits a clean `CompUnit` → `Using` → `Namespace (file-scoped)` → `class
 Program` → `Method [public static] Main` tree.
 
+### Delivered (Sprint 04d–05w — corpus to 100% clean)
+- [x] **The parser now parses the ENTIRE curated corpus cleanly: 152/152
+      files, zero diagnostics** (corlib-slice + feature-suite). The gate
+      floor is 100% (`assert_eq!`), so any regression fails CI. The road
+      from ~11% → 100% added, in rough order: preprocessor `#if`/`#elif`/
+      `#else` evaluation; explicit interface implementations; named call
+      args; function/delegate types; typed/tuple/count for-each; `sizeof`/
+      `typeof` type args; object & collection initializers (incl. indexed
+      `[k]=v` and anonymous-extension member bodies); lambda captures;
+      forced generic mixin calls `Get!<T>()` / `m!::()`; pattern matching
+      (`when`, `not case`, `let`/`var`/`ref` bindings, typed bindings);
+      `fallthrough`; open-ended & from-start ranges; const generics
+      (`const N`, literals, strings) and unbound `<,>`; `alloctype`/
+      `nullable`/`let` types; generic constructors with constraints; `where`
+      type-entities; `->` members; named tuple literals; declaration
+      conditions `if (T n = e)`; block expressions; `using` fields & using
+      modifiers; field/allocation destructors; `do { }` breakable blocks;
+      casts before `[`; interpolated strings with nested strings/braces.
+- [x] **Sema builds a contradiction-free definition graph for all 152
+      files** (gate also 100%). Parser unit tests: 64; lexer: 17; sema: 12;
+      plus both corpus gates. Build/clippy `-D warnings`/fmt/test all green.
+
 ---
 
 ## Sprint 05 — Definitions, namespaces, projects

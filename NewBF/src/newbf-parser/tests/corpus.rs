@@ -72,13 +72,14 @@ fn parser_does_not_panic_on_real_beef() {
 
     // No-panic gate.
     assert!(!files.is_empty(), "no .bf fixtures found");
-    // Coverage ratchet: the bar rises as Beef-syntax coverage fills in.
-    // Target (Path B, full Beef faithfulness) is ~70%; this floor locks
-    // in current progress so coverage can't silently regress.
-    let floor = files.len() * 70 / 100;
-    assert!(
-        clean >= floor,
-        "parser clean-parse coverage regressed: {clean} / {} (floor {floor})",
+    // Coverage ratchet. The parser now parses the **entire** curated corpus
+    // cleanly (Path B, full Beef faithfulness) — every `.bf` file in
+    // corlib-slice and feature-suite. The floor is 100%: any construct that
+    // regresses a file must be fixed, not floored around.
+    assert_eq!(
+        clean,
+        files.len(),
+        "parser clean-parse coverage regressed below 100%: {clean} / {}",
         files.len()
     );
 }

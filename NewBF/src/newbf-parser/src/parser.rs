@@ -668,6 +668,39 @@ impl<'a> Parser<'a> {
         self.bump(); // {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let before = self.pos;
+            // Anonymous-extension initializer content — member declarations
+            // (`new T() { public int mB = 5; }`) or a nested block — isn't an
+            // expression. Skip the remainder of the brace group.
+            if matches!(
+                self.kind(),
+                TokenKind::LBrace
+                    | TokenKind::Keyword(
+                        Keyword::Public
+                            | Keyword::Private
+                            | Keyword::Protected
+                            | Keyword::Internal
+                            | Keyword::Static
+                            | Keyword::Const
+                            | Keyword::ReadOnly
+                            | Keyword::Volatile
+                    )
+            ) {
+                let mut depth = 1i32;
+                while depth > 0 && !self.at(TokenKind::Eof) {
+                    match self.kind() {
+                        TokenKind::LBrace => depth += 1,
+                        TokenKind::RBrace => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.bump();
+                }
+                break;
+            }
             // Indexed collection-initializer entry: `[key] = value`.
             if self.at(TokenKind::LBracket) {
                 self.skip_balanced(TokenKind::LBracket, TokenKind::RBracket);
@@ -678,6 +711,27 @@ impl<'a> Parser<'a> {
                 let _ = self.expr();
             }
             if !self.eat(TokenKind::Comma) {
+                // Object/collection elements are comma-separated and end at
+                // `}`. Anything else after an element means this is an
+                // anonymous-extension initializer whose body holds members /
+                // statements (`{ (int,float) Get() => …; int this[…] … }`) —
+                // skip the remainder of the brace group.
+                if !self.at(TokenKind::RBrace) {
+                    let mut depth = 1i32;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.kind() {
+                            TokenKind::LBrace => depth += 1,
+                            TokenKind::RBrace => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                }
                 break;
             }
             if self.pos == before {
@@ -2003,9 +2057,18 @@ impl<'a> Parser<'a> {
     /// for the anonymous type for now.
     fn anonymous_type(&mut self, lo: u32) -> Type {
         let kind = self.type_kind().unwrap_or(TypeKind::Struct);
-        // Optional underlying/base type: `enum : int`.
+        // Optional `: …` clause — an underlying/base type (`enum : int`), or
+        // an inline constructor for an anonymous class
+        // (`class : this(int x, int y)`).
         if self.eat(TokenKind::Colon) {
-            let _ = self.ty();
+            if self.at_kw(Keyword::This) {
+                self.bump(); // this
+                if self.at(TokenKind::LParen) {
+                    let _ = self.params();
+                }
+            } else {
+                let _ = self.ty();
+            }
         }
         if self.eat(TokenKind::LBrace) {
             let _ = self.members(kind);

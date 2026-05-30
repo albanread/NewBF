@@ -99,17 +99,13 @@ fn sema_does_not_panic_on_real_beef() {
     // silently no-op.
     assert!(total_types > 0, "no types captured across the corpus");
     assert!(total_members > 0, "no members captured across the corpus");
-    // Clean-build ratchet. Sema diagnostics are in-program contradictions
-    // (duplicate defs). With `#if`/`#else` evaluated and explicit interface
-    // implementations captured (so they no longer false-collide), sema is
-    // clean on ~99% of the corpus — effectively every file that *parses*
-    // cleanly. The remaining handful are artifacts of files that still have
-    // parse diagnostics (partial/garbled trees produce spurious dups); they
-    // clear as the parser marches toward 100%. The floor locks in the gain.
-    let floor = files.len() * 95 / 100;
-    assert!(
-        clean >= floor,
-        "sema clean-build coverage regressed: {clean} / {} (floor {floor})",
+    // Clean-build ratchet. The parser now parses the whole corpus cleanly,
+    // and sema builds a contradiction-free definition graph for **every**
+    // file. The floor is 100%.
+    assert_eq!(
+        clean,
+        files.len(),
+        "sema clean-build coverage regressed below 100%: {clean} / {}",
         files.len()
     );
 }
