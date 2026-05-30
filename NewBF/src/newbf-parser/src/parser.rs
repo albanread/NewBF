@@ -304,6 +304,13 @@ impl<'a> Parser<'a> {
                 while self.at(TokenKind::Star) {
                     self.bump();
                 }
+                // Constructor args after a pointer-suffixed allocation
+                // type: `append uint8[size]*(?)`.
+                if self.at(TokenKind::LParen) {
+                    self.bump();
+                    let _ = self.arg_list(TokenKind::RParen);
+                    self.expect(TokenKind::RParen, "`)` to close allocation args");
+                }
                 // Object/collection initializer: `new T() { a = 1, b }`.
                 if self.at(TokenKind::LBrace) {
                     self.consume_initializer();
@@ -691,10 +698,17 @@ impl<'a> Parser<'a> {
             | Keyword::NameOf
             | Keyword::Comptype
             | Keyword::Decltype
-            | Keyword::Default
-            | Keyword::Var
-            | Keyword::Let => {
+            | Keyword::Default => {
                 self.bump();
+                Expr::Ident(span)
+            }
+            // `var x` / `let val` — binding patterns (used in `case`
+            // patterns and `if (var x = …)`): consume the bound name too.
+            Keyword::Var | Keyword::Let => {
+                self.bump();
+                if self.at(TokenKind::Ident) {
+                    self.bump();
+                }
                 Expr::Ident(span)
             }
             _ => {
@@ -824,6 +838,42 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Defer) => self.defer_stmt(),
             TokenKind::Keyword(Keyword::Var) | TokenKind::Keyword(Keyword::Let) => self.local(true),
             TokenKind::Keyword(Keyword::Switch) => self.switch_stmt(),
+            // Local `mixin Name(params) body` inside a method.
+            TokenKind::Keyword(Keyword::Mixin) => {
+                let lo = self.start();
+                self.bump(); // mixin
+                let name = if self.at(TokenKind::Ident) {
+                    self.bump().span
+                } else {
+                    self.error("expected mixin name");
+                    self.cur().span
+                };
+                let generic_params = if self.at(TokenKind::Lt) {
+                    self.generic_params()
+                } else {
+                    Vec::new()
+                };
+                let params = if self.at(TokenKind::LParen) { self.params() } else { Vec::new() };
+                let body = if self.at(TokenKind::LBrace) {
+                    self.block()
+                } else if self.eat(TokenKind::FatArrow) {
+                    let blo = self.start();
+                    let e = self.expr();
+                    self.expect(TokenKind::Semicolon, "`;` after `=> expr` body");
+                    Stmt::Expr { span: self.finish(blo), expr: e }
+                } else {
+                    self.expect(TokenKind::Semicolon, "mixin body");
+                    Stmt::Empty(self.cur().span)
+                };
+                Stmt::LocalFunction {
+                    span: self.finish(lo),
+                    return_ty: Type::Var(name),
+                    name,
+                    generic_params,
+                    params,
+                    body: Box::new(body),
+                }
+            }
             // `const`/`readonly`/`static` local: consume the modifier(s)
             // then parse `Type name = init;` (or `var`/`let`).
             TokenKind::Keyword(Keyword::Const)
@@ -1780,6 +1830,13 @@ impl<'a> Parser<'a> {
         let mut attrs = Vec::new();
         while self.at(TokenKind::LBracket) {
             self.bump(); // [
+            // Optional target specifier: `[return: X]`, `[field: X]`, etc.
+            if self.nth_kind(1) == TokenKind::Colon
+                && matches!(self.kind(), TokenKind::Ident | TokenKind::Keyword(_))
+            {
+                self.bump(); // target
+                self.bump(); // :
+            }
             loop {
                 let lo = self.start();
                 let name = self.path_type(lo);
@@ -2348,6 +2405,17 @@ impl<'a> Parser<'a> {
                 if self.eat(TokenKind::Tilde) {
                     let _ = self.expr();
                 }
+                // Multiple declarators: `int a, b, c;` — keep the first,
+                // consume the rest (`, name [= init]`).
+                while self.eat(TokenKind::Comma) {
+                    if !self.at(TokenKind::Ident) {
+                        break;
+                    }
+                    self.bump(); // name
+                    if self.eat(TokenKind::Assign) {
+                        let _ = self.expr();
+                    }
+                }
                 self.expect(TokenKind::Semicolon, "`;` after field");
                 Member::Field {
                     span: self.finish(lo),
@@ -2489,7 +2557,12 @@ impl<'a> Parser<'a> {
             self.bump();
             (m, span)
         });
-        while self.peek_param_modifier().is_some() {
+        while self.peek_param_modifier().is_some()
+            || matches!(
+                self.kind(),
+                TokenKind::Keyword(Keyword::ReadOnly) | TokenKind::Keyword(Keyword::Const)
+            )
+        {
             self.bump();
         }
         let ty = self.ty();

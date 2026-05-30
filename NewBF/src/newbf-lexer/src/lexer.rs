@@ -153,15 +153,27 @@ impl Lexer<'_> {
         let mut is_float = false;
         if self.b[self.pos] == b'0' && matches!(self.at(1), b'x' | b'X') {
             self.pos += 2;
-            while self.pos < self.b.len()
-                && (self.b[self.pos].is_ascii_hexdigit() || self.b[self.pos] == b'_')
-            {
-                self.pos += 1;
+            while self.pos < self.b.len() {
+                let c = self.b[self.pos];
+                if c.is_ascii_hexdigit() || c == b'_' {
+                    self.pos += 1;
+                } else if c == b'\'' && self.at(1).is_ascii_hexdigit() {
+                    self.pos += 1; // digit-group separator: 0xFFFF'FFFF
+                } else {
+                    break;
+                }
             }
         } else if self.b[self.pos] == b'0' && matches!(self.at(1), b'b' | b'B') {
             self.pos += 2;
-            while self.pos < self.b.len() && matches!(self.b[self.pos], b'0' | b'1' | b'_') {
-                self.pos += 1;
+            while self.pos < self.b.len() {
+                let c = self.b[self.pos];
+                if matches!(c, b'0' | b'1' | b'_') {
+                    self.pos += 1;
+                } else if c == b'\'' && matches!(self.at(1), b'0' | b'1') {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
             }
         } else {
             self.digits();
@@ -202,10 +214,15 @@ impl Lexer<'_> {
     }
 
     fn digits(&mut self) {
-        while self.pos < self.b.len()
-            && (self.b[self.pos].is_ascii_digit() || self.b[self.pos] == b'_')
-        {
-            self.pos += 1;
+        while self.pos < self.b.len() {
+            let c = self.b[self.pos];
+            if c.is_ascii_digit() || c == b'_' {
+                self.pos += 1;
+            } else if c == b'\'' && self.at(1).is_ascii_digit() {
+                self.pos += 1; // digit-group separator: 1'000'000
+            } else {
+                break;
+            }
         }
     }
 
