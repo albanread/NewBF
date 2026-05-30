@@ -277,6 +277,13 @@ impl<'a> Parser<'a> {
             // parse it as a unary expression (a type/pattern stand-in).
             let rhs = if matches!(op, BinOp::Is | BinOp::As | BinOp::Case) {
                 self.unary()
+            } else if matches!(op, BinOp::Range | BinOp::ClosedRange)
+                && !Self::can_start_unary(self.kind())
+            {
+                // Open-ended range: `1...`, `a..<` with no upper bound (e.g.
+                // the index `iList[1...]`). Placeholder empty-span operand.
+                let hi = self.toks[self.pos - 1].span.hi;
+                Expr::Ident(Span::new(self.file, hi, hi))
             } else {
                 self.binary(bp + 1) // left-associative
             };
@@ -292,11 +299,20 @@ impl<'a> Parser<'a> {
 
     fn unary(&mut self) -> Expr {
         let lo = self.start();
-        // `..expr` — Beef spread/append-to-target prefix (e.g. argument
-        // `f(.. new T())`). Consume the `..`; operand carries the value.
-        if self.at(TokenKind::DotDot) {
+        // Leading range / spread prefix: `..expr` (spread/append, e.g.
+        // `f(.. new T())`), `..<n` / `...n` (from-start range, e.g.
+        // `a[..<n]`). Consume the operator; the operand carries the bound.
+        // A bare operator (`a[...]`) yields a placeholder.
+        if matches!(
+            self.kind(),
+            TokenKind::DotDot | TokenKind::DotDotLess | TokenKind::DotDotDot
+        ) {
             self.bump();
-            return self.unary();
+            if Self::can_start_unary(self.kind()) {
+                return self.unary();
+            }
+            let hi = self.toks[self.pos - 1].span.hi;
+            return Expr::Ident(Span::new(self.file, hi, hi));
         }
         // Paramless / inferred-param lambda: `=> expr` / `=> { … }`
         // (also the operand of `scope => …`).
@@ -665,7 +681,16 @@ impl<'a> Parser<'a> {
                 value: Box::new(value),
             };
         }
-        self.expr()
+        let value = self.expr();
+        // Typed binding pattern in argument position: `Type name`, used in
+        // `case` patterns (`case .Range(let lo, int hi):`). After an argument
+        // expression a bare identifier can only be such a binding name (args
+        // are comma-separated, so a valid arg is otherwise followed by `,`
+        // or `)`); consume it (dropped for now).
+        if self.at(TokenKind::Ident) {
+            self.bump();
+        }
+        value
     }
 
     fn primary(&mut self) -> Expr {
@@ -706,11 +731,6 @@ impl<'a> Parser<'a> {
             }
             // `?` — Beef "uninitialized" placeholder (e.g. `int x = ?;`).
             TokenKind::Question => {
-                self.bump();
-                Expr::Ident(span)
-            }
-            // `...` — range-all placeholder (e.g. index `iList[...]`).
-            TokenKind::DotDotDot => {
                 self.bump();
                 Expr::Ident(span)
             }
@@ -927,12 +947,14 @@ impl<'a> Parser<'a> {
             // These take an *expression* (or optional) argument, so the
             // postfix `(…)` Call handles them: `nameof(x)`, `default(T)`,
             // `comptype(e)`. Treated as a primary. `var`/`let` below cover
-            // pattern bindings (e.g. `case .Ok(var val):`).
+            // pattern bindings (e.g. `case .Ok(var val):`). `fallthrough` is
+            // a bare control-flow primary used as a statement in `switch`.
             Keyword::NameOf
             | Keyword::Comptype
             | Keyword::Decltype
             | Keyword::RetType
-            | Keyword::Default => {
+            | Keyword::Default
+            | Keyword::Fallthrough => {
                 self.bump();
                 Expr::Ident(span)
             }

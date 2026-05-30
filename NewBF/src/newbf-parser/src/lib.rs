@@ -697,6 +697,22 @@ mod tests {
     }
 
     #[test]
+    fn fallthrough_and_open_ended_ranges() {
+        assert_eq!(ok_stmt("fallthrough;"), "(expr fallthrough)");
+        // Open-ended ranges parse without diagnostics (placeholder operand).
+        let _ = ok("a[1...]");
+        let _ = ok("a[...]");
+        let _ = ok("a[..<n]");
+    }
+
+    #[test]
+    fn typed_pattern_binding_argument() {
+        // `Type name` binding inside a call/pattern arg list parses clean
+        // (the binding name is consumed). Here as a plain call form.
+        assert_eq!(ok("f(int pos)"), "(call f int)");
+    }
+
+    #[test]
     fn tuple_destructuring_for_each() {
         assert_eq!(
             ok_stmt("for (var (a, b) in xs) {}"),
