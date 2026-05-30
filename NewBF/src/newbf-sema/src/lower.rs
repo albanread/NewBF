@@ -414,9 +414,72 @@ impl<'a> Lowerer<'a> {
                     self.terminated = true;
                 }
             }
-            // foreach (needs iterators), switch (arms/patterns), defer
-            // (scope-exit ordering), local-function — not in the kernel yet.
-            // Skipped (no IR emitted), never panicking.
+            Stmt::Switch {
+                scrutinee, arms, ..
+            } => {
+                // Value switch: evaluate the scrutinee once, then a chain of
+                // `==` tests. Beef arms don't fall through, so each body
+                // branches to a single exit. A `break` inside an arm exits the
+                // switch; `continue` still targets the enclosing loop.
+                let (sv, st) = self.expr(scrutinee, src);
+                let exit = self.fb.create_block("switch.exit");
+                let body_blocks: Vec<BlockId> = (0..arms.len())
+                    .map(|i| self.fb.create_block(format!("switch.case{i}")))
+                    .collect();
+                // The `default` arm (a patternless arm) is the chain's final
+                // else; with no default, a miss falls straight to the exit.
+                let default_target = arms
+                    .iter()
+                    .position(|a| a.pattern.is_none())
+                    .map(|i| body_blocks[i])
+                    .unwrap_or(exit);
+                let cont = self.loops.last().map(|&(c, _)| c).unwrap_or(exit);
+
+                let case_idxs: Vec<usize> = (0..arms.len())
+                    .filter(|&i| arms[i].pattern.is_some())
+                    .collect();
+                if case_idxs.is_empty() {
+                    self.fb.br(default_target);
+                    self.terminated = true;
+                }
+                for (chain_i, &arm_i) in case_idxs.iter().enumerate() {
+                    let pat = arms[arm_i].pattern.as_ref().unwrap();
+                    let (pv, pt) = self.expr(pat, src);
+                    let ct = common_type(st, pt);
+                    let l = self.coerce(sv.clone(), st, ct);
+                    let r = self.coerce(pv, pt, ct);
+                    let eq = self.fb.cmp(CmpPred::Eq, l, r);
+                    let last = chain_i + 1 == case_idxs.len();
+                    let next = if last {
+                        default_target
+                    } else {
+                        self.fb.create_block("switch.test")
+                    };
+                    self.fb.cond_br(eq, body_blocks[arm_i], next);
+                    self.terminated = true;
+                    if !last {
+                        self.switch(next);
+                    }
+                }
+                self.loops.push((cont, exit));
+                for i in 0..arms.len() {
+                    self.switch(body_blocks[i]);
+                    for s in &arms[i].body {
+                        self.stmt(s, src);
+                        if self.terminated {
+                            break;
+                        }
+                    }
+                    if !self.terminated {
+                        self.fb.br(exit);
+                    }
+                }
+                self.loops.pop();
+                self.switch(exit);
+            }
+            // foreach (needs iterators), defer (scope-exit ordering),
+            // local-function — not in the kernel yet. Skipped (no IR emitted),
+            // never panicking.
             _ => {}
         }
     }
