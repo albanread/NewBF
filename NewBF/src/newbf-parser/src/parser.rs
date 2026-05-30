@@ -380,9 +380,10 @@ impl<'a> Parser<'a> {
                     // `a.0` / `a.1` — tuple field access (numeric member).
                     // `inst.this(…)` — explicit constructor call; `.base`
                     // member — accept the `this`/`base` keywords as names.
-                    let name = if self.at(TokenKind::Int) {
-                        self.bump().span
-                    } else if self.at_kw(Keyword::This) || self.at_kw(Keyword::Base) {
+                    let name = if self.at(TokenKind::Int)
+                        || self.at_kw(Keyword::This)
+                        || self.at_kw(Keyword::Base)
+                    {
                         self.bump().span
                     } else {
                         self.expect_ident_span("member name")
@@ -935,7 +936,7 @@ impl<'a> Parser<'a> {
             // function type and drop it; placeholder primary stands in.
             Keyword::Function | Keyword::Delegate => {
                 let _ty = self.ty();
-                return Expr::Ident(span);
+                Expr::Ident(span)
             }
             // `var x` / `let val` — binding patterns (used in `case`
             // patterns and `if (var x = …)`); also `var ref val` / `let mut x`
