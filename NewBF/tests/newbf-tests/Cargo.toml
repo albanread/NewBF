@@ -6,5 +6,11 @@ license.workspace = true
 description = "NewBF: Rust-side unit and integration tests driving the full pipeline."
 publish = false
 
+[dev-dependencies]
+newbf-lexer.workspace = true
+newbf-parser.workspace = true
+newbf-sema.workspace = true
+newbf-winapi.workspace = true
+
 [lints]
 workspace = true

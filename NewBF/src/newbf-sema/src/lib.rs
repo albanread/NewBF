@@ -17,6 +17,7 @@
 //! checks). Reference: `E:\beef\IDEHelper\Compiler\BfDefBuilder.cpp`,
 //! `BfSystem.cpp`, `BfModule.cpp`.
 
+mod api;
 mod build;
 mod intern;
 mod lower;
@@ -24,6 +25,7 @@ mod model;
 mod report;
 mod resolve;
 
+pub use api::{ApiImport, ResolvedApi, discover_extern_methods, resolve_apis};
 pub use build::SourceFile;
 pub use intern::{Interner, Symbol};
 pub use lower::lower_program;

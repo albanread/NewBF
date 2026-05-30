@@ -378,6 +378,12 @@ version = "0.0.1"
 [[package]]
 name = "newbf-tests"
 version = "0.0.1"
+dependencies = [
+ "newbf-lexer",
+ "newbf-parser",
+ "newbf-sema",
+ "newbf-winapi",
+]
 
 [[package]]
 name = "newbf-winapi"
