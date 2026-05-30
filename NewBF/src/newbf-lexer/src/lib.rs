@@ -106,9 +106,17 @@ mod tests {
     fn numbers() {
         use TokenKind::{Float, Int};
         assert_eq!(
-            kinds("0 123 0xFF 0b1010 1_000 1.0 .5 1e9 3.14f 1.0e-3"),
-            [Int, Int, Int, Int, Int, Float, Float, Float, Float, Float]
+            kinds("0 123 0xFF 0b1010 0o17 1_000 1.0 1e9 3.14f 1.0e-3"),
+            [Int, Int, Int, Int, Int, Int, Float, Float, Float, Float]
         );
+    }
+
+    #[test]
+    fn leading_dot_digit_is_dot_then_int() {
+        use TokenKind::{Dot, Ident, Int};
+        // `.5` is `.`+`5` (not a float) so `a.0` tuple-field access works.
+        assert_eq!(kinds(".5"), [Dot, Int]);
+        assert_eq!(kinds("a.0"), [Ident, Dot, Int]);
     }
 
     #[test]

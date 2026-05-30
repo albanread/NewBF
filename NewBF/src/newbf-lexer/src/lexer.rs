@@ -60,7 +60,9 @@ impl Lexer<'_> {
             b'/' if self.at(1) == b'*' => self.block_comment(),
             b'#' => self.preproc_line(),
             b'0'..=b'9' => self.number(),
-            b'.' if self.at(1).is_ascii_digit() => self.number(),
+            // NB: a leading `.digit` is NOT a float here — `.` always
+            // lexes as a punctuator so `a.0` / `a.1` tuple-field access
+            // works. (`.5`-style floats are written `0.5` in Beef.)
             b'\'' => self.char_literal(),
             // Triple-quoted forms (`"""…"""`, `@"""…"""`, `$"""…"""`).
             b'"' if self.at(1) == b'"' && self.at(2) == b'"' => self.triple_string(TokenKind::Str),

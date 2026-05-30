@@ -645,7 +645,23 @@ impl<'a> Parser<'a> {
         let could_be_cast = self.diagnostics.len() == save.diag_len && self.at(TokenKind::RParen);
         if could_be_cast {
             self.bump(); // )
-            if Self::can_start_unary(self.kind()) {
+            // A bare-identifier "type" only commits to a cast before an
+            // unambiguous unary start. A *definite* type (pointer / generic
+            // / array / tuple) also commits before `& * - + ~ ! ++ --`
+            // (e.g. `(char8*)&mVal`, `(int)-1`).
+            let definite = Self::is_definite_type(&ty);
+            let commit = Self::can_start_unary(self.kind())
+                || (definite
+                    && matches!(
+                        self.kind(),
+                        TokenKind::Star
+                            | TokenKind::Amp
+                            | TokenKind::Minus
+                            | TokenKind::Plus
+                            | TokenKind::PlusPlus
+                            | TokenKind::MinusMinus
+                    ));
+            if commit {
                 let operand = self.unary();
                 return Expr::Cast {
                     span: self.finish(lo),
@@ -698,6 +714,22 @@ impl<'a> Parser<'a> {
         Expr::Paren {
             span: self.finish(lo),
             inner: Box::new(inner),
+        }
+    }
+
+    /// A "definite" type — one whose syntax can't be a plain expression
+    /// (pointer/nullable/array/sized/tuple, or a generic-instantiated
+    /// path). Used to widen the C-style-cast follow set.
+    fn is_definite_type(t: &Type) -> bool {
+        match t {
+            Type::Pointer { .. }
+            | Type::Nullable { .. }
+            | Type::Array { .. }
+            | Type::Sized { .. }
+            | Type::Tuple { .. }
+            | Type::Var(_) => true,
+            Type::Path { segments, .. } => segments.iter().any(|s| !s.args.is_empty()),
+            Type::Error(_) => false,
         }
     }
 
@@ -1006,6 +1038,17 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
+                // `ref Type name = …` — a ref-typed local. Speculatively
+                // consume `ref` and try a typed local; otherwise it's a
+                // `ref expr;` statement.
+                if self.at_kw(Keyword::Ref) {
+                    let save = self.save();
+                    self.bump(); // ref
+                    if let Some(s) = self.try_typed_local() {
+                        return s;
+                    }
+                    self.restore(save);
+                }
                 if let Some(s) = self.try_local_function() {
                     s
                 } else if let Some(s) = self.try_typed_local() {

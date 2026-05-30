@@ -75,7 +75,7 @@ fn parser_does_not_panic_on_real_beef() {
     // Coverage ratchet: the bar rises as Beef-syntax coverage fills in.
     // Target (Path B, full Beef faithfulness) is ~70%; this floor locks
     // in current progress so coverage can't silently regress.
-    let floor = files.len() * 35 / 100;
+    let floor = files.len() * 70 / 100;
     assert!(
         clean >= floor,
         "parser clean-parse coverage regressed: {clean} / {} (floor {floor})",
