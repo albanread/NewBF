@@ -124,6 +124,15 @@ mod tests {
                 format!("(cast {} {})", sxt(src, ty), sx(src, operand))
             }
             Expr::DotIdent { name, .. } => format!(".{}", name.text(src)),
+            Expr::Tuple { elems, .. } => {
+                let mut s = String::from("(tuple");
+                for e in elems {
+                    s.push(' ');
+                    s.push_str(&sx(src, e));
+                }
+                s.push(')');
+                s
+            }
         }
     }
 

@@ -377,17 +377,25 @@ impl Lexer<'_> {
                 }
             }
             b'!' => {
-                if self.at(1) == b'=' {
+                if self.at(1) == b'=' && self.at(2) == b'=' {
+                    tok!(3, StrictNeq)
+                } else if self.at(1) == b'=' {
                     tok!(2, NotEq)
                 } else {
                     tok!(1, Bang)
                 }
             }
-            b'=' => match self.at(1) {
-                b'=' => tok!(2, EqEq),
-                b'>' => tok!(2, FatArrow),
-                _ => tok!(1, Assign),
-            },
+            b'=' => {
+                if self.at(1) == b'=' && self.at(2) == b'=' {
+                    tok!(3, StrictEq)
+                } else if self.at(1) == b'=' {
+                    tok!(2, EqEq)
+                } else if self.at(1) == b'>' {
+                    tok!(2, FatArrow)
+                } else {
+                    tok!(1, Assign)
+                }
+            }
             b'&' => match self.at(1) {
                 b'&' => tok!(2, AmpAmp),
                 b'=' => tok!(2, AmpEq),

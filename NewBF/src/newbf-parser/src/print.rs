@@ -193,6 +193,12 @@ impl Printer<'_> {
             Expr::DotIdent { name, .. } => {
                 self.line(d, &format!("DotIdent .{}", self.txt(*name)));
             }
+            Expr::Tuple { elems, .. } => {
+                self.line(d, "Tuple");
+                for e in elems {
+                    self.expr(e, d + 1);
+                }
+            }
         }
     }
 

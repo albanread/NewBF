@@ -193,6 +193,8 @@ pub enum TokenKind {
     ShrEq,
     EqEq,
     NotEq,
+    StrictEq,  // === (reference identity)
+    StrictNeq, // !==
     Lt,
     Gt,
     Le,

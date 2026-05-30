@@ -305,6 +305,11 @@ pub enum Expr {
         span: Span,
         name: Span,
     },
+    /// `(a, b, …)` — tuple literal.
+    Tuple {
+        span: Span,
+        elems: Vec<Expr>,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
 }
@@ -335,7 +340,8 @@ impl Expr {
             | Expr::Prefix { span, .. }
             | Expr::Generic { span, .. }
             | Expr::Cast { span, .. }
-            | Expr::DotIdent { span, .. } => *span,
+            | Expr::DotIdent { span, .. }
+            | Expr::Tuple { span, .. } => *span,
         }
     }
 }

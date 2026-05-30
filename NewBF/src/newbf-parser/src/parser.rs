@@ -302,6 +302,21 @@ impl<'a> Parser<'a> {
                 while self.at(TokenKind::Star) {
                     self.bump();
                 }
+                // Object/collection initializer: `new T() { a = 1, b }`.
+                if self.at(TokenKind::LBrace) {
+                    self.bump();
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let before = self.pos;
+                        let _ = self.expr();
+                        if !self.eat(TokenKind::Comma) {
+                            break;
+                        }
+                        if self.pos == before {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RBrace, "`}` to close initializer");
+                }
             }
             return Expr::Prefix {
                 span: self.finish(lo),
@@ -351,6 +366,18 @@ impl<'a> Parser<'a> {
                 TokenKind::ColonColon => {
                     self.bump();
                     let name = self.expect_ident_span("name after `::`");
+                    e = Expr::Member {
+                        span: self.finish(lo),
+                        base: Box::new(e),
+                        name,
+                        conditional: false,
+                    };
+                }
+                // `obj..Method()` — Beef cascade operator; parses like a
+                // member access (cascade semantics resolved in sema).
+                TokenKind::DotDot if matches!(self.nth_kind(1), TokenKind::Ident) => {
+                    self.bump();
+                    let name = self.bump().span;
                     e = Expr::Member {
                         span: self.finish(lo),
                         base: Box::new(e),
@@ -567,6 +594,25 @@ impl<'a> Parser<'a> {
         self.restore(save);
         self.bump(); // (
         let inner = self.expr();
+        // Tuple literal: `(a, b, …)`. If a comma follows, collect the rest.
+        if self.at(TokenKind::Comma) {
+            let mut elems = vec![inner];
+            while self.eat(TokenKind::Comma) {
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+                let before = self.pos;
+                elems.push(self.expr());
+                if self.pos == before {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RParen, "`)` to close tuple literal");
+            return Expr::Tuple {
+                span: self.finish(lo),
+                elems,
+            };
+        }
         self.expect(TokenKind::RParen, "`)` to close parenthesized expression");
         Expr::Paren {
             span: self.finish(lo),
@@ -628,6 +674,7 @@ impl<'a> Parser<'a> {
             | Keyword::TypeOf
             | Keyword::NameOf
             | Keyword::Comptype
+            | Keyword::Decltype
             | Keyword::Default
             | Keyword::Var
             | Keyword::Let => {
@@ -709,8 +756,8 @@ impl<'a> Parser<'a> {
             TokenKind::Gt => BinOp::Gt,
             TokenKind::Le => BinOp::Le,
             TokenKind::Ge => BinOp::Ge,
-            TokenKind::EqEq => BinOp::Eq,
-            TokenKind::NotEq => BinOp::Ne,
+            TokenKind::EqEq | TokenKind::StrictEq => BinOp::Eq,
+            TokenKind::NotEq | TokenKind::StrictNeq => BinOp::Ne,
             TokenKind::AmpAmp => BinOp::And,
             TokenKind::PipePipe => BinOp::Or,
             TokenKind::QuestionQuestion => BinOp::NullCoalesce,
@@ -1432,6 +1479,24 @@ impl<'a> Parser<'a> {
         if self.at_type_kind_kw() {
             return Item::Type(self.type_decl(lo, attributes, modifiers));
         }
+        // Namespace-level `static { members }` grouping block.
+        if self.at(TokenKind::LBrace) {
+            let name = self.cur().span;
+            self.bump(); // {
+            let members = self.members(TypeKind::Class);
+            self.expect(TokenKind::RBrace, "`}` to close static block");
+            return Item::Type(TypeDecl {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                kind: TypeKind::Class,
+                name,
+                generic_params: Vec::new(),
+                bases: Vec::new(),
+                constraints: Vec::new(),
+                members,
+            });
+        }
         self.error("expected an item declaration (using/namespace/class/struct/interface/enum)");
         // Recovery: skip to next item-ish boundary.
         self.skip_to_item_boundary();
@@ -1882,17 +1947,25 @@ impl<'a> Parser<'a> {
             return Member::Nested(self.type_decl(lo, attributes, modifiers));
         }
 
-        // Static initializer block: `static { … }` (a bare block member,
-        // modelled as a parameterless constructor).
+        // `static { members }` — a static member-grouping block (Beef
+        // groups statics this way). Parse its contents as MEMBERS and
+        // model as a nested anonymous type.
         if self.at(TokenKind::LBrace) {
-            let body = self.block();
-            return Member::Constructor {
+            let name = self.cur().span;
+            self.bump(); // {
+            let members = self.members(kind);
+            self.expect(TokenKind::RBrace, "`}` to close static block");
+            return Member::Nested(TypeDecl {
                 span: self.finish(lo),
                 attributes,
                 modifiers,
-                params: Vec::new(),
-                body: MethodBody::Block(body),
-            };
+                kind,
+                name,
+                generic_params: Vec::new(),
+                bases: Vec::new(),
+                constraints: Vec::new(),
+                members,
+            });
         }
 
         // Mixin member: `[mods] mixin Name(params) body` (no return type).
@@ -2269,6 +2342,14 @@ impl<'a> Parser<'a> {
     }
 
     fn method_body(&mut self) -> MethodBody {
+        // Trailing method modifiers appear between the signature and the
+        // body: `bool MoveNext() mut { … }`, `... mut;`.
+        while matches!(
+            self.kind(),
+            TokenKind::Keyword(Keyword::Mut) | TokenKind::Keyword(Keyword::ReadOnly)
+        ) {
+            self.bump();
+        }
         if self.at(TokenKind::LBrace) {
             return MethodBody::Block(self.block());
         }
@@ -2321,11 +2402,16 @@ impl<'a> Parser<'a> {
     fn param(&mut self) -> Param {
         let lo = self.start();
         let attributes = self.attributes();
+        // A param can carry several modifiers, e.g. `this ref StructA`.
+        // We keep the first for the AST and consume the rest.
         let modifier = self.peek_param_modifier().map(|m| {
             let span = self.cur().span;
             self.bump();
             (m, span)
         });
+        while self.peek_param_modifier().is_some() {
+            self.bump();
+        }
         let ty = self.ty();
         let name = if self.at(TokenKind::Ident) {
             Some(self.bump().span)
