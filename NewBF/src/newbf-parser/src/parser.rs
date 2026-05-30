@@ -367,6 +367,16 @@ impl<'a> Parser<'a> {
                 if self.at(TokenKind::LBrace) {
                     self.consume_initializer();
                 }
+                // Allocation destructor: `scope T() ~ delete _;`,
+                // `scope [&]() => {…} ~ { b++ };` — runs on scope exit. Block
+                // or expression form; consumed for now.
+                if self.eat(TokenKind::Tilde) {
+                    if self.at(TokenKind::LBrace) {
+                        self.skip_balanced(TokenKind::LBrace, TokenKind::RBrace);
+                    } else {
+                        let _ = self.expr();
+                    }
+                }
             }
             return Expr::Prefix {
                 span: self.finish(lo),
@@ -1598,6 +1608,27 @@ impl<'a> Parser<'a> {
             self.restore(save);
         }
 
+        // Beef count-loop without a type: `for (var? name < EXPR)` — e.g.
+        // `for (let i < 2)`. The name directly precedes `<`.
+        {
+            let save = self.save();
+            let _ = self.eat_kw(Keyword::Var) || self.eat_kw(Keyword::Let);
+            if self.at(TokenKind::Ident) && self.nth_kind(1) == TokenKind::Lt {
+                let name = self.bump().span;
+                self.bump(); // <
+                let iter = self.expr();
+                self.expect(TokenKind::RParen, "`)` after for count-loop");
+                let body = Box::new(self.stmt());
+                return Stmt::ForEach {
+                    span: self.finish(lo),
+                    name,
+                    iter,
+                    body,
+                };
+            }
+            self.restore(save);
+        }
+
         // Beef count-loop: `for (var? Type name < EXPR)` — shorthand for
         // `for (Type name = 0; name < EXPR; name++)`. Modeled as ForEach
         // (the bound goes in `iter`; sema reinterprets).
@@ -1928,7 +1959,10 @@ impl<'a> Parser<'a> {
                     ) {
                     let s = self.cur().span;
                     let _ = self.eat_kw(Keyword::Const);
-                    let _ = self.unary();
+                    // Parse the const value at a precedence above comparison
+                    // (binding power 6) so `>` closes the generic list rather
+                    // than being read as greater-than: `<const TSize + 100>`.
+                    let _ = self.binary(6);
                     Type::Var(s)
                 } else {
                     self.ty()
