@@ -239,6 +239,14 @@ pub enum InstKind {
         a: Value,
         b: Value,
     },
+    /// A trap intrinsic. `debug: true` is a resumable breakpoint
+    /// (`int3` / `@llvm.debugtrap`) — a Vectored/SEH handler can catch it,
+    /// dump the stack, and continue. `debug: false` is a fatal illegal
+    /// instruction (`ud2` / `@llvm.trap`) for `Runtime.FatalError`, failed
+    /// asserts, and unreachable code. Result type is `Void`.
+    Trap {
+        debug: bool,
+    },
 }
 
 /// One instruction: its operation, its result type, and an optional source

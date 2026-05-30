@@ -156,6 +156,8 @@ impl Printer<'_> {
                 self.value(a),
                 self.value(b)
             ),
+            InstKind::Trap { debug: true } => "debugtrap".to_string(),
+            InstKind::Trap { debug: false } => "trap".to_string(),
         }
     }
 

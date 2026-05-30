@@ -219,4 +219,93 @@ mod tests {
         assert_eq!(add(3, 4), 7);
         assert_eq!(add(-10, 32), 22);
     }
+
+    /// Milestone 2 (SEH foundation): a `debugtrap` lowered into JIT'd code
+    /// raises `EXCEPTION_BREAKPOINT`, which a Vectored Exception Handler
+    /// catches — with the faulting `Rip` inside the JIT'd function — and then
+    /// resumes past. This proves Windows SEH delivery works for code running
+    /// in JIT'd `VirtualAlloc` pages (the precondition for symbolicated stack
+    /// dumps). `debugtrap` (int3, 1 byte) is resumable, so the handler steps
+    /// over it and the function returns normally — no process abort.
+    #[cfg(windows)]
+    #[test]
+    fn debugtrap_in_jit_code_delivers_seh() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+        const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
+        const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+        const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+        // x64 CONTEXT.Rip offset (winnt.h).
+        const RIP_OFFSET: usize = 0xF8;
+
+        #[repr(C)]
+        struct ExceptionRecord {
+            exception_code: u32,
+            exception_flags: u32,
+            exception_record: *mut ExceptionRecord,
+            exception_address: *mut c_void,
+            // remaining fields unused
+        }
+        #[repr(C)]
+        struct ExceptionPointers {
+            exception_record: *mut ExceptionRecord,
+            context_record: *mut c_void, // CONTEXT*, accessed by offset
+        }
+
+        unsafe extern "system" {
+            fn AddVectoredExceptionHandler(
+                First: u32,
+                Handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+            ) -> *mut c_void;
+            fn RemoveVectoredExceptionHandler(Handle: *mut c_void) -> u32;
+        }
+
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        static CODE: AtomicU32 = AtomicU32::new(0);
+        static RIP: AtomicU64 = AtomicU64::new(0);
+
+        unsafe extern "system" fn veh(info: *mut ExceptionPointers) -> i32 {
+            unsafe {
+                let rec = &*(*info).exception_record;
+                if rec.exception_code != EXCEPTION_BREAKPOINT {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+                let rip_ptr = ((*info).context_record as *mut u8).add(RIP_OFFSET) as *mut u64;
+                CODE.store(rec.exception_code, Ordering::SeqCst);
+                RIP.store(*rip_ptr, Ordering::SeqCst);
+                FIRED.store(true, Ordering::SeqCst);
+                // Step over the 1-byte int3 so execution resumes cleanly.
+                *rip_ptr += 1;
+                EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
+
+        // void boom() { debugtrap; return; }
+        let mut f = FunctionBuilder::new("boom", vec![], IrType::Void);
+        f.trap(true);
+        f.ret(None);
+        let mut m = IrModule::new("jit_trap");
+        m.add_function(f.finish());
+
+        let jit = OrcJit::from_ir(&m).expect("jit builds");
+        let addr = jit.lookup("boom").expect("boom resolves");
+
+        let handle = unsafe { AddVectoredExceptionHandler(1, veh) };
+        assert!(!handle.is_null(), "VEH install failed");
+
+        let boom: extern "C" fn() = unsafe { std::mem::transmute(addr) };
+        boom(); // executes int3 → VEH catches + resumes → ret
+
+        unsafe { RemoveVectoredExceptionHandler(handle) };
+
+        assert!(FIRED.load(Ordering::SeqCst), "VEH did not fire");
+        assert_eq!(CODE.load(Ordering::SeqCst), EXCEPTION_BREAKPOINT);
+        let rip = RIP.load(Ordering::SeqCst);
+        assert!(
+            rip >= addr && rip < addr + 256,
+            "faulting Rip {rip:#x} not inside JIT'd boom [{addr:#x}, {:#x})",
+            addr + 256
+        );
+    }
 }

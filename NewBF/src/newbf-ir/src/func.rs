@@ -157,6 +157,12 @@ impl FunctionBuilder {
         self.emit(InstKind::Select { cond, a, b }, ty, None)
     }
 
+    /// Emit a trap. `debug` selects a resumable breakpoint (`int3`) vs. a
+    /// fatal illegal instruction (`ud2`). Yields no value.
+    pub fn trap(&mut self, debug: bool) {
+        self.emit(InstKind::Trap { debug }, IrType::Void, None);
+    }
+
     /// Attach a source span to the most recently emitted instruction (for
     /// debug info / symbolicated stack dumps).
     pub fn set_span(&mut self, value: &Value, span: Span) {

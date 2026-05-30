@@ -395,6 +395,22 @@ impl<'ctx> Codegen<'ctx, '_> {
                 let bv = self.value_of(b, results, llvm_fn)?;
                 Some(self.builder.build_select(c, av, bv, "sel").unwrap())
             }
+            InstKind::Trap { debug } => {
+                // `@llvm.debugtrap` → int3 (resumable breakpoint);
+                // `@llvm.trap` → ud2 (fatal illegal instruction). Both are
+                // `void ()`; LLVM recognizes them as intrinsics by name.
+                let name = if *debug {
+                    "llvm.debugtrap"
+                } else {
+                    "llvm.trap"
+                };
+                let f = self.module.get_function(name).unwrap_or_else(|| {
+                    let fty = self.ctx.void_type().fn_type(&[], false);
+                    self.module.add_function(name, fty, None)
+                });
+                self.builder.build_call(f, &[], "").unwrap();
+                None
+            }
         }
     }
 
@@ -712,6 +728,19 @@ mod tests {
         let ir = lower_to_string(&m);
         assert!(ir.contains("declare i32 @puts(ptr"), "{ir}");
         assert!(ir.contains("call i32 @puts(ptr null)"), "{ir}");
+    }
+
+    #[test]
+    fn trap_lowers_to_intrinsic_and_verifies() {
+        // void crash() { debugtrap; return; }
+        let mut f = FunctionBuilder::new("crash", vec![], IrType::Void);
+        f.trap(true);
+        f.ret(None);
+        let m = module_with(f.finish());
+
+        verify_module(&m).expect("trap verifies");
+        let ir = lower_to_string(&m);
+        assert!(ir.contains("call void @llvm.debugtrap()"), "{ir}");
     }
 
     #[test]

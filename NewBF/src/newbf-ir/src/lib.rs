@@ -158,6 +158,21 @@ mod tests {
     }
 
     #[test]
+    fn trap_intrinsics_render() {
+        // void t() { debugtrap; trap; ret; }
+        let mut f = FunctionBuilder::new("t", vec![], IrType::Void);
+        f.trap(true);
+        f.trap(false);
+        f.ret(None);
+        let mut m = Module::new("m");
+        m.add_function(f.finish());
+        let r = format_ir(&m);
+        assert!(r.contains("    debugtrap\n"), "{r}");
+        // 4-space indent before bare `trap` distinguishes it from `debugtrap`.
+        assert!(r.contains("    trap\n"), "{r}");
+    }
+
+    #[test]
     fn types_and_floats() {
         let mut f = FunctionBuilder::new(
             "fma",
