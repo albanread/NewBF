@@ -177,6 +177,18 @@ impl Lexer<'_> {
                     break;
                 }
             }
+        } else if self.b[self.pos] == b'0' && matches!(self.at(1), b'o' | b'O') {
+            self.pos += 2;
+            while self.pos < self.b.len() {
+                let c = self.b[self.pos];
+                if matches!(c, b'0'..=b'7' | b'_')
+                    || (c == b'\'' && matches!(self.at(1), b'0'..=b'7'))
+                {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
         } else {
             self.digits();
             // fractional part: a '.' is only part of the number if a digit

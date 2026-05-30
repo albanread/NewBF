@@ -352,7 +352,12 @@ impl<'a> Parser<'a> {
                         }
                         self.eat(TokenKind::RBracket);
                     }
-                    let name = self.expect_ident_span("member name");
+                    // `a.0` / `a.1` — tuple field access (numeric member).
+                    let name = if self.at(TokenKind::Int) {
+                        self.bump().span
+                    } else {
+                        self.expect_ident_span("member name")
+                    };
                     e = Expr::Member {
                         span: self.finish(lo),
                         base: Box::new(e),
@@ -696,8 +701,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Token kinds that can start a unary expression — used to commit to
-    /// a C-style cast.
+    /// Token kinds that commit `(X) …` to a C-style cast. Deliberately
+    /// excludes tokens that are *also* binary/postfix operators (`. * & +
+    /// - ++ --`): `(a).b`, `(a)*b`, `(a)-b` are member-access / arithmetic,
+    /// not casts. Only unambiguous unary starts qualify.
     fn can_start_unary(k: TokenKind) -> bool {
         matches!(
             k,
@@ -709,15 +716,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::InterpStr
                 | TokenKind::Ident
                 | TokenKind::LParen
-                | TokenKind::Minus
-                | TokenKind::Plus
                 | TokenKind::Bang
                 | TokenKind::Tilde
-                | TokenKind::PlusPlus
-                | TokenKind::MinusMinus
-                | TokenKind::Star
-                | TokenKind::Amp
-                | TokenKind::Dot
                 | TokenKind::Keyword(_)
         )
     }
@@ -751,6 +751,7 @@ impl<'a> Parser<'a> {
             | Keyword::NameOf
             | Keyword::Comptype
             | Keyword::Decltype
+            | Keyword::RetType
             | Keyword::Default => {
                 self.bump();
                 Expr::Ident(span)
@@ -902,6 +903,23 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Defer) => self.defer_stmt(),
             TokenKind::Keyword(Keyword::Var) | TokenKind::Keyword(Keyword::Let) => self.local(true),
             TokenKind::Keyword(Keyword::Switch) => self.switch_stmt(),
+            // `using (resource) stmt` — RAII scope (modeled as a block).
+            TokenKind::Keyword(Keyword::Using) if self.nth_kind(1) == TokenKind::LParen => {
+                let lo = self.start();
+                self.bump(); // using
+                self.bump(); // (
+                if self.at_kw(Keyword::Var) || self.at_kw(Keyword::Let) {
+                    let _ = self.local(false);
+                } else {
+                    let _ = self.expr();
+                }
+                self.expect(TokenKind::RParen, "`)` after using-resource");
+                let body = self.stmt();
+                Stmt::Block {
+                    span: self.finish(lo),
+                    stmts: vec![body],
+                }
+            }
             // Local `mixin Name(params) body` inside a method.
             TokenKind::Keyword(Keyword::Mixin) => {
                 let lo = self.start();
@@ -1424,7 +1442,19 @@ impl<'a> Parser<'a> {
         let lo = self.start();
         let is_let = self.at_kw(Keyword::Let);
         self.bump(); // var / let
-        let name = self.expect_ident_span("variable name");
+        // Tuple destructuring: `var (a, b) = …`. Consume the `(names)`
+        // pattern; keep the opening-paren span as the binding name.
+        let name = if self.at(TokenKind::LParen) {
+            let pat = self.cur().span;
+            self.bump(); // (
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                self.bump();
+            }
+            self.expect(TokenKind::RParen, "`)` to close destructuring pattern");
+            pat
+        } else {
+            self.expect_ident_span("variable name")
+        };
         let init = if self.eat(TokenKind::Assign) {
             Some(self.expr())
         } else {
@@ -1445,7 +1475,11 @@ impl<'a> Parser<'a> {
     fn expr_stmt(&mut self) -> Stmt {
         let lo = self.start();
         let expr = self.expr();
-        self.expect(TokenKind::Semicolon, "`;` after expression statement");
+        // A trailing expression with no `;` right before `}` is a block's
+        // yielded value (`{ …; result }`) — don't require the semicolon.
+        if !self.eat(TokenKind::Semicolon) && !self.at(TokenKind::RBrace) {
+            self.error("expected `;` after expression statement");
+        }
         Stmt::Expr {
             span: self.finish(lo),
             expr,
@@ -2122,7 +2156,14 @@ impl<'a> Parser<'a> {
             }
             if matches!(
                 k,
-                Keyword::Class | Keyword::Struct | Keyword::New | Keyword::Delete | Keyword::Var
+                Keyword::Class
+                    | Keyword::Struct
+                    | Keyword::New
+                    | Keyword::Delete
+                    | Keyword::Var
+                    | Keyword::Concrete
+                    | Keyword::Interface
+                    | Keyword::Enum
             ) {
                 let span = self.bump().span;
                 let base = Type::Path {
@@ -2368,10 +2409,9 @@ impl<'a> Parser<'a> {
         let name = if self.at_kw(Keyword::Operator) {
             let op_lo = self.start();
             self.bump(); // operator
-            while !self.at(TokenKind::LParen)
-                && !self.at(TokenKind::Eof)
-                && !matches!(self.kind(), TokenKind::Ident | TokenKind::Keyword(_))
-            {
+            // Consume the operator name up to `(` — symbols, or a type /
+            // keyword for conversion ops (`operator implicit`, `operator T`).
+            while !self.at(TokenKind::LParen) && !self.at(TokenKind::Eof) {
                 self.bump();
             }
             self.finish(op_lo)
@@ -2663,6 +2703,18 @@ impl<'a> Parser<'a> {
 
     fn param(&mut self) -> Param {
         let lo = self.start();
+        // C-style varargs marker `...` in a parameter list.
+        if self.at(TokenKind::DotDotDot) {
+            let s = self.bump().span;
+            return Param {
+                span: s,
+                attributes: Vec::new(),
+                modifier: None,
+                ty: Type::Var(s),
+                name: None,
+                default: None,
+            };
+        }
         let attributes = self.attributes();
         // A param can carry several modifiers, e.g. `this ref StructA`.
         // We keep the first for the AST and consume the rest.
