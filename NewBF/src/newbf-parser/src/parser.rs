@@ -304,18 +304,7 @@ impl<'a> Parser<'a> {
                 }
                 // Object/collection initializer: `new T() { a = 1, b }`.
                 if self.at(TokenKind::LBrace) {
-                    self.bump();
-                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-                        let before = self.pos;
-                        let _ = self.expr();
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
-                        if self.pos == before {
-                            break;
-                        }
-                    }
-                    self.expect(TokenKind::RBrace, "`}` to close initializer");
+                    self.consume_initializer();
                 }
             }
             return Expr::Prefix {
@@ -386,6 +375,10 @@ impl<'a> Parser<'a> {
                     };
                 }
                 TokenKind::LParen => {
+                    // An inferred-ctor `.()` may carry an object
+                    // initializer (`.() { mA = 1 }`); a plain call never
+                    // does, so we only look for `{` in the dot-ctor case.
+                    let is_dot_ctor = matches!(&e, Expr::DotIdent { .. });
                     self.bump();
                     let args = self.arg_list(TokenKind::RParen);
                     self.expect(TokenKind::RParen, "`)` to close call");
@@ -394,6 +387,9 @@ impl<'a> Parser<'a> {
                         callee: Box::new(e),
                         args,
                     };
+                    if is_dot_ctor && self.at(TokenKind::LBrace) {
+                        self.consume_initializer();
+                    }
                 }
                 TokenKind::LBracket => {
                     self.bump();
@@ -495,6 +491,24 @@ impl<'a> Parser<'a> {
                 | TokenKind::FatArrow
                 | TokenKind::Eof
         )
+    }
+
+    /// Consume an object/collection initializer `{ a = 1, b, … }`
+    /// (contents discarded for now — recovered in sema). Assumes the
+    /// current token is `{`.
+    fn consume_initializer(&mut self) {
+        self.bump(); // {
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            let _ = self.expr();
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace, "`}` to close initializer");
     }
 
     fn arg_list(&mut self, close: TokenKind) -> Vec<Expr> {
@@ -1122,6 +1136,32 @@ impl<'a> Parser<'a> {
         }
         self.pos = checkpoint; // not a for-each; rewind
 
+        // Beef count-loop: `for (var? Type name < EXPR)` — shorthand for
+        // `for (Type name = 0; name < EXPR; name++)`. Modeled as ForEach
+        // (the bound goes in `iter`; sema reinterprets).
+        {
+            let save = self.save();
+            let _ = self.eat_kw(Keyword::Var) || self.eat_kw(Keyword::Let);
+            let _ty = self.ty();
+            if self.diagnostics.len() == save.diag_len
+                && self.at(TokenKind::Ident)
+                && self.nth_kind(1) == TokenKind::Lt
+            {
+                let name = self.bump().span;
+                self.bump(); // <
+                let iter = self.expr();
+                self.expect(TokenKind::RParen, "`)` after for count-loop");
+                let body = Box::new(self.stmt());
+                return Stmt::ForEach {
+                    span: self.finish(lo),
+                    name,
+                    iter,
+                    body,
+                };
+            }
+            self.restore(save);
+        }
+
         // C-style: `(init; cond; update)`
         let init = if self.at(TokenKind::Semicolon) {
             None
@@ -1301,8 +1341,10 @@ impl<'a> Parser<'a> {
                 Vec::new()
             };
             segments.push(TypeSeg { name, args });
-            // Only descend on `.ident` (avoid swallowing trailing dots).
-            if self.at(TokenKind::Dot) && self.nth_kind(1) == TokenKind::Ident {
+            // Descend on `.ident` or `::ident` (`global::System.String`).
+            if (self.at(TokenKind::Dot) || self.at(TokenKind::ColonColon))
+                && self.nth_kind(1) == TokenKind::Ident
+            {
                 self.bump();
             } else {
                 break;
@@ -1657,6 +1699,20 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
         let constraints = self.where_clauses();
+        // Bodyless / forward declaration: `struct StructB;`.
+        if self.eat(TokenKind::Semicolon) {
+            return TypeDecl {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                kind,
+                name,
+                generic_params,
+                bases,
+                constraints,
+                members: Vec::new(),
+            };
+        }
         let members = if self.eat(TokenKind::LBrace) {
             self.members(kind)
         } else {
@@ -1804,7 +1860,14 @@ impl<'a> Parser<'a> {
         let mut bases = Vec::new();
         loop {
             let before = self.pos;
-            bases.push(self.ty());
+            // Beef tuple-struct/primary-ctor base clause: `: this(int a)`.
+            // Consume it (params become the type's fields) and continue.
+            if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LParen {
+                self.bump(); // this
+                let _ = self.params();
+            } else {
+                bases.push(self.ty());
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -1876,13 +1939,15 @@ impl<'a> Parser<'a> {
                 Keyword::Class | Keyword::Struct | Keyword::New | Keyword::Delete | Keyword::Var
             ) {
                 let span = self.bump().span;
-                return Type::Path {
+                let base = Type::Path {
                     span,
                     segments: vec![TypeSeg {
                         name: span,
                         args: Vec::new(),
                     }],
                 };
+                // `where T : struct*` etc. — allow trailing type suffixes.
+                return self.type_suffixes(base);
             }
         }
         self.ty()
