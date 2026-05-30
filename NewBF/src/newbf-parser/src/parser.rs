@@ -709,6 +709,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Ident(span)
             }
+            // `...` — range-all placeholder (e.g. index `iList[...]`).
+            TokenKind::DotDotDot => {
+                self.bump();
+                Expr::Ident(span)
+            }
             // Leading-`.` shorthand: `.Variant` (enum case), `.(args)`
             // (inferred-type ctor), `.[i]` (inferred-type indexer). The
             // postfix loop handles the call/index after we emit the
@@ -1613,7 +1618,20 @@ impl<'a> Parser<'a> {
         let update = if self.at(TokenKind::RParen) {
             None
         } else {
-            Some(self.expr())
+            // Comma-separated update expressions: `for (…;…; i++, j--)`.
+            // Keep the first; consume the rest.
+            let first = self.expr();
+            while self.eat(TokenKind::Comma) {
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+                let before = self.pos;
+                let _ = self.expr();
+                if self.pos == before {
+                    break;
+                }
+            }
+            Some(first)
         };
         self.expect(TokenKind::RParen, "`)` after for-clauses");
         let body = Box::new(self.stmt());
@@ -2492,6 +2510,11 @@ impl<'a> Parser<'a> {
     fn members(&mut self, kind: TypeKind) -> Vec<Member> {
         let mut out = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            // Stray `;` between members — e.g. a trailing semicolon after a
+            // nested type body (`enum { … };`). Skip as an empty member.
+            if self.eat(TokenKind::Semicolon) {
+                continue;
+            }
             let before = self.pos;
             out.push(self.member(kind));
             if self.pos == before {
