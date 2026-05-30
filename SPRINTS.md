@@ -282,17 +282,38 @@ every type with its full shape, and every member signature.
 
 ## Sprints 06–08 — Primitive kernel JIT (phase 3)
 **Goal:** Thin end-to-end pipeline: primitives, functions, control flow,
-JIT-run "hello world."
+JIT-run "hello world" — **and a comptime tracer bullet**, because comptime's
+*architecture* is designed in from the first IR sprint even though its
+*breadth* fills in later (decided 2026-05-30: handle comptime up front, a
+JIT-engine/orchestration refit is ~10× the cost of designing it in).
 
-- **06 — Typed SSA IR core (`newbf-ir`).** Smallest viable instruction
-  set; `dump-ir` report.
+- **06 — Typed SSA IR core (`newbf-ir`).** Single typed, post-
+  monomorphization SSA IR; smallest viable instruction set; `dump-ir`
+  report. **Designed comptime-ready from day one:** (a) the IR→lowering
+  pipeline is a library parameterized by a *world* (intrinsic table +
+  allocator + target) so the same codegen serves an app world and a
+  comptime world; (b) the compilation **orchestration is a worklist /
+  fixpoint with "type-being-built" states**, never a linear pipeline, so
+  comptime emitting types/members mid-resolution is not a future rewrite.
 - **07 — LLVM lowering + JIT (`newbf-llvm`).** Activate the pinned LLVM
   deps; integer/float arithmetic, branches, direct calls; `dump-llvm`
-  report. Lift the JIT memory manager + Win64 SEH from NewM2.
-- **08 — Hello world.** One FFI shim to stdout; `newbf-driver run` JITs
-  and executes a primitive Beef program end-to-end.
+  report. **The JIT is ORCv2 (`LLJIT`), not MCJIT** (manifesto core
+  decision 3): `JITDylib`s model the comptime/app worlds, `ResourceTracker`
+  gives hot-swap + comptime-world teardown. Run ORC over
+  `RTDyldObjectLinkingLayer` and **reuse NewM2's RuntimeDyld + Win64-SEH
+  unwind-registration manager unchanged**; inkwell builds modules,
+  `llvm-sys` drives the ORC layer. **Gating spike:** JIT a trivial fn under
+  ORC+RTDyld on Windows/LLVM 22.1, throw + unwind through it, and confirm
+  the SEH manager registers and a stack dump symbolicates — *before*
+  building on it. Sandbox hooks (bounded step/time/mem) stubbed here.
+- **08 — Hello world + comptime tracer bullet.** One FFI shim to stdout;
+  `newbf-driver run` JITs and executes a primitive Beef program. **Also:**
+  JIT one `[Comptime]` const function into a comptime `JITDylib`, marshal
+  args across the boundary, fold the constant back into app IR — proving
+  the two-world plumbing + marshalling end-to-end while the surface is tiny.
 
-**Demo (08):** `newbf-driver run beef-tests/samples/hello.bf` prints output.
+**Demo (08):** `newbf-driver run beef-tests/samples/hello.bf` prints output;
+a `const x = ComptimeAdd(2, 3);` folds to `5` at compile time.
 
 ---
 
@@ -325,7 +346,7 @@ a use-after-free faults at the offending access, not later.
 | ------- | ----- | ----------- |
 | 12–15 | Structs, classes, interfaces; fields, properties, ctors/dtors; inheritance + vtables + interface dispatch | `dump-types`, `dump-dispatch` |
 | 16–18 | Generics + monomorphization; constraints; const generics | `dump-generic-instantiations` |
-| 19–21 | Comptime (`newbf-comptime`): `[Comptime]`, const-eval, type generation | comptime trace |
+| 19–21 | Comptime **breadth** (`newbf-comptime`): full `[Comptime]`, type generation/emission, reflection API, memoization. (The *architecture* — world-parameterized IR, ORC `JITDylib`s, the worklist/fixpoint, and a const-eval tracer bullet — already shipped in Sprints 06–08; this is where it grows up, not where it starts.) | comptime trace |
 | 22–23 | Reflection + attributes; metadata emission with strip policy | reflection-metadata |
 | 24–26 | `Result`/`Try!`, payload enums + pattern matching, `defer`, `mixin` | — |
 

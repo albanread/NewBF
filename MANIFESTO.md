@@ -84,9 +84,30 @@ NewBF is **manual-memory-first**, **Rust-for-the-substrate**,
 
 3. **LLVM is the only code generator.** Beef's own "Be" x86 backend and
    COFF emitter are dropped. The pipeline is Beef → tokens → parse tree →
-   reduced AST → resolved/typed AST → NewBF SSA IR → LLVM IR → machine
+   AST → resolved/typed AST → **a single typed SSA IR** → LLVM IR → machine
    code, JIT-first, with a reviewable textual report at every phase
-   (core decision 12).
+   (core decision 12). The IR is *one* level, not two: Beef's apparent
+   two-level-ness is a fossil of `BfReducer` (an IDE-incremental-reparse
+   concern we collapse into one AST pass) and `BfIRBuilder`'s backend-
+   neutral command buffer (which existed only to target LLVM *or* "Be" —
+   moot now that we're LLVM-only).
+
+   **The JIT is LLVM ORCv2 (`LLJIT`), not MCJIT** — a deliberate divergence
+   from the sibling compilers, which use MCJIT for "compile-module-into-
+   memory-and-run." NewBF has two needs MCJIT fights and ORC makes first-
+   class: (a) **comptime's two worlds** map onto ORC `JITDylib`s (a comptime
+   world and an app world with separate symbol scopes and lifetimes;
+   `ResourceTracker.remove()` tears the comptime world down after compile),
+   and (b) **hot code swapping** is `ResourceTracker` replace, supported in
+   ORC and impossible-to-do-cleanly in MCJIT. Swapping JIT engines later
+   would be exactly the kind of refit we refuse, so ORC is chosen up front.
+   To de-risk Windows SEH we run ORC over **`RTDyldObjectLinkingLayer`**
+   (RuntimeDyld) so we reuse NewM2's proven unwind-registration memory
+   manager unchanged, rather than jumping to JITLink. Practical split:
+   **inkwell builds the modules; `llvm-sys` drives the ORC execution layer**
+   (inkwell's ORCv2 coverage is partial). AOT is orthogonal — same module
+   emission, written to an object file and linked — so the JIT choice does
+   not touch the AOT path.
 
 4. **64-bit from day one.** Pointer width, integer sizing, struct layout,
    FFI marshalling, and allocation headers all assume a 64-bit address
@@ -173,7 +194,14 @@ NewBF is **manual-memory-first**, **Rust-for-the-substrate**,
     the IDE crash view. This is load-bearing *because* the language is
     manual-memory: when the stomp allocator faults on a use-after-free,
     the dump must point at the offending frame and at the allocation and
-    free sites of the poisoned object. Detailed in *Crash handling* below.
+    free sites of the poisoned object. **It is also load-bearing for *us*:**
+    NewBF (compiler + iGui IDE) is a Windows application under active
+    development that *will* crash, and JIT'd code — comptime and app — that
+    faults without registered unwind info gives no stack, i.e. blind
+    debugging. So SEH serves our own development first, the compiled
+    program's exception semantics second. This is the chief reason the JIT
+    runs ORC over RuntimeDyld (core decision 3): it reuses NewM2's proven
+    Win64 unwind-registration manager. Detailed in *Crash handling* below.
 
 ## The memory model
 
