@@ -26,3 +26,16 @@
 //! opt-in mode — never the default.
 //!
 //! Lands in SPRINTS.md Sprints 09–11. Reference: `E:\beef\BeefRT\rt\`.
+//!
+//! **Live now:** the signal-safe Win64 crash-dump handler ([`crash_dump`]) —
+//! the SEH consumer for `trap`/`debugtrap` and any fault, so a
+//! crash-under-development prints a dump instead of dying silently. Its
+//! memory-guard section is a hook the stomp allocator fills in Sprints 09–11.
+
+mod crash_dump;
+
+#[cfg(windows)]
+pub use crash_dump::ensure_stack_overflow_reserve_this_thread;
+pub use crash_dump::{
+    install_crash_handler, note_free, note_memory_guard_installed, update_guard_metrics,
+};
