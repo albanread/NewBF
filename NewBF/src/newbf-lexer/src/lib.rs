@@ -142,6 +142,15 @@ mod tests {
     }
 
     #[test]
+    fn interpolated_string_with_nested_string() {
+        use TokenKind::InterpStr;
+        // The `"` inside the `{ … }` hole must not end the interpolated
+        // string; the whole thing is one token. `{{` is an escaped brace.
+        assert_eq!(kinds(r#"$"a{(c ? "x" : "y")}b{{c}}""#), [InterpStr]);
+        assert_eq!(kinds(r#"$"{nested("q")}""#), [InterpStr]);
+    }
+
+    #[test]
     fn operators_maximal_munch() {
         use TokenKind::*;
         assert_eq!(

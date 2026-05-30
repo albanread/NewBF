@@ -278,9 +278,53 @@ impl Lexer<'_> {
 
     fn string(&mut self, kind: TokenKind) -> TokenKind {
         let verbatim = matches!(kind, TokenKind::VerbatimStr);
+        let interp = matches!(kind, TokenKind::InterpStr);
         self.pos += 1; // opening "
+        // Brace nesting inside an interpolated string's `{ expr }` holes. A
+        // `"` only closes the string at brace-depth 0; inside a hole, nested
+        // strings and braces are skipped so `$"{(c ? "a" : "b")}"` lexes as
+        // one token. `{{` / `}}` are escaped literal braces.
+        let mut depth = 0u32;
         while self.pos < self.b.len() {
-            match self.b[self.pos] {
+            let c = self.b[self.pos];
+            if interp && depth == 0 && c == b'{' {
+                if self.at(1) == b'{' {
+                    self.pos += 2; // `{{` literal brace
+                } else {
+                    depth = 1;
+                    self.pos += 1;
+                }
+                continue;
+            }
+            if interp && depth > 0 {
+                match c {
+                    b'{' => {
+                        depth += 1;
+                        self.pos += 1;
+                    }
+                    b'}' => {
+                        depth -= 1;
+                        self.pos += 1;
+                    }
+                    // A nested string inside the interpolation hole.
+                    b'"' => {
+                        self.pos += 1;
+                        while self.pos < self.b.len() {
+                            match self.b[self.pos] {
+                                b'\\' => self.pos += 2,
+                                b'"' => {
+                                    self.pos += 1;
+                                    break;
+                                }
+                                _ => self.pos += 1,
+                            }
+                        }
+                    }
+                    _ => self.pos += 1,
+                }
+                continue;
+            }
+            match c {
                 b'\\' if !verbatim => self.pos += 2, // escape
                 b'"' => {
                     // In verbatim strings, "" is an escaped quote.
