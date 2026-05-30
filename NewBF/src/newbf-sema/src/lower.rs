@@ -50,8 +50,44 @@ fn lower_items(items: &[Item], prefix: &str, src: &str, m: &mut Module) {
     }
 }
 
+/// A method's lowered signature — its mangled symbol, return type, and
+/// parameter types — so a same-type call (`Foo()`) resolves to `{prefix}Foo`
+/// with the right signature instead of a defaulted external.
+#[derive(Clone)]
+struct MethodSig {
+    full_name: String,
+    ret: IrType,
+    params: Vec<IrType>,
+}
+
 fn lower_type(td: &TypeDecl, prefix: &str, src: &str, m: &mut Module) {
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
+    // Index this type's methods first so bodies can resolve calls to siblings
+    // (incl. recursion). First declaration of a name wins (overloads later).
+    let mut sigs: HashMap<String, MethodSig> = HashMap::new();
+    for member in &td.members {
+        if let Member::Method {
+            return_ty,
+            name,
+            params,
+            body,
+            ..
+        } = member
+        {
+            // Only body-having methods are lowered + declared; indexing a
+            // body-less overload (extern/abstract) would aim a same-arity call
+            // at a symbol that's never emitted (or a different overload).
+            if matches!(body, MethodBody::None) {
+                continue;
+            }
+            let nm = name.text(src).to_string();
+            sigs.entry(nm.clone()).or_insert_with(|| MethodSig {
+                full_name: format!("{new_prefix}{nm}"),
+                ret: lower_ty(return_ty, src),
+                params: params.iter().map(|p| lower_ty(&p.ty, src)).collect(),
+            });
+        }
+    }
     for member in &td.members {
         match member {
             Member::Method {
@@ -61,9 +97,15 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, m: &mut Module) {
                 body,
                 ..
             } => {
-                if let Some(func) =
-                    lower_method(&new_prefix, name.text(src), return_ty, params, body, src)
-                {
+                if let Some(func) = lower_method(
+                    &new_prefix,
+                    name.text(src),
+                    return_ty,
+                    params,
+                    body,
+                    src,
+                    &sigs,
+                ) {
                     m.add_function(func);
                 }
             }
@@ -80,6 +122,7 @@ fn lower_method(
     params: &[AstParam],
     body: &MethodBody,
     src: &str,
+    methods: &HashMap<String, MethodSig>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -97,7 +140,7 @@ fn lower_method(
         .collect();
 
     let fb = FunctionBuilder::new(format!("{prefix}{name}"), ir_params, ret);
-    let mut lw = Lowerer::new(fb, ret);
+    let mut lw = Lowerer::new(fb, ret, methods);
 
     // Make parameters addressable: spill each into a stack slot at entry so
     // reads are `load`s and assignments just `store` (LLVM mem2reg cleans up).
@@ -127,22 +170,25 @@ fn lower_method(
     Some(lw.fb.finish())
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     fb: FunctionBuilder,
     ret_ty: IrType,
     /// Lexical scope stack: name → (stack-slot pointer, slot type).
     scopes: Vec<HashMap<String, (Value, IrType)>>,
     /// Whether the current block already has a terminator (stop emitting).
     terminated: bool,
+    /// Sibling methods (same type), for resolving bare-name calls.
+    methods: &'a HashMap<String, MethodSig>,
 }
 
-impl Lowerer {
-    fn new(fb: FunctionBuilder, ret_ty: IrType) -> Self {
+impl<'a> Lowerer<'a> {
+    fn new(fb: FunctionBuilder, ret_ty: IrType, methods: &'a HashMap<String, MethodSig>) -> Self {
         Self {
             fb,
             ret_ty,
             scopes: vec![HashMap::new()],
             terminated: false,
+            methods,
         }
     }
 
@@ -314,13 +360,37 @@ impl Lowerer {
                 op, target, value, ..
             } => self.assign(*op, target, value, src),
             Expr::Call { callee, args, .. } => {
-                let arg_vals: Vec<Value> = args.iter().map(|a| self.expr(a, src).0).collect();
+                let arg_vals: Vec<(Value, IrType)> =
+                    args.iter().map(|a| self.expr(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
-                    // Direct call; result type unknown without resolution —
-                    // default to i64 for the kernel (callee resolution lands
-                    // with the type sprint).
-                    let r = self.fb.call(s.text(src), arg_vals, IrType::I64);
-                    (r, IrType::I64)
+                    let name = s.text(src);
+                    // Resolve to a same-type method ONLY when the arg count
+                    // matches its arity. Coercion then makes every arg exactly
+                    // the param type, so the call matches the declared
+                    // signature. On an arity mismatch (a different overload, or
+                    // no such method) we fall back to a defaulted external —
+                    // overload resolution by type lands with the type sprint.
+                    let resolved = self
+                        .methods
+                        .get(name)
+                        .filter(|sig| sig.params.len() == arg_vals.len())
+                        .cloned();
+                    if let Some(sig) = resolved {
+                        // Same-type call (incl. recursion).
+                        let coerced: Vec<Value> = arg_vals
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
+                            .collect();
+                        let r = self.fb.call(sig.full_name, coerced, sig.ret);
+                        (r, sig.ret)
+                    } else {
+                        // Unresolved / arity-mismatched bare name — an external
+                        // (Win32/CRT) call; default the result to i64.
+                        let plain: Vec<Value> = arg_vals.into_iter().map(|(v, _)| v).collect();
+                        let r = self.fb.call(name, plain, IrType::I64);
+                        (r, IrType::I64)
+                    }
                 } else {
                     (undef(IrType::I64), IrType::I64)
                 }
