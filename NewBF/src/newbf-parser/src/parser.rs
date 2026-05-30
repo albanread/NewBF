@@ -60,6 +60,11 @@ struct Parser<'a> {
     /// ctor body, not an initializer of `base(args)`). Reset inside `()`/`[]`
     /// so initializers in arguments still parse.
     suppress_init: bool,
+    /// The post-preprocess trivia tokens (whitespace, comments, surviving
+    /// preprocessor directive lines), in source order, that were filtered
+    /// out of `toks`. Retained for the IDE source formatter (see
+    /// [`parse_file_with_trivia`]); empty/ignored on the normal parse path.
+    trivia: Vec<Token>,
 }
 
 /// Snapshot of parser state used by speculative parses.
@@ -72,11 +77,25 @@ struct Save {
 
 impl<'a> Parser<'a> {
     fn new(src: &'a str, file: FileId) -> Self {
+        Self::new_inner(src, file, false)
+    }
+
+    /// Like [`Parser::new`], but retains the post-preprocess trivia stream
+    /// (whitespace, comments, surviving directive lines) in `self.trivia`
+    /// for the source formatter.
+    fn new_with_trivia(src: &'a str, file: FileId) -> Self {
+        Self::new_inner(src, file, true)
+    }
+
+    fn new_inner(src: &'a str, file: FileId, keep_trivia: bool) -> Self {
         let lexed = lex(src, file);
-        let toks: Vec<Token> = crate::preprocess::preprocess(src, lexed)
-            .into_iter()
-            .filter(|t| !t.kind.is_trivia())
-            .collect();
+        let pre = crate::preprocess::preprocess(src, lexed);
+        let trivia: Vec<Token> = if keep_trivia {
+            pre.iter().filter(|t| t.kind.is_trivia()).copied().collect()
+        } else {
+            Vec::new()
+        };
+        let toks: Vec<Token> = pre.into_iter().filter(|t| !t.kind.is_trivia()).collect();
         Self {
             src,
             toks,
@@ -85,6 +104,7 @@ impl<'a> Parser<'a> {
             diagnostics: Vec::new(),
             splits: Vec::new(),
             suppress_init: false,
+            trivia,
         }
     }
 
@@ -3591,4 +3611,21 @@ pub fn parse_file(src: &str, file: FileId) -> (CompUnit, Vec<Diagnostic>) {
     let mut p = Parser::new(src, file);
     let unit = p.comp_unit();
     (unit, p.diagnostics)
+}
+
+/// Parse a whole compilation unit, additionally returning the
+/// **post-preprocess trivia stream** (whitespace, comments, and surviving
+/// preprocessor directive lines, in source order). Intended for the IDE
+/// source formatter, which walks the AST for structure and flushes trivia
+/// from this side channel by position. The AST itself is identical to
+/// [`parse_file`]'s — trivia is *not* attached to nodes.
+///
+/// Note: inactive `#if`/`#else` branches have their *code* dropped by the
+/// preprocessor, but trivia (comments/whitespace) inside those branches is
+/// still present in this stream; the formatter should bound trivia flushing
+/// to the span of the node it precedes.
+pub fn parse_file_with_trivia(src: &str, file: FileId) -> (CompUnit, Vec<Token>, Vec<Diagnostic>) {
+    let mut p = Parser::new_with_trivia(src, file);
+    let unit = p.comp_unit();
+    (unit, p.trivia, p.diagnostics)
 }

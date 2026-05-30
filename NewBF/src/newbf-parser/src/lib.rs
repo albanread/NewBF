@@ -20,7 +20,9 @@ pub use ast::{
     MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm, Type, TypeDecl,
     TypeKind, TypeSeg, UnOp, WhereClause,
 };
-pub use parser::{Diagnostic, parse_expr, parse_file, parse_fragment, parse_type};
+pub use parser::{
+    Diagnostic, parse_expr, parse_file, parse_file_with_trivia, parse_fragment, parse_type,
+};
 pub use print::{format_ast, format_expr, format_parse};
 
 #[cfg(test)]
@@ -1104,6 +1106,47 @@ namespace Demo {
         };
         assert_eq!(td.name.text(src), "Point");
         assert_eq!(td.members.len(), 4);
+    }
+
+    #[test]
+    fn parse_file_with_trivia_retains_comments_and_directives() {
+        use newbf_lexer::TokenKind;
+        let src = "// lead comment\n#pragma once\nclass C {\n  /* doc */ int x; // trail\n}\n";
+        let (unit, trivia, diags) = parse_file_with_trivia(src, FileId(0));
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(unit.items.len(), 1); // AST unchanged — trivia not attached
+        // The side channel keeps comments, the directive line, and whitespace,
+        // in source order with exact spans.
+        let kinds: Vec<TokenKind> = trivia.iter().map(|t| t.kind).collect();
+        assert!(kinds.contains(&TokenKind::LineComment));
+        assert!(kinds.contains(&TokenKind::BlockComment));
+        assert!(kinds.contains(&TokenKind::PreprocLine)); // `#pragma once` retained
+        assert!(kinds.contains(&TokenKind::Whitespace)); // for blank-line counting
+        // Source order + exact spans: each trivia slice matches the source.
+        let mut last = 0;
+        for t in &trivia {
+            assert!(t.span.lo >= last, "trivia out of order");
+            assert_eq!(
+                &src[t.span.lo as usize..t.span.hi as usize],
+                t.span.text(src)
+            );
+            last = t.span.lo;
+        }
+        // The leading comment is the first trivia and reproduces verbatim.
+        assert_eq!(trivia[0].span.text(src), "// lead comment");
+    }
+
+    #[test]
+    fn error_node_spans_full_skipped_region() {
+        // R3: a malformed item's Error node must cover the whole skipped
+        // slice (so the formatter can copy it verbatim), not just one token.
+        let src = "@@@ $$$ ;\nclass C { }";
+        let (unit, _diags) = parse_file(src, FileId(0));
+        let Item::Error(span) = &unit.items[0] else {
+            panic!("expected Error item, got {:?}", unit.items[0]);
+        };
+        // Covers from the start through the `;` recovery boundary.
+        assert_eq!(span.text(src), "@@@ $$$ ;");
     }
 
     #[test]
