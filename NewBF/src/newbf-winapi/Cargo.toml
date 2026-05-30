@@ -3,14 +3,24 @@ name = "newbf-winapi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NewBF: vendored Win32 API metadata for the FFI surface (from E:\\windows_api)."
+description = "NewBF: vendored Win32 ABI metadata for the FFI surface (from E:\\windows_api)."
 
-# At the winapi sprint (SPRINTS.md Sprint 27) this gains a build.rs that
-# reads a vendored data/windows_api.db snapshot and emits a postcard+zstd
-# blob, mirroring NewOpenDylan's nod-winapi:
-#   [dependencies]      postcard, serde, zstd
-#   [build-dependencies] rusqlite (bundled), postcard, serde, zstd
+# Mirrors NewOpenDylan's nod-winapi: a build.rs reads the shared
+# `E:\windows_api\windows_api.db` (Microsoft win32metadata ingested into
+# SQLite) and emits a language-agnostic postcard+zstd ABI blob; lib.rs decodes
+# it lazily and answers `find_function` / `import_lib_for_dll` lookups. The DB
+# path is `NEWBF_WINDOWS_API_DB`-overridable and defaults to the canonical
+# read-only location — the 28 MB DB is NOT vendored into the repo.
 [dependencies]
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde    = { version = "1", features = ["derive"] }
+zstd     = { version = "0.13", default-features = false }
+
+[build-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde    = { version = "1", features = ["derive"] }
+zstd     = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true
