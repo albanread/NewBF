@@ -195,6 +195,10 @@ version = "0.0.1"
 [[package]]
 name = "newbf-comptime"
 version = "0.0.1"
+dependencies = [
+ "newbf-ir",
+ "newbf-llvm",
+]
 
 [[package]]
 name = "newbf-corlib"

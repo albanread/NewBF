@@ -3,7 +3,13 @@ name = "newbf-comptime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NewBF: compile-time execution engine (Beef's CeMachine)."
+description = "NewBF: compile-time execution engine (JIT-based; cf. Beef's CeMachine interpreter)."
+
+[dependencies]
+# Comptime runs on the JIT: it lowers const/[Comptime] code through the same
+# IR→LLVM→ORC pipeline as application code and calls it during compilation.
+newbf-ir.workspace = true
+newbf-llvm.workspace = true
 
 [lints]
 workspace = true
