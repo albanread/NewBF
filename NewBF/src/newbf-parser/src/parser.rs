@@ -250,12 +250,29 @@ impl<'a> Parser<'a> {
     fn binary(&mut self, min_bp: u8) -> Expr {
         let lo = self.start();
         let mut lhs = self.unary();
-        while let Some(op) = self.peek_binop() {
+        loop {
+            // `not case` — Beef's negated case-test operator. `not` lexes as
+            // an identifier; treat the pair as a `case` operator (the
+            // negation is dropped for now). Same precedence as `case`.
+            let not_case =
+                self.at_ident_text("not") && self.nth_kind(1) == TokenKind::Keyword(Keyword::Case);
+            let Some(op) = (if not_case {
+                Some(BinOp::Case)
+            } else {
+                self.peek_binop()
+            }) else {
+                break;
+            };
             let bp = op.precedence();
             if bp < min_bp {
                 break;
             }
-            self.bump();
+            if not_case {
+                self.bump(); // not
+                self.bump(); // case
+            } else {
+                self.bump();
+            }
             // `is`/`as`/`case` take a type or pattern on the right; we
             // parse it as a unary expression (a type/pattern stand-in).
             let rhs = if matches!(op, BinOp::Is | BinOp::As | BinOp::Case) {
@@ -720,24 +737,27 @@ impl<'a> Parser<'a> {
     /// `[`). Nested brackets are tracked so a capture like `[obj[0]]`
     /// closes correctly.
     fn skip_capture_clause(&mut self) {
+        self.skip_balanced(TokenKind::LBracket, TokenKind::RBracket);
+    }
+
+    /// Consume a balanced `open … close` run (current token is `open`).
+    fn skip_balanced(&mut self, open: TokenKind, close: TokenKind) {
         let mut depth = 0u32;
         loop {
-            match self.kind() {
-                TokenKind::LBracket => {
-                    depth += 1;
-                    self.bump();
+            let k = self.kind();
+            if k == open {
+                depth += 1;
+                self.bump();
+            } else if k == close {
+                self.bump();
+                depth -= 1;
+                if depth == 0 {
+                    break;
                 }
-                TokenKind::RBracket => {
-                    self.bump();
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                TokenKind::Eof => break,
-                _ => {
-                    self.bump();
-                }
+            } else if k == TokenKind::Eof {
+                break;
+            } else {
+                self.bump();
             }
         }
     }
@@ -1342,6 +1362,11 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                // Optional `when <guard>` clause (consumed/dropped for now):
+                // `case .Circle(let x, let y) when x == 10:`.
+                if self.eat_kw(Keyword::When) {
+                    let _ = self.expr();
+                }
                 Some(first)
             } else if self.eat_kw(Keyword::Default) {
                 None
@@ -1470,6 +1495,31 @@ impl<'a> Parser<'a> {
             };
         }
         self.pos = checkpoint; // not a for-each; rewind
+
+        // Tuple-destructuring for-each: `for (var (a, b) in EXPR)`. The
+        // binding pattern's span stands in for `name` (no pattern field yet).
+        {
+            let save = self.save();
+            let _ = self.eat_kw(Keyword::Var) || self.eat_kw(Keyword::Let);
+            if self.at(TokenKind::LParen) {
+                let name_lo = self.cur().span.lo;
+                self.skip_balanced(TokenKind::LParen, TokenKind::RParen);
+                let name_hi = self.toks[self.pos - 1].span.hi;
+                if self.eat_kw(Keyword::In) {
+                    let name = Span::new(self.file, name_lo, name_hi);
+                    let iter = self.expr();
+                    self.expect(TokenKind::RParen, "`)` after for-each");
+                    let body = Box::new(self.stmt());
+                    return Stmt::ForEach {
+                        span: self.finish(lo),
+                        name,
+                        iter,
+                        body,
+                    };
+                }
+            }
+            self.restore(save);
+        }
 
         // Typed for-each: `(Type IDENT in EXPR)` — e.g. `for (int i in 0..<10)`.
         // (The binding type is dropped for now, like the count-loop below;

@@ -675,6 +675,24 @@ mod tests {
     // ── switch statement ────────────────────────────────────────────────
 
     #[test]
+    fn case_patterns_with_bindings_when_and_not_case() {
+        // `let`/`var` bindings + `when` guard parse clean (bindings and the
+        // guard are dropped for now, but must not error).
+        let s = ok_stmt("switch (x) { case .Ok(let a) when a > 0: f(); default: g(); }");
+        assert!(s.contains("(switch x"), "got {s}");
+        // `not case` is parsed as a case-test operator.
+        assert_eq!(ok("x not case .Foo"), "(case x .Foo)");
+    }
+
+    #[test]
+    fn tuple_destructuring_for_each() {
+        assert_eq!(
+            ok_stmt("for (var (a, b) in xs) {}"),
+            "(foreach (a, b) xs (block))"
+        );
+    }
+
+    #[test]
     fn switch_with_cases_and_default() {
         let s = ok_stmt("switch (x) { case 1: a(); case 2: b(); default: c(); }");
         assert!(s.contains("(switch x"), "got {s}");
