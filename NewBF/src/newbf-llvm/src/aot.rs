@@ -197,4 +197,47 @@ mod tests {
         let _ = std::fs::remove_file(&obj);
         let _ = std::fs::remove_file(&exe);
     }
+
+    /// AOT Win32: an exe that calls a real Win32 function (`GetCurrentProcessId`,
+    /// kernel32) through the linker-built IAT. We `declare` the extern and link
+    /// the demanded import lib — the import lib's `Foo: jmp [__imp_Foo]` thunk
+    /// resolves through the IAT, no `dllimport` needed. The program returns 7
+    /// iff the call yielded a (always-nonzero) pid, so exit code 7 proves the
+    /// Win32 call executed in the shipped binary.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn aot_calls_a_real_win32_function() {
+        use super::{emit_object, link_executable};
+        use newbf_ir::{CmpPred, Value};
+
+        // i32 main() { return GetCurrentProcessId() != 0 ? 7 : 0; }
+        let mut m = IrModule::new("aot_win32");
+        m.declare_extern("GetCurrentProcessId", vec![], IrType::U32);
+        let mut f = FunctionBuilder::new("main", vec![], IrType::I32);
+        let pid = f.call("GetCurrentProcessId", vec![], IrType::U32);
+        let nonzero = f.cmp(CmpPred::Ne, pid, Value::int(0, IrType::U32));
+        let code = f.select(
+            nonzero,
+            Value::int(7, IrType::I32),
+            Value::int(0, IrType::I32),
+            IrType::I32,
+        );
+        f.ret(Some(code));
+        m.add_function(f.finish());
+
+        let dir = std::env::temp_dir();
+        let pidn = std::process::id();
+        let obj = dir.join(format!("newbf_aotwin_{pidn}.obj"));
+        let exe = dir.join(format!("newbf_aotwin_{pidn}.exe"));
+
+        emit_object(&m, &obj).expect("emit object");
+        // `kernel32.lib` is what `import_lib_for_dll("kernel32.dll")` yields —
+        // in the full pipeline the driver derives this from the demanded set.
+        link_executable(&[&obj], &exe, &["kernel32.lib"]).expect("link exe");
+        let status = std::process::Command::new(&exe).status().expect("run exe");
+        assert_eq!(status.code(), Some(7), "AOT Win32 call result");
+
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&exe);
+    }
 }
