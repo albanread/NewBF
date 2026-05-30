@@ -720,6 +720,10 @@ pub enum Member {
         params: Vec<Param>,
         constraints: Vec<WhereClause>,
         body: MethodBody,
+        /// `Some` for an explicit interface implementation
+        /// (`Ret IFace<Args>.Name(…)`): the qualifying interface type. The
+        /// `name` is the final segment; this is the part before it.
+        explicit_iface: Option<Type>,
     },
     /// `this(params) { body }` (constructor).
     Constructor {
@@ -744,6 +748,9 @@ pub enum Member {
         ty: Type,
         name: Span,
         accessors: Vec<Accessor>,
+        /// `Some` for an explicit interface implementation
+        /// (`Ret IFace<Args>.Name { … }`): the qualifying interface type.
+        explicit_iface: Option<Type>,
     },
     /// An enum payload-bearing case: `case Foo(int x) [= value];`.
     EnumCase {

@@ -136,9 +136,10 @@ fn fmt_member(it: &Interner, m: &MemberDef) -> String {
                 None => String::new(),
             };
             format!(
-                "{} {}{}({}){} body={}",
+                "{} {}{}{}({}){} body={}",
                 m.method_kind.as_str(),
                 fmt_mods(&m.modifiers),
+                fmt_iface(it, &m.explicit_iface),
                 it.resolve(m.name),
                 fmt_params(it, &m.params),
                 ret,
@@ -148,7 +149,8 @@ fn fmt_member(it: &Interner, m: &MemberDef) -> String {
         MemberDef::Property(p) => {
             let accs: Vec<&str> = p.accessors.iter().map(|a| a.kind.as_str()).collect();
             format!(
-                "property {} : {}{} {{ {} }}",
+                "property {}{} : {}{} {{ {} }}",
+                fmt_iface(it, &p.explicit_iface),
                 it.resolve(p.name),
                 fmt_mods(&p.modifiers),
                 fmt_typeref(it, &p.ty),
@@ -164,6 +166,15 @@ fn fmt_member(it: &Interner, m: &MemberDef) -> String {
             let val = if c.has_value { " = …" } else { "" };
             format!("case {}{}{}", it.resolve(c.name), payload, val)
         }
+    }
+}
+
+/// Render the explicit-interface qualifier prefix (`IFace.`) for a member
+/// that explicitly implements an interface, or empty otherwise.
+fn fmt_iface(it: &Interner, iface: &Option<TypeRef>) -> String {
+    match iface {
+        Some(t) => format!("{}.", fmt_typeref(it, t)),
+        None => String::new(),
     }
 }
 

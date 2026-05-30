@@ -137,8 +137,12 @@ impl Builder {
             let dup_checked = match m {
                 MemberDef::Field(_) | MemberDef::EnumCase(_) => true,
                 // Indexer properties spell their name `this` and overload by
-                // parameter signature, just like methods — exempt them.
-                MemberDef::Property(p) => self.interner.resolve(p.name) != "this",
+                // parameter signature, just like methods — exempt them. An
+                // explicit interface implementation (`int IFoo.Bar => …`)
+                // also doesn't collide with a same-named regular member.
+                MemberDef::Property(p) => {
+                    self.interner.resolve(p.name) != "this" && p.explicit_iface.is_none()
+                }
                 MemberDef::Method(_) => false,
             };
             if !dup_checked {

@@ -252,12 +252,14 @@ impl Builder {
                     params,
                     constraints,
                     body,
+                    explicit_iface,
                 } => {
                     let ret = self.lower_type(return_ty, f);
                     let attrs = self.lower_attrs(attributes, f);
                     let gps = self.lower_generic_params(generic_params, f);
                     let params = self.lower_params(params, f);
                     let constraints = self.lower_where(constraints, f);
+                    let iface = explicit_iface.as_ref().map(|t| self.lower_type(t, f));
                     let name_sym = self.interner.intern(name.text(f.src));
                     member_ids.push(self.push_member(MemberDef::Method(MethodDef {
                         owner: tid,
@@ -270,6 +272,7 @@ impl Builder {
                         params,
                         constraints,
                         body: body_kind(body),
+                        explicit_iface: iface,
                         span: *span,
                     })));
                 }
@@ -294,6 +297,7 @@ impl Builder {
                         params,
                         constraints: Vec::new(),
                         body: body_kind(body),
+                        explicit_iface: None,
                         span: *span,
                     })));
                 }
@@ -316,6 +320,7 @@ impl Builder {
                         params: Vec::new(),
                         constraints: Vec::new(),
                         body: body_kind(body),
+                        explicit_iface: None,
                         span: *span,
                     })));
                 }
@@ -326,9 +331,11 @@ impl Builder {
                     ty,
                     name,
                     accessors,
+                    explicit_iface,
                 } => {
                     let ty = self.lower_type(ty, f);
                     let attrs = self.lower_attrs(attributes, f);
+                    let iface = explicit_iface.as_ref().map(|t| self.lower_type(t, f));
                     let name_sym = self.interner.intern(name.text(f.src));
                     let accessors = accessors
                         .iter()
@@ -345,6 +352,7 @@ impl Builder {
                         modifiers: strip_mods(modifiers),
                         attributes: attrs,
                         accessors,
+                        explicit_iface: iface,
                         span: *span,
                     })));
                 }

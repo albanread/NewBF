@@ -2239,6 +2239,38 @@ impl<'a> Parser<'a> {
         out
     }
 
+    /// Read-only lookahead: does the upcoming sequence look like the
+    /// `IFace<Args>.Member` head of an explicit interface implementation —
+    /// an identifier, an optional balanced `<…>`, then `.Ident`? The
+    /// `.this` explicit-indexer form (ending in a keyword) is excluded; it's
+    /// handled by the `.Ident`/`.this` walk in `member`.
+    fn looks_like_explicit_iface(&self) -> bool {
+        let mut i = self.pos;
+        if self.toks.get(i).map(|t| t.kind) != Some(TokenKind::Ident) {
+            return false;
+        }
+        i += 1;
+        if self.toks.get(i).map(|t| t.kind) == Some(TokenKind::Lt) {
+            let mut depth: i32 = 0;
+            loop {
+                match self.toks.get(i).map(|t| t.kind) {
+                    Some(TokenKind::Lt) => depth += 1,
+                    Some(TokenKind::Shl) => depth += 2,
+                    Some(TokenKind::Gt) => depth -= 1,
+                    Some(TokenKind::Shr) => depth -= 2,
+                    Some(TokenKind::Eof) | None => return false,
+                    _ => {}
+                }
+                i += 1;
+                if depth <= 0 {
+                    break;
+                }
+            }
+        }
+        self.toks.get(i).map(|t| t.kind) == Some(TokenKind::Dot)
+            && self.toks.get(i + 1).map(|t| t.kind) == Some(TokenKind::Ident)
+    }
+
     fn member(&mut self, kind: TypeKind) -> Member {
         let lo = self.start();
         let attributes = self.attributes();
@@ -2336,6 +2368,7 @@ impl<'a> Parser<'a> {
                 params,
                 constraints: Vec::new(),
                 body,
+                explicit_iface: None,
             };
         }
 
@@ -2401,6 +2434,7 @@ impl<'a> Parser<'a> {
                 params,
                 constraints: Vec::new(),
                 body,
+                explicit_iface: None,
             };
         }
 
@@ -2449,8 +2483,15 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 accessors,
+                explicit_iface: None,
             };
         }
+        // The qualifying interface of an explicit interface implementation,
+        // if any (`Ret IFace<Args>.Member …`). Captured so the member name
+        // doesn't false-collide with a same-named regular member and so sema
+        // can resolve the impl.
+        let mut explicit_iface: Option<Type> = None;
+
         let name = if self.at_kw(Keyword::Operator) {
             let op_lo = self.start();
             self.bump(); // operator
@@ -2460,6 +2501,23 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
             self.finish(op_lo)
+        } else if self.looks_like_explicit_iface() {
+            // Parse the whole `IFace<Args>.Member` as a type path, then peel
+            // the final segment off as the member name. (The `.this`
+            // explicit-indexer form ends in a keyword, so it isn't matched
+            // here and falls to the `.Ident`/`.this` walk below.)
+            let path = self.ty();
+            match split_qualified_name(path) {
+                Some((iface, member)) => {
+                    explicit_iface = Some(iface);
+                    member
+                }
+                None => {
+                    self.error("malformed explicit interface member");
+                    self.skip_to_member_boundary();
+                    return Member::Error(self.finish(lo));
+                }
+            }
         } else if self.at(TokenKind::Ident) {
             self.bump().span
         } else {
@@ -2475,10 +2533,9 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
 
-        // Explicit interface implementation: `IFoo<T>.Bar(…)`. Walk
-        // qualifying `.Ident` segments; the *last* one is the member
-        // name (the qualifier is dropped — interface-impl info is
-        // recovered later in sema).
+        // Fallback explicit-interface walk for forms not captured as a type
+        // path above — chiefly the `.this` explicit indexer
+        // (`Ret IFoo.this[…]`). The final segment becomes the member name.
         let mut name = name;
         while self.at(TokenKind::Dot)
             && matches!(
@@ -2531,6 +2588,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 accessors,
+                explicit_iface: None,
             };
         }
 
@@ -2549,6 +2607,7 @@ impl<'a> Parser<'a> {
                     params,
                     constraints,
                     body,
+                    explicit_iface,
                 }
             }
             TokenKind::LBrace => {
@@ -2569,6 +2628,7 @@ impl<'a> Parser<'a> {
                     ty,
                     name,
                     accessors,
+                    explicit_iface,
                 }
             }
             // Expression-bodied property: `Type Name => expr;`
@@ -2590,6 +2650,7 @@ impl<'a> Parser<'a> {
                         kind: AccessorKind::Get,
                         body: MethodBody::Expr(e),
                     }],
+                    explicit_iface,
                 }
             }
             _ => {
@@ -2892,6 +2953,23 @@ pub fn parse_type(src: &str, file: FileId) -> (Type, Vec<Diagnostic>) {
 
 /// Parse a whole .bf compilation unit from `src` (the parser phase
 /// report behind `newbf-driver dump-ast`).
+/// Split a parsed `IFace<Args>.Member` type path into the qualifying
+/// interface type and the final member-name span. Returns `None` for a
+/// single-segment path (shouldn't occur given the explicit-iface lookahead).
+/// The qualifier keeps the full path span — it over-covers the member name
+/// slightly, which is fine for diagnostics at this phase.
+fn split_qualified_name(path: Type) -> Option<(Type, Span)> {
+    if let Type::Path { span, mut segments } = path {
+        if segments.len() < 2 {
+            return None;
+        }
+        let last = segments.pop().unwrap();
+        Some((Type::Path { span, segments }, last.name))
+    } else {
+        None
+    }
+}
+
 pub fn parse_file(src: &str, file: FileId) -> (CompUnit, Vec<Diagnostic>) {
     let mut p = Parser::new(src, file);
     let unit = p.comp_unit();

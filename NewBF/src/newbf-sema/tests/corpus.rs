@@ -100,14 +100,13 @@ fn sema_does_not_panic_on_real_beef() {
     assert!(total_types > 0, "no types captured across the corpus");
     assert!(total_members > 0, "no members captured across the corpus");
     // Clean-build ratchet. Sema diagnostics are in-program contradictions
-    // (duplicate defs). With `#if`/`#else` now evaluated (dead branches
-    // pruned before parsing), the clean rate is ~91%. The remaining noisy
-    // files are *not* sema bugs: they use explicit interface implementations
-    // (`int IFoo<T>.Member => …`), and the parser currently records only the
-    // last name segment, so an explicit impl false-collides with a plain
-    // member of the same name. The floor locks in the current gain; it
-    // should rise once the parser captures explicit-interface qualifiers.
-    let floor = files.len() * 88 / 100;
+    // (duplicate defs). With `#if`/`#else` evaluated and explicit interface
+    // implementations captured (so they no longer false-collide), sema is
+    // clean on ~99% of the corpus — effectively every file that *parses*
+    // cleanly. The remaining handful are artifacts of files that still have
+    // parse diagnostics (partial/garbled trees produce spurious dups); they
+    // clear as the parser marches toward 100%. The floor locks in the gain.
+    let floor = files.len() * 95 / 100;
     assert!(
         clean >= floor,
         "sema clean-build coverage regressed: {clean} / {} (floor {floor})",

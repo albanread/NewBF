@@ -822,6 +822,51 @@ class Foo {
     }
 
     #[test]
+    fn explicit_interface_implementation_captures_qualifier() {
+        // `static int IMinMaxValue<int>.MinValue => MinValue;` is an explicit
+        // interface impl: the member name is `MinValue`, and the qualifying
+        // interface `IMinMaxValue<int>` is captured (not dropped) so it
+        // doesn't collide with a plain `MinValue` member.
+        let src = "struct Int { const int MinValue = 0; static int IMinMaxValue<int>.MinValue => MinValue; }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        let Member::Property {
+            name,
+            explicit_iface: Some(iface),
+            ..
+        } = &td.members[1]
+        else {
+            panic!(
+                "expected explicit-interface property, got {:?}",
+                td.members[1]
+            );
+        };
+        assert_eq!(name.text(src), "MinValue");
+        assert_eq!(sxt(src, iface), "IMinMaxValue<int>");
+    }
+
+    #[test]
+    fn explicit_interface_method() {
+        let src = "class C { void IDisposable.Dispose() { } }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        let Member::Method {
+            name,
+            explicit_iface: Some(iface),
+            ..
+        } = &td.members[0]
+        else {
+            panic!("expected explicit-interface method");
+        };
+        assert_eq!(name.text(src), "Dispose");
+        assert_eq!(sxt(src, iface), "IDisposable");
+    }
+
+    #[test]
     fn generic_type_with_where_constraint() {
         let src = "class List<T> where T : class { }";
         let unit = ok_file(src);

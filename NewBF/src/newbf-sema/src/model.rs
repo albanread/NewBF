@@ -221,6 +221,10 @@ pub struct MethodDef {
     pub params: Vec<ParamDef>,
     pub constraints: Vec<WhereRef>,
     pub body: BodyKind,
+    /// `Some` for an explicit interface implementation — the qualifying
+    /// interface. Such a member doesn't collide with a same-named regular
+    /// member.
+    pub explicit_iface: Option<TypeRef>,
     pub span: Span,
 }
 
@@ -231,6 +235,8 @@ pub struct PropertyDef {
     pub modifiers: Vec<Modifier>,
     pub attributes: Vec<AttrRef>,
     pub accessors: Vec<AccessorDef>,
+    /// `Some` for an explicit interface implementation (see [`MethodDef`]).
+    pub explicit_iface: Option<TypeRef>,
     pub span: Span,
 }
 

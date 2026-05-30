@@ -275,6 +275,27 @@ namespace Demo { class X { } }
     }
 
     #[test]
+    fn explicit_interface_member_is_not_a_duplicate() {
+        // A `const MinValue` field and a `IFoo<int>.MinValue` explicit-impl
+        // property share a name but must NOT be flagged as duplicate members.
+        let src = "struct Int { const int MinValue = 0; static int IMinMaxValue<int>.MinValue => MinValue; }";
+        let p = analyze_src(src);
+        assert!(
+            !p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate member")),
+            "explicit-interface impl must not collide: {:?}",
+            p.diagnostics
+        );
+        // And the qualifier is recorded on the property.
+        let int = type_named(&p, "Int");
+        let has_iface = int.members.iter().any(|&m| {
+            matches!(p.graph.member(m), MemberDef::Property(prop) if prop.explicit_iface.is_some())
+        });
+        assert!(has_iface, "explicit interface qualifier should be recorded");
+    }
+
+    #[test]
     fn enum_cases_and_delegates_and_aliases_are_captured() {
         let src = "
 enum Color { case Red, case Green = 2, case Custom(int r, int g, int b) }

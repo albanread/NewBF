@@ -233,6 +233,22 @@ Program` → `Method [public static] Main` tree.
       (`int IFoo<T>.Member => …`) the parser doesn't yet qualify — a
       parser-fidelity follow-up.
 
+### Delivered (Sprint 05c — explicit interface implementations)
+- [x] The parser now **captures the qualifying interface** of an explicit
+      interface implementation (`Ret IFace<Args>.Member …`) as
+      `Member::Method/Property::explicit_iface: Option<Type>`, instead of
+      dropping it and keeping only the last name segment. Detected by a
+      read-only `IFace<…>.Member` lookahead, parsed as a type path, then
+      split into qualifier + member name. Sema records it on
+      `MethodDef`/`PropertyDef` and exempts such members from the
+      duplicate-name check (they don't collide with a same-named regular
+      member). +2 parser tests, +1 sema test.
+- [x] Effect: sema clean-build ~91% → **~99% (151/152)** — sema is now
+      clean on every file that *parses* cleanly; the single remaining file
+      (`Lambdas.bf`) still has parse diagnostics, and its spurious duplicate
+      is a parse-recovery artifact that clears as the parser reaches 100%.
+      Floor raised to ≥95%.
+
 ### Sibling-project leverage
 - Reference `BfDefBuilder.cpp` / `BfSystem.cpp`.
 
