@@ -66,7 +66,8 @@ struct Save {
 
 impl<'a> Parser<'a> {
     fn new(src: &'a str, file: FileId) -> Self {
-        let toks: Vec<Token> = lex(src, file)
+        let lexed = lex(src, file);
+        let toks: Vec<Token> = crate::preprocess::preprocess(src, lexed)
             .into_iter()
             .filter(|t| !t.kind.is_trivia())
             .collect();

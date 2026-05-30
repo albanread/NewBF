@@ -12,6 +12,7 @@
 
 mod ast;
 mod parser;
+mod preprocess;
 mod print;
 
 pub use ast::{

@@ -215,10 +215,23 @@ Program` → `Method [public static] Main` tree.
       file or a directory analyzed as one merged program).
 - [x] Corpus def-build gate: parse+analyze every `.bf` in `corlib-slice`
       (89) and `feature-suite/src` (70). Hard gate: **no panics on 152 real
-      Beef files**; captures ~948 types / ~6066 members. Clean-build
-      ratchet ≥80% (currently ~84%); the remaining noisy files redefine
-      symbols across `#if`/`#else` branches (conditional compilation isn't
-      evaluated yet) — not sema bugs. +11 sema unit tests.
+      Beef files**; captures ~848 types / ~4826 members. Clean-build
+      ratchet ≥88% (currently ~91%). +11 sema unit tests.
+
+### Delivered (Sprint 05b — conditional compilation in the parser)
+- [x] **`#if`/`#elif`/`#else`/`#endif` evaluation** as a token-stream pass
+      in `newbf-parser` (`preprocess`), run between lexing and parsing: it
+      tracks directive nesting, evaluates conditions (identifiers true iff
+      defined, `true`/`false`, `!`, `&&`, `||`, parens), honors active-region
+      `#define`/`#undef`, and **drops the tokens in inactive branches** so
+      dead arms never reach the parser. Default symbol set is empty — the
+      aim is deterministic single-branch selection (a build-config-driven
+      define set is future work). This removed the duplicate-definition
+      noise sema saw from un-pruned `#if`/`#else` arms (sema clean-build
+      ~84% → ~91%; parser clean ~74% → ~76%). +6 preprocessor unit tests.
+      Remaining sema duplicates are explicit interface implementations
+      (`int IFoo<T>.Member => …`) the parser doesn't yet qualify — a
+      parser-fidelity follow-up.
 
 ### Sibling-project leverage
 - Reference `BfDefBuilder.cpp` / `BfSystem.cpp`.
