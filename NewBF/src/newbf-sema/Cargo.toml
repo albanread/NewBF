@@ -8,6 +8,7 @@ description = "NewBF: semantic analysis — resolution, generics, dispatch, owne
 [dependencies]
 newbf-lexer.workspace = true
 newbf-parser.workspace = true
+newbf-ir.workspace = true
 
 [lints]
 workspace = true

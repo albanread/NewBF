@@ -127,9 +127,10 @@ mod tests {
         let mut module = Module::new("t");
         module.add_function(f.finish());
         let r = format_ir(&module);
+        // Blocks get a unique index suffix (then→then1, else→else2, join→join3).
         assert!(r.contains("icmp sgt %0, %1"), "{r}");
-        assert!(r.contains("condbr %2, then, else"), "{r}");
-        assert!(r.contains("phi i64 [ %0, then ], [ %1, else ]"), "{r}");
+        assert!(r.contains("condbr %2, then1, else2"), "{r}");
+        assert!(r.contains("phi i64 [ %0, then1 ], [ %1, else2 ]"), "{r}");
     }
 
     #[test]

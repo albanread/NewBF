@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use newbf_lexer::FileId;
 use newbf_parser::parse_file;
-use newbf_sema::{SourceFile, analyze};
+use newbf_sema::{SourceFile, analyze, lower_program};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../beef-tests")
@@ -108,4 +108,34 @@ fn sema_does_not_panic_on_real_beef() {
         "sema clean-build coverage regressed below 100%: {clean} / {}",
         files.len()
     );
+}
+
+/// IR lowering (the primitive kernel) must terminate on every real Beef
+/// file without panicking — richer constructs are skipped, not crashed on.
+/// Reports how many IR functions were produced across the corpus.
+#[test]
+fn lowering_does_not_panic_on_real_beef() {
+    let mut files = Vec::new();
+    collect_bf(&root().join("corlib-slice"), &mut files);
+    collect_bf(&root().join("feature-suite/src"), &mut files);
+    assert!(!files.is_empty(), "no .bf fixtures found");
+
+    let mut total_funcs = 0usize;
+    for path in &files {
+        let src = std::fs::read_to_string(path).unwrap();
+        let (unit, _pdiags) = parse_file(&src, FileId(0));
+        let srcs = [SourceFile {
+            file: FileId(0),
+            src: &src,
+            unit: &unit,
+        }];
+        let program = analyze(&srcs);
+        let module = lower_program(&srcs, &program);
+        total_funcs += module.funcs.len();
+    }
+    eprintln!(
+        "ir lowering: {total_funcs} functions lowered across {} files",
+        files.len()
+    );
+    assert!(total_funcs > 0, "lowering produced no functions");
 }

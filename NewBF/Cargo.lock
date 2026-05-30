@@ -127,6 +127,7 @@ name = "newbf-driver"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "newbf-ir",
  "newbf-lexer",
  "newbf-parser",
  "newbf-sema",
@@ -170,6 +171,7 @@ version = "0.0.1"
 name = "newbf-sema"
 version = "0.0.1"
 dependencies = [
+ "newbf-ir",
  "newbf-lexer",
  "newbf-parser",
 ]

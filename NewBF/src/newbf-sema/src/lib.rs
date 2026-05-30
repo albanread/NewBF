@@ -19,12 +19,14 @@
 
 mod build;
 mod intern;
+mod lower;
 mod model;
 mod report;
 mod resolve;
 
 pub use build::SourceFile;
 pub use intern::{Interner, Symbol};
+pub use lower::lower_program;
 pub use model::{
     AccessorDef, AttrRef, BodyKind, DefGraph, DelegateSig, EnumCaseDef, FieldDef, MemberDef,
     MemberId, MethodDef, MethodKind, NamespaceDef, NsId, ParamDef, PropertyDef, TypeDef, TypeId,
@@ -325,5 +327,68 @@ typealias Id = int;
         assert!(r.starts_with("defs:"));
         assert!(r.contains("N.A"));
         assert!(r.contains("field x"));
+    }
+
+    // ── IR lowering (primitive kernel) ──────────────────────────────────
+
+    /// Parse + analyze + lower `src`, returning the `dump-ir` report.
+    fn lower_src(src: &str) -> String {
+        let (unit, pdiags) = parse_file(src, FileId(0));
+        assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+        let files = vec![SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let program = analyze(&files);
+        let module = lower_program(&files, &program);
+        newbf_ir::format_ir(&module)
+    }
+
+    #[test]
+    fn lowers_integer_arithmetic_method() {
+        let ir = lower_src("class C { public static int add(int a, int b) { return a + b; } }");
+        assert!(ir.contains("func @C.add(i64 %0, i64 %1) -> i64"), "{ir}");
+        assert!(ir.contains("= add i64"), "{ir}");
+        assert!(ir.contains("ret %"), "{ir}");
+    }
+
+    #[test]
+    fn lowers_float_expression_body() {
+        let ir = lower_src("class C { public static double dbl(double x) => x * 2.0; }");
+        assert!(ir.contains("func @C.dbl(f64 %0) -> f64"), "{ir}");
+        assert!(ir.contains("fmul f64"), "{ir}");
+    }
+
+    #[test]
+    fn lowers_locals_and_while_loop() {
+        let ir = lower_src(
+            "class C { public static int sum(int n) { \
+                int s = 0; while (n > 0) { s = s + n; n = n - 1; } return s; } }",
+        );
+        assert!(ir.contains("alloca i64"), "{ir}");
+        assert!(ir.contains("while.head"), "{ir}");
+        assert!(ir.contains("icmp sgt"), "{ir}");
+        assert!(ir.contains("condbr"), "{ir}");
+    }
+
+    #[test]
+    fn lowers_if_else_diamond() {
+        let ir = lower_src(
+            "class C { public static int m(int a, int b) { \
+                if (a > b) { return a; } else { return b; } } }",
+        );
+        assert!(ir.contains("if.then"), "{ir}");
+        assert!(ir.contains("if.else"), "{ir}");
+        assert!(ir.contains("condbr"), "{ir}");
+    }
+
+    #[test]
+    fn unsupported_body_lowers_to_terminated_stub_without_panic() {
+        // `new`/member access aren't in the kernel; lowering must still
+        // produce a well-formed, terminated function (no panic, no dangling).
+        let ir = lower_src("class C { public static void h() { var x = new Foo(); x.Bar(); } }");
+        assert!(ir.contains("func @C.h() -> void"), "{ir}");
+        assert!(ir.contains("ret void"), "{ir}");
     }
 }

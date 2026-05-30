@@ -83,8 +83,11 @@ impl FunctionBuilder {
 
     pub fn create_block(&mut self, label: impl Into<String>) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
+        // Suffix with the block index so labels are unique within the
+        // function (the lowerer reuses base names like `if.then`).
+        let label = format!("{}{}", label.into(), id.0);
         self.blocks.push(Block {
-            label: label.into(),
+            label,
             insts: Vec::new(),
             term: Terminator::Unreachable,
         });
