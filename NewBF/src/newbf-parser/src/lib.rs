@@ -387,6 +387,20 @@ mod tests {
     }
 
     #[test]
+    fn arrow_member_named_tuple_decl_condition() {
+        // `->` pointer-member access (modeled like `.`).
+        assert_eq!(ok("p->Length"), "(. p Length)");
+        // Named tuple literal.
+        assert_eq!(ok("(x: 3, y: 4)"), "(tuple (named x 3) (named y 4))");
+        // Declaration-condition `if (Type name = expr)` — prefix consumed,
+        // value becomes the condition.
+        assert_eq!(
+            ok_stmt("if (int i = f()) g();"),
+            "(if (call f) (expr (call g)))"
+        );
+    }
+
+    #[test]
     fn object_initializers() {
         // Initializer is consumed and dropped for now, so the expr is just
         // the constructed value — but it must parse without diagnostics.

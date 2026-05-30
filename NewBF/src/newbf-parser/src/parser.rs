@@ -393,7 +393,9 @@ impl<'a> Parser<'a> {
         let lo = e.span().lo;
         loop {
             match self.kind() {
-                TokenKind::Dot => {
+                // `.` member access, and `->` pointer-member access
+                // (`rcStr->Length`) — treated identically here.
+                TokenKind::Dot | TokenKind::Arrow => {
                     self.bump();
                     // Beef friend-access list `.[Friend]Name` — consume
                     // and discard the bracketed attribute set for now.
@@ -876,7 +878,8 @@ impl<'a> Parser<'a> {
                 elems: Vec::new(),
             };
         }
-        let inner = self.expr();
+        // Use `arg` so tuple elements can be named (`(x: 3, y: 4)`).
+        let inner = self.arg();
         // Tuple literal `(a, b, …)` or lambda params `(a, b) => …`.
         if self.at(TokenKind::Comma) {
             let mut elems = vec![inner];
@@ -885,7 +888,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 let before = self.pos;
-                elems.push(self.expr());
+                elems.push(self.arg());
                 if self.pos == before {
                     break;
                 }
@@ -1508,11 +1511,33 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A condition that may be a declaration: `if (Type name = expr)`,
+    /// `while (Type name = expr)` (Beef binds `name` for the body). The
+    /// `Type name =` prefix is consumed and the value becomes the condition
+    /// (the binding is dropped for now). `var x = …` already parses via the
+    /// `var`/`let` binding primary, so this targets the typed form.
+    fn cond_expr(&mut self) -> Expr {
+        let save = self.save();
+        if self.at(TokenKind::Ident) {
+            let _ty = self.ty();
+            if self.diagnostics.len() == save.diag_len
+                && self.at(TokenKind::Ident)
+                && self.nth_kind(1) == TokenKind::Assign
+            {
+                self.bump(); // name
+                self.bump(); // =
+                return self.expr();
+            }
+            self.restore(save);
+        }
+        self.expr()
+    }
+
     fn if_stmt(&mut self) -> Stmt {
         let lo = self.start();
         self.bump(); // if
         self.expect(TokenKind::LParen, "`(` after `if`");
-        let cond = self.expr();
+        let cond = self.cond_expr();
         self.expect(TokenKind::RParen, "`)` after if-condition");
         let then = Box::new(self.stmt());
         let els = if self.eat_kw(Keyword::Else) {
@@ -1532,7 +1557,7 @@ impl<'a> Parser<'a> {
         let lo = self.start();
         self.bump(); // while
         self.expect(TokenKind::LParen, "`(` after `while`");
-        let cond = self.expr();
+        let cond = self.cond_expr();
         self.expect(TokenKind::RParen, "`)` after while-condition");
         let body = Box::new(self.stmt());
         Stmt::While {
