@@ -248,9 +248,9 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
-            // `is`/`as` take a type on the right; we parse it as a unary
-            // expression (a type stand-in) until the type grammar lands.
-            let rhs = if matches!(op, BinOp::Is | BinOp::As) {
+            // `is`/`as`/`case` take a type or pattern on the right; we
+            // parse it as a unary expression (a type/pattern stand-in).
+            let rhs = if matches!(op, BinOp::Is | BinOp::As | BinOp::Case) {
                 self.unary()
             } else {
                 self.binary(bp + 1) // left-associative
@@ -310,6 +310,14 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 TokenKind::Dot => {
                     self.bump();
+                    // Beef friend-access list `.[Friend]Name` — consume
+                    // and discard the bracketed attribute set for now.
+                    if self.eat(TokenKind::LBracket) {
+                        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+                            self.bump();
+                        }
+                        self.eat(TokenKind::RBracket);
+                    }
                     let name = self.expect_ident_span("member name");
                     e = Expr::Member {
                         span: self.finish(lo),
@@ -353,6 +361,19 @@ impl<'a> Parser<'a> {
                     e = Expr::PostInc {
                         span: self.finish(lo),
                         operand: Box::new(e),
+                    };
+                }
+                // `name!(args)` — Beef mixin/macro invocation. Modeled as
+                // a Call for now (the `!` is lost at this phase).
+                TokenKind::Bang if matches!(self.nth_kind(1), TokenKind::LParen) => {
+                    self.bump(); // !
+                    self.bump(); // (
+                    let args = self.arg_list(TokenKind::RParen);
+                    self.expect(TokenKind::RParen, "`)` to close mixin call");
+                    e = Expr::Call {
+                        span: self.finish(lo),
+                        callee: Box::new(e),
+                        args,
                     };
                 }
                 TokenKind::MinusMinus => {
@@ -466,14 +487,30 @@ impl<'a> Parser<'a> {
                 Expr::Ident(span)
             }
             TokenKind::Keyword(k) => self.primary_keyword(k, span),
-            TokenKind::LParen => {
-                let lo = span.lo;
+            TokenKind::LParen => self.paren_or_cast(),
+            // `?` — Beef "uninitialized" placeholder (e.g. `int x = ?;`).
+            TokenKind::Question => {
                 self.bump();
-                let inner = self.expr();
-                self.expect(TokenKind::RParen, "`)` to close parenthesized expression");
-                Expr::Paren {
-                    span: self.finish(lo),
-                    inner: Box::new(inner),
+                Expr::Ident(span)
+            }
+            // Leading-`.` shorthand: `.Variant` (enum case), `.(args)`
+            // (inferred-type ctor), `.[i]` (inferred-type indexer). The
+            // postfix loop handles the call/index after we emit the
+            // leading-dot primary.
+            TokenKind::Dot => {
+                let lo = span.lo;
+                self.bump(); // .
+                if self.at(TokenKind::Ident) {
+                    let name = self.bump().span;
+                    Expr::DotIdent {
+                        span: self.finish(lo),
+                        name,
+                    }
+                } else {
+                    Expr::DotIdent {
+                        span: self.finish(lo),
+                        name: span,
+                    }
                 }
             }
             _ => {
@@ -483,6 +520,62 @@ impl<'a> Parser<'a> {
                 Expr::Error(span)
             }
         }
+    }
+
+    /// `(Type)expr` C-style cast vs. `(expr)` parenthesised. We
+    /// speculatively try to parse a type followed by `)` and a
+    /// unary-startable token; if that fails we backtrack to a paren.
+    fn paren_or_cast(&mut self) -> Expr {
+        let save = self.save();
+        let lo = self.start();
+        self.bump(); // (
+        let ty = self.ty();
+        let could_be_cast = self.diagnostics.len() == save.diag_len && self.at(TokenKind::RParen);
+        if could_be_cast {
+            self.bump(); // )
+            if Self::can_start_unary(self.kind()) {
+                let operand = self.unary();
+                return Expr::Cast {
+                    span: self.finish(lo),
+                    ty,
+                    operand: Box::new(operand),
+                };
+            }
+        }
+        self.restore(save);
+        self.bump(); // (
+        let inner = self.expr();
+        self.expect(TokenKind::RParen, "`)` to close parenthesized expression");
+        Expr::Paren {
+            span: self.finish(lo),
+            inner: Box::new(inner),
+        }
+    }
+
+    /// Token kinds that can start a unary expression — used to commit to
+    /// a C-style cast.
+    fn can_start_unary(k: TokenKind) -> bool {
+        matches!(
+            k,
+            TokenKind::Int
+                | TokenKind::Float
+                | TokenKind::Char
+                | TokenKind::Str
+                | TokenKind::VerbatimStr
+                | TokenKind::InterpStr
+                | TokenKind::Ident
+                | TokenKind::LParen
+                | TokenKind::Minus
+                | TokenKind::Plus
+                | TokenKind::Bang
+                | TokenKind::Tilde
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus
+                | TokenKind::Star
+                | TokenKind::Amp
+                | TokenKind::Dot
+                | TokenKind::Keyword(_)
+        )
     }
 
     fn primary_keyword(&mut self, k: Keyword, span: Span) -> Expr {
@@ -505,13 +598,17 @@ impl<'a> Parser<'a> {
             }
             // Builtin "function-like" keywords are treated as primaries so
             // `sizeof(T)` / `typeof(T)` / `default(T)` parse as calls.
+            // `var`/`let` here covers pattern bindings inside `case`
+            // patterns (e.g. `case .Ok(var val):`).
             Keyword::SizeOf
             | Keyword::AlignOf
             | Keyword::StrideOf
             | Keyword::TypeOf
             | Keyword::NameOf
             | Keyword::Comptype
-            | Keyword::Default => {
+            | Keyword::Default
+            | Keyword::Var
+            | Keyword::Let => {
                 self.bump();
                 Expr::Ident(span)
             }
@@ -597,6 +694,7 @@ impl<'a> Parser<'a> {
             TokenKind::QuestionQuestion => BinOp::NullCoalesce,
             TokenKind::Keyword(Keyword::Is) => BinOp::Is,
             TokenKind::Keyword(Keyword::As) => BinOp::As,
+            TokenKind::Keyword(Keyword::Case) => BinOp::Case,
             _ => return None,
         })
     }
@@ -642,7 +740,9 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Var) | TokenKind::Keyword(Keyword::Let) => self.local(true),
             TokenKind::Keyword(Keyword::Switch) => self.switch_stmt(),
             _ => {
-                if let Some(s) = self.try_typed_local() {
+                if let Some(s) = self.try_local_function() {
+                    s
+                } else if let Some(s) = self.try_typed_local() {
                     s
                 } else {
                     self.expr_stmt()
@@ -651,9 +751,86 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Speculatively parse a local function declaration nested in a
+    /// method body: `Type Name [<G…>] (params) { body }` (or `=> expr;` /
+    /// `;`).
+    fn try_local_function(&mut self) -> Option<Stmt> {
+        if !matches!(
+            self.kind(),
+            TokenKind::Ident | TokenKind::LParen | TokenKind::Keyword(Keyword::Var)
+        ) {
+            return None;
+        }
+        let lo = self.start();
+        let save = self.save();
+        let return_ty = self.ty();
+        if self.diagnostics.len() > save.diag_len || !self.at(TokenKind::Ident) {
+            self.restore(save);
+            return None;
+        }
+        // Local-fn signature: `Ident [<G…>] (` — we require `(` after the
+        // name (with optional generic params in between).
+        let after_name = self.nth_kind(1);
+        let looks_like_fn = match after_name {
+            TokenKind::LParen => true,
+            TokenKind::Lt => {
+                // Could be a generic-param list, but we don't speculate
+                // that hard — accept it as a local-fn candidate.
+                true
+            }
+            _ => false,
+        };
+        if !looks_like_fn {
+            self.restore(save);
+            return None;
+        }
+        let name = self.bump().span;
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+        if !self.at(TokenKind::LParen) {
+            self.restore(save);
+            return None;
+        }
+        let params = self.params();
+        // Optional `where` clauses on local fns.
+        let _ = self.where_clauses();
+        let body: Stmt = if self.at(TokenKind::LBrace) {
+            self.block()
+        } else if self.eat(TokenKind::FatArrow) {
+            let body_lo = self.start();
+            let e = self.expr();
+            self.expect(TokenKind::Semicolon, "`;` after `=> expr` body");
+            Stmt::Expr {
+                span: self.finish(body_lo),
+                expr: e,
+            }
+        } else {
+            self.expect(
+                TokenKind::Semicolon,
+                "`;`, `{ … }`, or `=> expr;` for function body",
+            );
+            Stmt::Empty(self.cur().span)
+        };
+        Some(Stmt::LocalFunction {
+            span: self.finish(lo),
+            return_ty,
+            name,
+            generic_params,
+            params,
+            body: Box::new(body),
+        })
+    }
+
     /// Speculatively parse a typed local declaration `Type name [= init];`.
     /// Returns `None` (restoring state) if the lookahead doesn't fit.
     fn try_typed_local(&mut self) -> Option<Stmt> {
+        self.try_typed_local_init(true)
+    }
+
+    fn try_typed_local_init(&mut self, consume_semi: bool) -> Option<Stmt> {
         // Only attempt if the current token could plausibly start a type.
         if !matches!(
             self.kind(),
@@ -664,7 +841,7 @@ impl<'a> Parser<'a> {
         let lo = self.start();
         let save = self.save();
         let ty = self.ty();
-        // Demand: no errors, current is Ident, next is `=`/`;`/`,`.
+        // Demand: no errors, current is Ident, next is `=`/`;`/`,`/`)`.
         if self.diagnostics.len() > save.diag_len || !self.at(TokenKind::Ident) {
             self.restore(save);
             return None;
@@ -672,7 +849,7 @@ impl<'a> Parser<'a> {
         let next = self.nth_kind(1);
         if !matches!(
             next,
-            TokenKind::Assign | TokenKind::Semicolon | TokenKind::Comma
+            TokenKind::Assign | TokenKind::Semicolon | TokenKind::Comma | TokenKind::RParen
         ) {
             self.restore(save);
             return None;
@@ -683,7 +860,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect(TokenKind::Semicolon, "`;` after local variable");
+        if consume_semi {
+            self.expect(TokenKind::Semicolon, "`;` after local variable");
+        }
         Some(Stmt::Local {
             span: self.finish(lo),
             is_let: false,
@@ -862,17 +1041,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A for-init: a `var`/`let` local without trailing `;`, or an expr.
+    /// A for-init: a `var`/`let` local without trailing `;`, a typed
+    /// local (`int32 i = 0`) without trailing `;`, or an expression.
     fn for_init(&mut self) -> Stmt {
         if self.at_kw(Keyword::Var) || self.at_kw(Keyword::Let) {
-            self.local(false)
-        } else {
-            let lo = self.start();
-            let e = self.expr();
-            Stmt::Expr {
-                span: self.finish(lo),
-                expr: e,
-            }
+            return self.local(false);
+        }
+        if let Some(s) = self.try_typed_local_init(false) {
+            return s;
+        }
+        let lo = self.start();
+        let e = self.expr();
+        Stmt::Expr {
+            span: self.finish(lo),
+            expr: e,
         }
     }
 
@@ -967,6 +1149,16 @@ impl<'a> Parser<'a> {
                 let s = self.cur().span;
                 self.bump();
                 Type::Var(s)
+            }
+            // `comptype(expr)` / `decltype(expr)` — type computed at
+            // compile-time from an expression. Modeled as a Var
+            // placeholder for now.
+            TokenKind::Keyword(Keyword::Comptype) | TokenKind::Keyword(Keyword::Decltype) => {
+                self.bump();
+                self.expect(TokenKind::LParen, "`(` after comptype/decltype");
+                let _e = self.expr();
+                self.expect(TokenKind::RParen, "`)` after comptype/decltype argument");
+                Type::Var(self.finish(lo))
             }
             TokenKind::Ident => self.path_type(lo),
             _ => {
@@ -1156,6 +1348,12 @@ impl<'a> Parser<'a> {
             return self.namespace_item(lo, attributes);
         }
         let modifiers = self.modifiers();
+        if self.at_kw(Keyword::Delegate) {
+            return self.delegate_item(lo, attributes, modifiers);
+        }
+        if self.at_kw(Keyword::TypeAlias) {
+            return self.type_alias_item(lo, attributes, modifiers);
+        }
         if self.at_type_kind_kw() {
             return Item::Type(self.type_decl(lo, attributes, modifiers));
         }
@@ -1163,6 +1361,74 @@ impl<'a> Parser<'a> {
         // Recovery: skip to next item-ish boundary.
         self.skip_to_item_boundary();
         Item::Error(self.finish(lo))
+    }
+
+    fn type_alias_item(
+        &mut self,
+        lo: u32,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+    ) -> Item {
+        self.bump(); // typealias
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected typealias name");
+            self.cur().span
+        };
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+        self.expect(TokenKind::Assign, "`=` after typealias name");
+        let target = self.ty();
+        self.expect(TokenKind::Semicolon, "`;` after typealias");
+        Item::TypeAlias {
+            span: self.finish(lo),
+            attributes,
+            modifiers,
+            name,
+            generic_params,
+            target,
+        }
+    }
+
+    fn delegate_item(
+        &mut self,
+        lo: u32,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+    ) -> Item {
+        self.bump(); // delegate
+        let return_ty = self.ty();
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected delegate name");
+            self.cur().span
+        };
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+        let params = if self.at(TokenKind::LParen) {
+            self.params()
+        } else {
+            Vec::new()
+        };
+        let _ = self.where_clauses();
+        self.expect(TokenKind::Semicolon, "`;` after delegate declaration");
+        Item::Delegate {
+            span: self.finish(lo),
+            attributes,
+            modifiers,
+            return_ty,
+            name,
+            generic_params,
+            params,
+        }
     }
 
     fn using_item(&mut self, lo: u32, attributes: Vec<Attribute>) -> Item {
@@ -1355,6 +1621,7 @@ impl<'a> Parser<'a> {
             Keyword::ReadOnly => Modifier::ReadOnly,
             Keyword::Const => Modifier::Const,
             Keyword::Mut => Modifier::Mut,
+            Keyword::Ref => Modifier::Ref,
             Keyword::New => Modifier::New,
             Keyword::Inline => Modifier::Inline,
             Keyword::Mixin => Modifier::Mixin,
@@ -1442,25 +1709,26 @@ impl<'a> Parser<'a> {
     /// One constraint atom: a type, or a keyword like `class`/`struct`/
     /// `new`/`delete` (synthesised as a single-ident Path).
     fn constraint_atom(&mut self) -> Type {
-        if let TokenKind::Keyword(k) = self.kind()
-            && matches!(
+        if let TokenKind::Keyword(k) = self.kind() {
+            // `where T : const Type` — const generic constraint takes a
+            // type after the keyword.
+            if k == Keyword::Const {
+                self.bump();
+                return self.ty();
+            }
+            if matches!(
                 k,
-                Keyword::Class
-                    | Keyword::Struct
-                    | Keyword::New
-                    | Keyword::Delete
-                    | Keyword::Const
-                    | Keyword::Var
-            )
-        {
-            let span = self.bump().span;
-            return Type::Path {
-                span,
-                segments: vec![TypeSeg {
-                    name: span,
-                    args: Vec::new(),
-                }],
-            };
+                Keyword::Class | Keyword::Struct | Keyword::New | Keyword::Delete | Keyword::Var
+            ) {
+                let span = self.bump().span;
+                return Type::Path {
+                    span,
+                    segments: vec![TypeSeg {
+                        name: span,
+                        args: Vec::new(),
+                    }],
+                };
+            }
         }
         self.ty()
     }
@@ -1489,6 +1757,36 @@ impl<'a> Parser<'a> {
             return self.enum_case(lo, attributes);
         }
 
+        // C-style enum value: `Name [= value],` / `Name [= value];`
+        // (no `case` keyword — common in real-world Beef enums).
+        if kind == TypeKind::Enum && self.at(TokenKind::Ident) {
+            let next = self.nth_kind(1);
+            if matches!(
+                next,
+                TokenKind::Comma | TokenKind::Semicolon | TokenKind::Assign | TokenKind::RBrace
+            ) {
+                let name = self.bump().span;
+                let value = if self.eat(TokenKind::Assign) {
+                    Some(self.expr())
+                } else {
+                    None
+                };
+                let _ = self.eat(TokenKind::Comma) || self.eat(TokenKind::Semicolon);
+                return Member::EnumCase {
+                    span: self.finish(lo),
+                    attributes,
+                    name,
+                    payload: Vec::new(),
+                    value,
+                };
+            }
+        }
+
+        // `typealias Name [<G…>] = Type;`
+        if self.at_kw(Keyword::TypeAlias) {
+            return self.type_alias_member(lo, attributes, modifiers);
+        }
+
         // Nested type
         if self.at_type_kind_kw() {
             return Member::Nested(self.type_decl(lo, attributes, modifiers));
@@ -1498,6 +1796,11 @@ impl<'a> Parser<'a> {
         if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LParen {
             self.bump(); // this
             let params = self.params();
+            // Optional constructor chain: `: this(args)` / `: base(args)` /
+            // `: this[Friend](args)` etc. We just consume an expression.
+            if self.eat(TokenKind::Colon) {
+                let _ = self.expr();
+            }
             let body = self.method_body();
             return Member::Constructor {
                 span: self.finish(lo),
@@ -1523,9 +1826,89 @@ impl<'a> Parser<'a> {
             };
         }
 
-        // Otherwise: `Type Name …` — a field / method / property.
+        // Conversion-shaped operator: `operator T(...)` (no explicit return
+        // type — the operator IS the target type or symbol).
+        if self.at_kw(Keyword::Operator) {
+            let op_lo = self.start();
+            self.bump(); // operator
+            while !self.at(TokenKind::LParen) && !self.at(TokenKind::Eof) {
+                self.bump();
+            }
+            let name = self.finish(op_lo);
+            let params = self.params();
+            let _ = self.where_clauses();
+            let body = self.method_body();
+            return Member::Method {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                return_ty: Type::Error(name),
+                name,
+                generic_params: Vec::new(),
+                params,
+                constraints: Vec::new(),
+                body,
+            };
+        }
+
+        // Otherwise: `Type Name …` — a field / method / property /
+        // operator. After the return type we may instead see `operator`
+        // (operator method) — the "name" then spans the operator symbol(s).
         let ty = self.ty();
-        let name = if self.at(TokenKind::Ident) {
+
+        // Indexer: `Type this[params] { accessors }` or `=> expr;`.
+        if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LBracket {
+            let name = self.bump().span;
+            let _params = self.bracketed_params();
+            let accessors = if self.eat(TokenKind::LBrace) {
+                let mut accs = Vec::new();
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let before = self.pos;
+                    accs.push(self.accessor());
+                    if self.pos == before {
+                        self.bump();
+                    }
+                }
+                self.expect(TokenKind::RBrace, "`}` to close indexer body");
+                accs
+            } else if self.eat(TokenKind::FatArrow) {
+                let acc_span = self.finish(lo);
+                let e = self.expr();
+                self.expect(TokenKind::Semicolon, "`;` after expression-bodied indexer");
+                vec![Accessor {
+                    span: acc_span,
+                    attributes: Vec::new(),
+                    modifiers: Vec::new(),
+                    kind: AccessorKind::Get,
+                    body: MethodBody::Expr(e),
+                }]
+            } else {
+                self.expect(
+                    TokenKind::Semicolon,
+                    "`{ accessors }` or `=> expr;` for indexer",
+                );
+                Vec::new()
+            };
+            return Member::Property {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                ty,
+                name,
+                accessors,
+            };
+        }
+        let name = if self.at_kw(Keyword::Operator) {
+            let op_lo = self.start();
+            self.bump(); // operator
+            while !self.at(TokenKind::LParen)
+                && !self.at(TokenKind::Eof)
+                && !matches!(self.kind(), TokenKind::Ident | TokenKind::Keyword(_))
+            {
+                self.bump();
+            }
+            self.finish(op_lo)
+        } else if self.at(TokenKind::Ident) {
             self.bump().span
         } else {
             self.error("expected member name");
@@ -1534,11 +1917,26 @@ impl<'a> Parser<'a> {
         };
 
         // Optional generic params on a method.
-        let generic_params = if self.at(TokenKind::Lt) {
+        let mut generic_params = if self.at(TokenKind::Lt) {
             self.generic_params()
         } else {
             Vec::new()
         };
+
+        // Explicit interface implementation: `IFoo<T>.Bar(…)`. Walk
+        // qualifying `.Ident` segments; the *last* one is the member
+        // name (the qualifier is dropped — interface-impl info is
+        // recovered later in sema).
+        let mut name = name;
+        while self.at(TokenKind::Dot) && matches!(self.nth_kind(1), TokenKind::Ident) {
+            self.bump(); // .
+            name = self.bump().span;
+            generic_params = if self.at(TokenKind::Lt) {
+                self.generic_params()
+            } else {
+                Vec::new()
+            };
+        }
 
         match self.kind() {
             TokenKind::LParen => {
@@ -1577,12 +1975,39 @@ impl<'a> Parser<'a> {
                     accessors,
                 }
             }
+            // Expression-bodied property: `Type Name => expr;`
+            TokenKind::FatArrow => {
+                self.bump();
+                let e = self.expr();
+                let accessor_span = self.finish(lo);
+                self.expect(TokenKind::Semicolon, "`;` after expression-bodied property");
+                Member::Property {
+                    span: self.finish(lo),
+                    attributes,
+                    modifiers,
+                    ty,
+                    name,
+                    accessors: vec![Accessor {
+                        span: accessor_span,
+                        attributes: Vec::new(),
+                        modifiers: Vec::new(),
+                        kind: AccessorKind::Get,
+                        body: MethodBody::Expr(e),
+                    }],
+                }
+            }
             _ => {
                 let init = if self.eat(TokenKind::Assign) {
                     Some(self.expr())
                 } else {
                     None
                 };
+                // Beef field destructor: `= new T() ~ delete _;` — `~`
+                // introduces a destructor expression that runs when the
+                // field is reclaimed. We consume it for coverage.
+                if self.eat(TokenKind::Tilde) {
+                    let _ = self.expr();
+                }
                 self.expect(TokenKind::Semicolon, "`;` after field");
                 Member::Field {
                     span: self.finish(lo),
@@ -1593,6 +2018,37 @@ impl<'a> Parser<'a> {
                     init,
                 }
             }
+        }
+    }
+
+    fn type_alias_member(
+        &mut self,
+        lo: u32,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+    ) -> Member {
+        self.bump(); // typealias
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected typealias name");
+            self.cur().span
+        };
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+        self.expect(TokenKind::Assign, "`=` after typealias name");
+        let target = self.ty();
+        self.expect(TokenKind::Semicolon, "`;` after typealias");
+        Member::TypeAlias {
+            span: self.finish(lo),
+            attributes,
+            modifiers,
+            name,
+            generic_params,
+            target,
         }
     }
 
@@ -1639,6 +2095,23 @@ impl<'a> Parser<'a> {
             "`;` or `{ … }` or `=> expr;` for method body",
         );
         MethodBody::None
+    }
+
+    fn bracketed_params(&mut self) -> Vec<Param> {
+        self.expect(TokenKind::LBracket, "`[`");
+        let mut params = Vec::new();
+        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            params.push(self.param());
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBracket, "`]`");
+        params
     }
 
     fn params(&mut self) -> Vec<Param> {
@@ -1705,7 +2178,7 @@ impl<'a> Parser<'a> {
     fn accessor(&mut self) -> Accessor {
         let lo = self.start();
         let attributes = self.attributes();
-        let modifiers = self.modifiers();
+        let mut modifiers = self.modifiers();
         let kind = if self.eat_ident_text("get") {
             AccessorKind::Get
         } else if self.eat_ident_text("set") {
@@ -1721,6 +2194,8 @@ impl<'a> Parser<'a> {
                 body: MethodBody::None,
             };
         };
+        // Trailing modifiers after `get`/`set`, e.g. `get mut { … }`.
+        modifiers.extend(self.modifiers());
         let body = self.method_body();
         Accessor {
             span: self.finish(lo),

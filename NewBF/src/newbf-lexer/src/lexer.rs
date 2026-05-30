@@ -58,9 +58,20 @@ impl Lexer<'_> {
             b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b => self.whitespace(),
             b'/' if self.at(1) == b'/' => self.line_comment(),
             b'/' if self.at(1) == b'*' => self.block_comment(),
+            b'#' => self.preproc_line(),
             b'0'..=b'9' => self.number(),
             b'.' if self.at(1).is_ascii_digit() => self.number(),
             b'\'' => self.char_literal(),
+            // Triple-quoted forms (`"""…"""`, `@"""…"""`, `$"""…"""`).
+            b'"' if self.at(1) == b'"' && self.at(2) == b'"' => self.triple_string(TokenKind::Str),
+            b'@' if self.at(1) == b'"' && self.at(2) == b'"' && self.at(3) == b'"' => {
+                self.pos += 1;
+                self.triple_string(TokenKind::VerbatimStr)
+            }
+            b'$' if self.at(1) == b'"' && self.at(2) == b'"' && self.at(3) == b'"' => {
+                self.pos += 1;
+                self.triple_string(TokenKind::InterpStr)
+            }
             b'"' => self.string(TokenKind::Str),
             b'@' if self.at(1) == b'"' => {
                 self.pos += 1;
@@ -111,6 +122,14 @@ impl Lexer<'_> {
         } else {
             TokenKind::LineComment
         }
+    }
+
+    fn preproc_line(&mut self) -> TokenKind {
+        self.pos += 1; // consume '#'
+        while self.pos < self.b.len() && self.b[self.pos] != b'\n' {
+            self.pos += 1;
+        }
+        TokenKind::PreprocLine
     }
 
     fn block_comment(&mut self) -> TokenKind {
@@ -204,6 +223,25 @@ impl Lexer<'_> {
             }
         }
         TokenKind::Char
+    }
+
+    /// Triple-quoted string (`"""…"""`). Consumes the three opening
+    /// quotes and reads until the next `"""`, with no escape processing.
+    fn triple_string(&mut self, kind: TokenKind) -> TokenKind {
+        self.pos += 3; // opening """
+        while self.pos + 2 < self.b.len() {
+            if self.b[self.pos] == b'"'
+                && self.b[self.pos + 1] == b'"'
+                && self.b[self.pos + 2] == b'"'
+            {
+                self.pos += 3;
+                return kind;
+            }
+            self.pos += 1;
+        }
+        // Unterminated — consume the rest of the buffer.
+        self.pos = self.b.len();
+        kind
     }
 
     fn string(&mut self, kind: TokenKind) -> TokenKind {

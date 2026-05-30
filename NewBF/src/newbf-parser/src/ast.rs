@@ -28,6 +28,7 @@ pub enum BinOp {
     ClosedRange,  // 8  (...)
     Is,           // 7
     As,           // 7
+    Case,         // 7  (Beef: `expr case pattern`)
     Compare,      // 6  (<=>)
     Lt,           // 5
     Gt,           // 5
@@ -51,7 +52,7 @@ impl BinOp {
             BinOp::BitXor => 10,
             BinOp::BitOr => 9,
             BinOp::Range | BinOp::ClosedRange => 8,
-            BinOp::Is | BinOp::As => 7,
+            BinOp::Is | BinOp::As | BinOp::Case => 7,
             BinOp::Compare => 6,
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => 5,
             BinOp::Eq | BinOp::Ne => 4,
@@ -77,6 +78,7 @@ impl BinOp {
             BinOp::ClosedRange => "...",
             BinOp::Is => "is",
             BinOp::As => "as",
+            BinOp::Case => "case",
             BinOp::Compare => "<=>",
             BinOp::Lt => "<",
             BinOp::Gt => ">",
@@ -291,6 +293,18 @@ pub enum Expr {
         base: Box<Expr>,
         args: Vec<Type>,
     },
+    /// `(Type)expr` — C-style cast.
+    Cast {
+        span: Span,
+        ty: Type,
+        operand: Box<Expr>,
+    },
+    /// `.Variant` — leading-dot enum-case shorthand (the type is inferred
+    /// from context).
+    DotIdent {
+        span: Span,
+        name: Span,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
 }
@@ -319,7 +333,9 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::Member { span, .. }
             | Expr::Prefix { span, .. }
-            | Expr::Generic { span, .. } => *span,
+            | Expr::Generic { span, .. }
+            | Expr::Cast { span, .. }
+            | Expr::DotIdent { span, .. } => *span,
         }
     }
 }
@@ -390,6 +406,15 @@ pub enum Stmt {
         scrutinee: Expr,
         arms: Vec<SwitchArm>,
     },
+    /// Local function declaration nested inside a method body.
+    LocalFunction {
+        span: Span,
+        return_ty: Type,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        params: Vec<Param>,
+        body: Box<Stmt>,
+    },
     /// recovery placeholder for a malformed statement
     Error(Span),
 }
@@ -420,7 +445,8 @@ impl Stmt {
             | Stmt::Break { span, .. }
             | Stmt::Continue { span, .. }
             | Stmt::Defer { span, .. }
-            | Stmt::Switch { span, .. } => *span,
+            | Stmt::Switch { span, .. }
+            | Stmt::LocalFunction { span, .. } => *span,
         }
     }
 }
@@ -507,6 +533,25 @@ pub enum Item {
     },
     /// A type declaration (class/struct/interface/enum/extension).
     Type(TypeDecl),
+    /// Top-level delegate declaration: `delegate Return Name<G>(params);`
+    Delegate {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        return_ty: Type,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        params: Vec<Param>,
+    },
+    /// Top-level / namespace-level type alias: `typealias Name = Type;`
+    TypeAlias {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        target: Type,
+    },
     /// Recovery placeholder for a malformed item.
     Error(Span),
 }
@@ -514,7 +559,10 @@ pub enum Item {
 impl Item {
     pub fn span(&self) -> Span {
         match self {
-            Item::Using { span, .. } | Item::Namespace { span, .. } => *span,
+            Item::Using { span, .. }
+            | Item::Namespace { span, .. }
+            | Item::Delegate { span, .. }
+            | Item::TypeAlias { span, .. } => *span,
             Item::Type(t) => t.span,
             Item::Error(s) => *s,
         }
@@ -545,6 +593,7 @@ pub enum Modifier {
     ReadOnly,
     Const,
     Mut,
+    Ref,
     New,
     Inline,
     Mixin,
@@ -571,6 +620,7 @@ impl Modifier {
             Modifier::ReadOnly => "readonly",
             Modifier::Const => "const",
             Modifier::Mut => "mut",
+            Modifier::Ref => "ref",
             Modifier::New => "new",
             Modifier::Inline => "inline",
             Modifier::Mixin => "mixin",
@@ -692,6 +742,15 @@ pub enum Member {
     },
     /// A nested type declaration.
     Nested(TypeDecl),
+    /// `typealias Name [<G…>] = Type;`
+    TypeAlias {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        target: Type,
+    },
     /// Recovery placeholder for a malformed member.
     Error(Span),
 }
@@ -704,7 +763,8 @@ impl Member {
             | Member::Constructor { span, .. }
             | Member::Destructor { span, .. }
             | Member::Property { span, .. }
-            | Member::EnumCase { span, .. } => *span,
+            | Member::EnumCase { span, .. }
+            | Member::TypeAlias { span, .. } => *span,
             Member::Nested(t) => t.span,
             Member::Error(s) => *s,
         }

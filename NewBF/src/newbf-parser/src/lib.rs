@@ -120,6 +120,10 @@ mod tests {
                 s.push(')');
                 s
             }
+            Expr::Cast { ty, operand, .. } => {
+                format!("(cast {} {})", sxt(src, ty), sx(src, operand))
+            }
+            Expr::DotIdent { name, .. } => format!(".{}", name.text(src)),
         }
     }
 
@@ -238,6 +242,9 @@ mod tests {
             Stmt::Break { .. } => "(break)".into(),
             Stmt::Continue { .. } => "(continue)".into(),
             Stmt::Defer { body, .. } => format!("(defer {})", sxs(src, body)),
+            Stmt::LocalFunction { name, body, .. } => {
+                format!("(fn {} {})", name.text(src), sxs(src, body))
+            }
             Stmt::Switch {
                 scrutinee, arms, ..
             } => {

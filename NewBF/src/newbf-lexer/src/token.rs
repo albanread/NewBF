@@ -132,6 +132,7 @@ pub enum TokenKind {
     LineComment,  // `// …`
     DocComment,   // `/// …`
     BlockComment, // `/* … */` (nesting supported)
+    PreprocLine,  // `#unwarn` / `#pragma …` / `#if …` (consumed to EOL)
 
     // ── literals ──────────────────────────────────────────────────────
     Int,         // 123, 0xFF, 0b1010, with `_` separators and suffixes
@@ -220,6 +221,7 @@ impl TokenKind {
                 | TokenKind::LineComment
                 | TokenKind::DocComment
                 | TokenKind::BlockComment
+                | TokenKind::PreprocLine
         )
     }
 }

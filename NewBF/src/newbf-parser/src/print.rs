@@ -184,6 +184,15 @@ impl Printer<'_> {
                     self.ty(a, d + 2);
                 }
             }
+            Expr::Cast { ty, operand, .. } => {
+                self.line(d, "Cast");
+                self.line(d + 1, "ty:");
+                self.ty(ty, d + 2);
+                self.labeled_expr(d + 1, "operand", operand);
+            }
+            Expr::DotIdent { name, .. } => {
+                self.line(d, &format!("DotIdent .{}", self.txt(*name)));
+            }
         }
     }
 
@@ -280,6 +289,63 @@ impl Printer<'_> {
                 }
             }
             Item::Type(td) => self.type_decl(td, d),
+            Item::Delegate {
+                attributes,
+                modifiers,
+                return_ty,
+                name,
+                generic_params,
+                params,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("Delegate {}", self.txt(*name))
+                } else {
+                    format!("Delegate [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                self.line(d + 1, "returns:");
+                self.ty(return_ty, d + 2);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+            }
+            Item::TypeAlias {
+                attributes,
+                modifiers,
+                name,
+                generic_params,
+                target,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("TypeAlias {}", self.txt(*name))
+                } else {
+                    format!("TypeAlias [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                self.line(d + 1, "target:");
+                self.ty(target, d + 2);
+            }
             Item::Error(_) => self.line(d, "Item:Error"),
         }
     }
@@ -489,6 +555,31 @@ impl Printer<'_> {
                 }
             }
             Member::Nested(td) => self.type_decl(td, d),
+            Member::TypeAlias {
+                attributes,
+                modifiers,
+                name,
+                generic_params,
+                target,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("TypeAlias {}", self.txt(*name))
+                } else {
+                    format!("TypeAlias [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                self.line(d + 1, "target:");
+                self.ty(target, d + 2);
+            }
             Member::Error(_) => self.line(d, "Member:Error"),
         }
     }
@@ -635,6 +726,32 @@ impl Printer<'_> {
             Stmt::Defer { body, .. } => {
                 self.line(d, "Defer");
                 self.stmt(body, d + 1);
+            }
+            Stmt::LocalFunction {
+                return_ty,
+                name,
+                generic_params,
+                params,
+                body,
+                ..
+            } => {
+                self.line(d, &format!("LocalFunction {}", self.txt(*name)));
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                self.line(d + 1, "returns:");
+                self.ty(return_ty, d + 2);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+                self.line(d + 1, "body:");
+                self.stmt(body, d + 2);
             }
             Stmt::Switch {
                 scrutinee, arms, ..
