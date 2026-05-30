@@ -706,6 +706,20 @@ mod tests {
     }
 
     #[test]
+    fn block_expressions_and_using_field() {
+        // Block expression in expression position parses clean.
+        let _ = ok("{ a(); 1 }");
+        // Attributed block expression.
+        let _ = ok("[IgnoreErrors] { f(); }");
+        // `using` field qualifier.
+        let unit = ok_file("class C { using public ClassA mInst; }");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert!(matches!(&td.members[0], Member::Field { .. }));
+    }
+
+    #[test]
     fn typed_pattern_binding_argument() {
         // `Type name` binding inside a call/pattern arg list parses clean
         // (the binding name is consumed). Here as a plain call form.

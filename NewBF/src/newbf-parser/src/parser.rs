@@ -733,12 +733,21 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(k) => self.primary_keyword(k, span),
             TokenKind::LParen => self.paren_or_cast(),
             // Lambda capture clause: `[&] (a,b) => …`, `[=] => …`,
-            // `[x, &y] z => …`. The captures are consumed and dropped for
-            // now; the lambda expression that follows is parsed normally.
+            // `[x, &y] z => …`; or an attributed block `[IgnoreErrors] { … }`.
+            // The bracket clause is consumed and dropped; what follows is a
+            // block expression or a lambda.
             TokenKind::LBracket => {
                 self.skip_capture_clause();
-                self.unary()
+                if self.at(TokenKind::LBrace) {
+                    self.block_expr(span.lo)
+                } else {
+                    self.unary()
+                }
             }
+            // Block expression: `{ stmts; result }` used in expression
+            // position (an `if` condition, an argument, an assignment RHS).
+            // Consumed and dropped for now; placeholder primary stands in.
+            TokenKind::LBrace => self.block_expr(span.lo),
             // `?` — Beef "uninitialized" placeholder (e.g. `int x = ?;`).
             TokenKind::Question => {
                 self.bump();
@@ -778,6 +787,14 @@ impl<'a> Parser<'a> {
     /// closes correctly.
     fn skip_capture_clause(&mut self) {
         self.skip_balanced(TokenKind::LBracket, TokenKind::RBracket);
+    }
+
+    /// A block used in expression position: `{ stmts; result }` (an `if`
+    /// condition, argument, or RHS). The statements are parsed (so inner
+    /// errors are still reported); the block's value is a placeholder.
+    fn block_expr(&mut self, lo: u32) -> Expr {
+        let _ = self.block();
+        Expr::Ident(self.finish(lo))
     }
 
     /// Consume a balanced `open … close` run (current token is `open`).
@@ -2342,6 +2359,9 @@ impl<'a> Parser<'a> {
             let before = self.pos;
             attributes.extend(self.attributes());
             modifiers.extend(self.modifiers());
+            // `using` field qualifier (member forwarding):
+            // `using public ClassA mInst;`. Consumed; not modeled yet.
+            let _ = self.eat_kw(Keyword::Using);
             if self.pos == before {
                 break;
             }
