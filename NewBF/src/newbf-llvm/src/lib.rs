@@ -20,6 +20,6 @@ mod jit;
 mod jit_mm;
 mod lower;
 
-pub use aot::{emit_object, emit_object_to_memory};
+pub use aot::{emit_object, emit_object_to_memory, link_executable};
 pub use jit::OrcJit;
 pub use lower::{emit_module, lower_to_string, verify_module};

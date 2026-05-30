@@ -3,10 +3,12 @@
 //!
 //! Lowers the typed SSA IR to an LLVM module (the same `emit_module` the JIT
 //! uses) and runs it through an LLVM `TargetMachine` to produce a native
-//! object file (COFF on Windows). Linking the object(s) + the runtime into a
-//! standalone `.exe` (lld / the MSVC linker) and the driver `compile` command
-//! are the next step; this is the codegen foundation, verified by emitting a
-//! real object and checking its container format.
+//! object file (COFF on Windows) — [`emit_object`] — then drives MSVC
+//! `link.exe` to link object(s) + the CRT into a standalone `.exe`
+//! ([`link_executable`]). The full path is proven end-to-end: lower → object
+//! → link → run. Still ahead: linking the runtime staticlib (for the AOT
+//! entry stub + `newbf_install_crash_handler`) and the driver `compile`
+//! command.
 
 use std::path::Path;
 use std::sync::Once;
@@ -68,6 +70,66 @@ pub fn emit_object(ir: &IrModule, path: &Path) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// Link `objects` (+ any `extra_libs`, e.g. `"user32.lib"`) into a native
+/// console `.exe` at `output`, driving MSVC `link.exe`. The CRT entry
+/// `mainCRTStartup` runs the C `main` our codegen emits.
+///
+/// `cc::windows_registry::find` locates `link.exe` with `%LIB%` populated, so
+/// the SDK/CRT import libs below resolve without a Developer Command Prompt —
+/// the same trick NewOpenDylan's driver uses. The runtime staticlib (which
+/// will provide `newbf_install_crash_handler` + the AOT entry stub) joins this
+/// arg list when it lands; for now the CRT alone suffices for a freestanding
+/// `main`.
+pub fn link_executable(
+    objects: &[&Path],
+    output: &Path,
+    extra_libs: &[&str],
+) -> Result<(), String> {
+    let mut cmd =
+        cc::windows_registry::find("x86_64-pc-windows-msvc", "link.exe").ok_or_else(|| {
+            "could not locate MSVC link.exe (install VS Build Tools or run from a \
+             Developer Command Prompt)"
+                .to_string()
+        })?;
+    for obj in objects {
+        cmd.arg(obj);
+    }
+    cmd.arg(format!("/OUT:{}", output.display()));
+    cmd.arg("/SUBSYSTEM:CONSOLE");
+    cmd.arg("/ENTRY:mainCRTStartup");
+    cmd.arg("/MACHINE:X64");
+    // Modern Windows security defaults (link.exe warns without them).
+    cmd.arg("/NXCOMPAT");
+    cmd.arg("/DYNAMICBASE");
+    cmd.arg("/HIGHENTROPYVA");
+    // The CRT + kernel import libs a freestanding `main` needs; %LIB% (set by
+    // the discovered link.exe) resolves them from the SDK.
+    for lib in [
+        "kernel32.lib",
+        "msvcrt.lib",
+        "ucrt.lib",
+        "vcruntime.lib",
+        "legacy_stdio_definitions.lib",
+    ] {
+        cmd.arg(lib);
+    }
+    for lib in extra_libs {
+        cmd.arg(lib);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to invoke link.exe: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "link.exe failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::emit_object_to_memory;
@@ -104,5 +166,35 @@ mod tests {
         // IMAGE_FILE_MACHINE_AMD64 = 0x8664, little-endian → bytes 64 86.
         #[cfg(all(windows, target_arch = "x86_64"))]
         assert_eq!(&obj[..2], &[0x64, 0x86], "not an x64 COFF object");
+    }
+
+    /// End-to-end AOT: emit an object for `i32 main() => 42`, link it into a
+    /// real `.exe`, run it, and check the exit code — the AOT analog of the
+    /// JIT's `jit_executes_add`.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn links_and_runs_an_exe() {
+        use super::{emit_object, link_executable};
+        use newbf_ir::Value;
+
+        // i32 main() => 42;
+        let mut f = FunctionBuilder::new("main", vec![], IrType::I32);
+        f.ret(Some(Value::int(42, IrType::I32)));
+        let mut m = IrModule::new("aot_exe");
+        m.add_function(f.finish());
+
+        // Per-process-unique temp paths so parallel test binaries don't clash.
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let obj = dir.join(format!("newbf_aot_{pid}.obj"));
+        let exe = dir.join(format!("newbf_aot_{pid}.exe"));
+
+        emit_object(&m, &obj).expect("emit object");
+        link_executable(&[&obj], &exe, &[]).expect("link exe");
+        let status = std::process::Command::new(&exe).status().expect("run exe");
+        assert_eq!(status.code(), Some(42), "AOT exe exit code");
+
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&exe);
     }
 }

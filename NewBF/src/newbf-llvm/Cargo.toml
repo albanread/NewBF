@@ -12,6 +12,9 @@ description = "NewBF: LLVM lowering, JIT, and AOT object/executable emission."
 newbf-ir.workspace = true
 inkwell.workspace  = true
 llvm-sys.workspace = true
+# `cc::windows_registry::find` locates MSVC `link.exe` (with %LIB% set) to
+# link AOT objects into a native .exe — same approach as NewOpenDylan's driver.
+cc = "1"
 
 [lints]
 workspace = true
