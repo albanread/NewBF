@@ -265,6 +265,37 @@ mod tests {
         assert_eq!(pid(), std::process::id());
     }
 
+    /// Read the OS millisecond timer twice through JIT'd code, with a sleep
+    /// between — the second read must have advanced. A *live, changing* value
+    /// (unlike a constant pid) proves the JIT'd Win32 call really executes the
+    /// kernel32 function each time, not a cached/constant-folded result.
+    #[cfg(windows)]
+    #[test]
+    fn jit_reads_the_millisecond_timer() {
+        // u32 tick() => GetTickCount();  (kernel32 — ms since boot, monotonic)
+        let mut m = IrModule::new("jit_tick");
+        m.declare_extern("GetTickCount", vec![], IrType::U32);
+        let mut f = FunctionBuilder::new("tick", vec![], IrType::U32);
+        let r = f.call("GetTickCount", vec![], IrType::U32);
+        f.ret(Some(r));
+        m.add_function(f.finish());
+
+        let jit = OrcJit::from_ir(&m).expect("jit builds");
+        let addr = jit.lookup("tick").expect("tick resolves");
+        let tick: extern "C" fn() -> u32 = unsafe { std::mem::transmute(addr) };
+
+        let t1 = tick();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let t2 = tick();
+        // GetTickCount's resolution is ~10–16 ms, so a 50 ms sleep must show a
+        // plausible elapsed delta — not zero (constant) and not garbage.
+        let dt = t2.wrapping_sub(t1);
+        assert!(
+            (10..10_000).contains(&dt),
+            "implausible tick delta over a 50ms sleep: {dt} ms ({t1} -> {t2})"
+        );
+    }
+
     /// Milestone 2 (SEH foundation): a `debugtrap` lowered into JIT'd code
     /// raises `EXCEPTION_BREAKPOINT`, which a Vectored Exception Handler
     /// catches — with the faulting `Rip` inside the JIT'd function — and then
