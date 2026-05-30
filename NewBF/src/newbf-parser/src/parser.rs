@@ -1724,6 +1724,27 @@ impl<'a> Parser<'a> {
             self.restore(save);
         }
 
+        // For-each over a bare expression with no binding: `for (expr)` —
+        // e.g. `for (this.Split(ch))`. If the parens hold a single expression
+        // followed by `)`, iterate it directly.
+        {
+            let save = self.save();
+            if !self.at(TokenKind::Semicolon) {
+                let iter = self.expr();
+                if self.diagnostics.len() == save.diag_len && self.at(TokenKind::RParen) {
+                    self.bump(); // )
+                    let body = Box::new(self.stmt());
+                    return Stmt::ForEach {
+                        span: self.finish(lo),
+                        name: Span::new(self.file, lo, lo),
+                        iter,
+                        body,
+                    };
+                }
+            }
+            self.restore(save);
+        }
+
         // C-style: `(init; cond; update)`
         let init = if self.at(TokenKind::Semicolon) {
             None
@@ -1886,7 +1907,7 @@ impl<'a> Parser<'a> {
         let lo = self.start();
         let base = match self.kind() {
             TokenKind::LParen => self.tuple_type(lo),
-            TokenKind::Keyword(Keyword::Var) => {
+            TokenKind::Keyword(Keyword::Var | Keyword::Let) => {
                 let s = self.cur().span;
                 self.bump();
                 Type::Var(s)
@@ -2017,11 +2038,14 @@ impl<'a> Parser<'a> {
         if !self.at(TokenKind::Gt) && !self.at(TokenKind::Shr) {
             loop {
                 let before = self.pos;
-                // Const generic argument: `Foo<const N>`, or a bare literal
-                // value (`Foo<16>`, `Foo<true>`). A type never starts with a
-                // numeric/char/bool literal, so this is unambiguous. Parse the
-                // value expression and stand a placeholder type in for it.
-                let arg = if self.at_kw(Keyword::Const)
+                // Omitted argument in an unbound generic: `typeof(Result<,>)`,
+                // `Dictionary<,>`. The slot is a placeholder.
+                let arg = if matches!(
+                    self.kind(),
+                    TokenKind::Comma | TokenKind::Gt | TokenKind::Shr
+                ) {
+                    Type::Var(self.cur().span)
+                } else if self.at_kw(Keyword::Const)
                     || matches!(
                         self.kind(),
                         TokenKind::Int
@@ -2030,7 +2054,8 @@ impl<'a> Parser<'a> {
                             | TokenKind::Keyword(Keyword::True)
                             | TokenKind::Keyword(Keyword::False)
                             | TokenKind::Minus
-                    ) {
+                    )
+                {
                     let s = self.cur().span;
                     let _ = self.eat_kw(Keyword::Const);
                     // Parse the const value at a precedence above comparison
