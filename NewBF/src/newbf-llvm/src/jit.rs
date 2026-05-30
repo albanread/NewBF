@@ -31,12 +31,13 @@ use llvm_sys::execution_engine::{
 use llvm_sys::orc2::lljit::{
     LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
     LLVMOrcLLJITAddLLVMIRModule, LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator,
-    LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
+    LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
 };
 use llvm_sys::orc2::{
+    LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess,
     LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcCreateNewThreadSafeModule,
-    LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutionSessionRef, LLVMOrcExecutorAddress,
-    LLVMOrcObjectLayerRef,
+    LLVMOrcDefinitionGeneratorRef, LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutionSessionRef,
+    LLVMOrcExecutorAddress, LLVMOrcJITDylibAddGenerator, LLVMOrcObjectLayerRef,
 };
 use newbf_ir::Module as IrModule;
 
@@ -139,13 +140,35 @@ impl OrcJit {
             return Err(format!("LLJIT creation failed: {}", take_error(err)));
         }
 
+        // Resolve external symbols from the host process — Win32 exports from
+        // loaded DLLs (kernel32 et al.), runtime helpers, comptime callbacks.
+        // This is what lets JIT'd code call the Windows API directly: ORC's
+        // idiomatic equivalent of MCJIT's LLVMAddGlobalMapping, and simpler —
+        // no per-symbol binding, the generator resolves on demand at lookup.
+        let jd = unsafe { LLVMOrcLLJITGetMainJITDylib(jit) };
+        unsafe {
+            let prefix = LLVMOrcLLJITGetGlobalPrefix(jit);
+            let mut generator: LLVMOrcDefinitionGeneratorRef = std::ptr::null_mut();
+            let gerr = LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+                &mut generator,
+                prefix,
+                None,
+                std::ptr::null_mut(),
+            );
+            if gerr.is_null() {
+                LLVMOrcJITDylibAddGenerator(jd, generator);
+            } else {
+                // Non-fatal: without it, only module-internal symbols resolve.
+                let _ = take_error(gerr);
+            }
+        }
+
         // Wrap the donated context + module and hand the module to the JIT.
         let tsc = unsafe { LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx_raw) };
         let tsm = unsafe { LLVMOrcCreateNewThreadSafeModule(mod_raw, tsc) };
         // The ThreadSafeModule keeps its own reference to the context's data.
         unsafe { LLVMOrcDisposeThreadSafeContext(tsc) };
 
-        let jd = unsafe { LLVMOrcLLJITGetMainJITDylib(jit) };
         let err = unsafe { LLVMOrcLLJITAddLLVMIRModule(jit, jd, tsm) };
         if !err.is_null() {
             let msg = take_error(err);
@@ -218,6 +241,28 @@ mod tests {
         let add: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(addr) };
         assert_eq!(add(3, 4), 7);
         assert_eq!(add(-10, 32), 22);
+    }
+
+    /// The compiler autogenerates a real Win32 call. JIT a function that calls
+    /// `GetCurrentProcessId` (kernel32 — always loaded), declared with the
+    /// oracle's signature and resolved via the ORC process search generator,
+    /// and confirm it returns this very process's id. This is the JIT half of
+    /// "call the Windows API directly" — no thunk table, no AddGlobalMapping.
+    #[cfg(windows)]
+    #[test]
+    fn jit_calls_a_real_win32_function() {
+        // extern u32 GetCurrentProcessId();  u32 pid() => GetCurrentProcessId();
+        let mut m = IrModule::new("jit_win32");
+        m.declare_extern("GetCurrentProcessId", vec![], IrType::U32);
+        let mut f = FunctionBuilder::new("pid", vec![], IrType::U32);
+        let r = f.call("GetCurrentProcessId", vec![], IrType::U32);
+        f.ret(Some(r));
+        m.add_function(f.finish());
+
+        let jit = OrcJit::from_ir(&m).expect("jit builds");
+        let addr = jit.lookup("pid").expect("pid resolves");
+        let pid: extern "C" fn() -> u32 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(pid(), std::process::id());
     }
 
     /// Milestone 2 (SEH foundation): a `debugtrap` lowered into JIT'd code
