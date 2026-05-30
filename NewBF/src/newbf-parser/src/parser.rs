@@ -378,7 +378,11 @@ impl<'a> Parser<'a> {
                         self.eat(TokenKind::RBracket);
                     }
                     // `a.0` / `a.1` — tuple field access (numeric member).
+                    // `inst.this(…)` — explicit constructor call; `.base`
+                    // member — accept the `this`/`base` keywords as names.
                     let name = if self.at(TokenKind::Int) {
+                        self.bump().span
+                    } else if self.at_kw(Keyword::This) || self.at_kw(Keyword::Base) {
                         self.bump().span
                     } else {
                         self.expect_ident_span("member name")
@@ -926,10 +930,21 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Ident(span)
             }
+            // `function`/`delegate` type in expression position — the RHS of
+            // `is`/`as` (`obj is delegate int(int a, int b)`). Parse the
+            // function type and drop it; placeholder primary stands in.
+            Keyword::Function | Keyword::Delegate => {
+                let _ty = self.ty();
+                return Expr::Ident(span);
+            }
             // `var x` / `let val` — binding patterns (used in `case`
-            // patterns and `if (var x = …)`): consume the bound name too.
+            // patterns and `if (var x = …)`); also `var ref val` / `let mut x`
+            // with a binding modifier. Consume the modifier and bound name.
             Keyword::Var | Keyword::Let => {
                 self.bump();
+                let _ = self.eat_kw(Keyword::Ref)
+                    || self.eat_kw(Keyword::Mut)
+                    || self.eat_kw(Keyword::Out);
                 if self.at(TokenKind::Ident) {
                     self.bump();
                 }
@@ -2869,10 +2884,21 @@ impl<'a> Parser<'a> {
                     None
                 };
                 // Beef field destructor: `= new T() ~ delete _;` — `~`
-                // introduces a destructor expression that runs when the
-                // field is reclaimed. We consume it for coverage.
+                // introduces a destructor that runs when the field is
+                // reclaimed. It may be a block (`~ { … }`), carry a guard
+                // (`~ if (onHeap) delete _;`), or be a bare expression. We
+                // consume it for coverage, leaving the field's `;` in place.
                 if self.eat(TokenKind::Tilde) {
-                    let _ = self.expr();
+                    if self.at(TokenKind::LBrace) {
+                        self.skip_balanced(TokenKind::LBrace, TokenKind::RBrace);
+                    } else {
+                        if self.eat_kw(Keyword::If) {
+                            self.expect(TokenKind::LParen, "`(` after `if`");
+                            let _ = self.expr();
+                            self.expect(TokenKind::RParen, "`)` after if-condition");
+                        }
+                        let _ = self.expr();
+                    }
                 }
                 // Multiple declarators: `int a, b, c;` — keep the first,
                 // consume the rest (`, name [= init]`).
