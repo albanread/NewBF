@@ -45,7 +45,8 @@ pub fn parse_fragment(src: &str, file: FileId) -> (Vec<Stmt>, Vec<Diagnostic>) {
     (stmts, p.diagnostics)
 }
 
-struct Parser {
+struct Parser<'a> {
+    src: &'a str,
     toks: Vec<Token>,
     file: FileId,
     pos: usize,
@@ -63,18 +64,35 @@ struct Save {
     splits_len: usize,
 }
 
-impl Parser {
-    fn new(src: &str, file: FileId) -> Self {
+impl<'a> Parser<'a> {
+    fn new(src: &'a str, file: FileId) -> Self {
         let toks: Vec<Token> = lex(src, file)
             .into_iter()
             .filter(|t| !t.kind.is_trivia())
             .collect();
         Self {
+            src,
             toks,
             file,
             pos: 0,
             diagnostics: Vec::new(),
             splits: Vec::new(),
+        }
+    }
+
+    /// Compare the current token's text to a literal. Useful for the few
+    /// places where contextual keywords (`get`, `set`) aren't lexer
+    /// keywords proper.
+    fn at_ident_text(&self, text: &str) -> bool {
+        self.at(TokenKind::Ident) && self.cur().span.text(self.src) == text
+    }
+
+    fn eat_ident_text(&mut self, text: &str) -> bool {
+        if self.at_ident_text(text) {
+            self.bump();
+            true
+        } else {
+            false
         }
     }
 
@@ -1109,6 +1127,645 @@ impl Parser {
             elems,
         }
     }
+
+    // ── declarations (compilation unit / items / members) ──────────────
+
+    fn comp_unit(&mut self) -> CompUnit {
+        let lo = self.start();
+        let mut items = Vec::new();
+        while !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            items.push(self.item());
+            if self.pos == before {
+                self.bump(); // safety
+            }
+        }
+        CompUnit {
+            span: self.finish(lo),
+            items,
+        }
+    }
+
+    fn item(&mut self) -> Item {
+        let lo = self.start();
+        let attributes = self.attributes();
+        if self.at_kw(Keyword::Using) {
+            return self.using_item(lo, attributes);
+        }
+        if self.at_kw(Keyword::Namespace) {
+            return self.namespace_item(lo, attributes);
+        }
+        let modifiers = self.modifiers();
+        if self.at_type_kind_kw() {
+            return Item::Type(self.type_decl(lo, attributes, modifiers));
+        }
+        self.error("expected an item declaration (using/namespace/class/struct/interface/enum)");
+        // Recovery: skip to next item-ish boundary.
+        self.skip_to_item_boundary();
+        Item::Error(self.finish(lo))
+    }
+
+    fn using_item(&mut self, lo: u32, attributes: Vec<Attribute>) -> Item {
+        self.bump(); // using
+        let is_static = self.eat_kw(Keyword::Static);
+        let first_lo = self.start();
+        let first = self.path_type(first_lo);
+        // `using A = B;` — the first parsed name was an alias.
+        let (alias, target) = if self.eat(TokenKind::Assign) {
+            let alias_span = match &first {
+                Type::Path { segments, .. }
+                    if segments.len() == 1 && segments[0].args.is_empty() =>
+                {
+                    Some(segments[0].name)
+                }
+                _ => {
+                    self.error("alias before `=` must be a single identifier");
+                    None
+                }
+            };
+            let target_lo = self.start();
+            (alias_span, self.path_type(target_lo))
+        } else {
+            (None, first)
+        };
+        self.expect(TokenKind::Semicolon, "`;` after `using` directive");
+        Item::Using {
+            span: self.finish(lo),
+            attributes,
+            is_static,
+            alias,
+            target,
+        }
+    }
+
+    fn namespace_item(&mut self, lo: u32, attributes: Vec<Attribute>) -> Item {
+        self.bump(); // namespace
+        let path_lo = self.start();
+        let path = self.path_type(path_lo);
+        let body = if self.eat(TokenKind::Semicolon) {
+            None // file-scoped
+        } else {
+            self.expect(TokenKind::LBrace, "`{` or `;` after namespace path");
+            let mut items = Vec::new();
+            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                let before = self.pos;
+                items.push(self.item());
+                if self.pos == before {
+                    self.bump();
+                }
+            }
+            self.expect(TokenKind::RBrace, "`}` to close namespace");
+            Some(items)
+        };
+        Item::Namespace {
+            span: self.finish(lo),
+            attributes,
+            path,
+            body,
+        }
+    }
+
+    fn type_decl(
+        &mut self,
+        lo: u32,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+    ) -> TypeDecl {
+        let kind = self
+            .type_kind()
+            .expect("at_type_kind_kw guaranteed a type-kind keyword");
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected type name");
+            self.cur().span
+        };
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+        let bases = if self.eat(TokenKind::Colon) {
+            self.base_list()
+        } else {
+            Vec::new()
+        };
+        let constraints = self.where_clauses();
+        let members = if self.eat(TokenKind::LBrace) {
+            self.members(kind)
+        } else {
+            self.expect(TokenKind::LBrace, "`{` to open type body");
+            Vec::new()
+        };
+        // Consume `}` (members() stops at `}` but does not consume it).
+        self.expect(TokenKind::RBrace, "`}` to close type body");
+        TypeDecl {
+            span: self.finish(lo),
+            attributes,
+            modifiers,
+            kind,
+            name,
+            generic_params,
+            bases,
+            constraints,
+            members,
+        }
+    }
+
+    fn at_type_kind_kw(&self) -> bool {
+        matches!(
+            self.kind(),
+            TokenKind::Keyword(Keyword::Class)
+                | TokenKind::Keyword(Keyword::Struct)
+                | TokenKind::Keyword(Keyword::Interface)
+                | TokenKind::Keyword(Keyword::Enum)
+                | TokenKind::Keyword(Keyword::Extension)
+        )
+    }
+
+    fn type_kind(&mut self) -> Option<TypeKind> {
+        let TokenKind::Keyword(k) = self.kind() else {
+            return None;
+        };
+        let kind = match k {
+            Keyword::Class => TypeKind::Class,
+            Keyword::Struct => TypeKind::Struct,
+            Keyword::Interface => TypeKind::Interface,
+            Keyword::Enum => TypeKind::Enum,
+            Keyword::Extension => TypeKind::Extension,
+            _ => return None,
+        };
+        self.bump();
+        Some(kind)
+    }
+
+    fn attributes(&mut self) -> Vec<Attribute> {
+        let mut attrs = Vec::new();
+        while self.at(TokenKind::LBracket) {
+            self.bump(); // [
+            loop {
+                let lo = self.start();
+                let name = self.path_type(lo);
+                let args = if self.eat(TokenKind::LParen) {
+                    let a = self.arg_list(TokenKind::RParen);
+                    self.expect(TokenKind::RParen, "`)` after attribute args");
+                    a
+                } else {
+                    Vec::new()
+                };
+                attrs.push(Attribute {
+                    span: self.finish(lo),
+                    name,
+                    args,
+                });
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBracket, "`]` to close attribute");
+        }
+        attrs
+    }
+
+    fn modifiers(&mut self) -> Vec<(Modifier, Span)> {
+        let mut mods = Vec::new();
+        while let Some(m) = self.peek_modifier() {
+            let span = self.cur().span;
+            self.bump();
+            mods.push((m, span));
+        }
+        mods
+    }
+
+    fn peek_modifier(&self) -> Option<Modifier> {
+        let TokenKind::Keyword(k) = self.kind() else {
+            return None;
+        };
+        Some(match k {
+            Keyword::Public => Modifier::Public,
+            Keyword::Private => Modifier::Private,
+            Keyword::Protected => Modifier::Protected,
+            Keyword::Internal => Modifier::Internal,
+            Keyword::Static => Modifier::Static,
+            Keyword::Abstract => Modifier::Abstract,
+            Keyword::Sealed => Modifier::Sealed,
+            Keyword::Virtual => Modifier::Virtual,
+            Keyword::Override => Modifier::Override,
+            Keyword::Extern => Modifier::Extern,
+            Keyword::ReadOnly => Modifier::ReadOnly,
+            Keyword::Const => Modifier::Const,
+            Keyword::Mut => Modifier::Mut,
+            Keyword::New => Modifier::New,
+            Keyword::Inline => Modifier::Inline,
+            Keyword::Mixin => Modifier::Mixin,
+            Keyword::Append => Modifier::Append,
+            Keyword::Concrete => Modifier::Concrete,
+            Keyword::Implicit => Modifier::Implicit,
+            Keyword::Explicit => Modifier::Explicit,
+            Keyword::Volatile => Modifier::Volatile,
+            _ => return None,
+        })
+    }
+
+    fn generic_params(&mut self) -> Vec<GenericParam> {
+        let mut params = Vec::new();
+        if !self.eat(TokenKind::Lt) {
+            return params;
+        }
+        loop {
+            let lo = self.start();
+            // skip any attributes on the type param
+            let _ = self.attributes();
+            if !self.at(TokenKind::Ident) {
+                break;
+            }
+            let name = self.bump().span;
+            params.push(GenericParam {
+                span: self.finish(lo),
+                name,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.close_gt();
+        params
+    }
+
+    fn base_list(&mut self) -> Vec<Type> {
+        let mut bases = Vec::new();
+        loop {
+            let before = self.pos;
+            bases.push(self.ty());
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
+        bases
+    }
+
+    fn where_clauses(&mut self) -> Vec<WhereClause> {
+        let mut clauses = Vec::new();
+        while self.at_kw(Keyword::Where) {
+            let lo = self.start();
+            self.bump(); // where
+            let name = if self.at(TokenKind::Ident) {
+                self.bump().span
+            } else {
+                self.error("expected type parameter name after `where`");
+                self.cur().span
+            };
+            self.expect(TokenKind::Colon, "`:` after `where T`");
+            let mut constraints = Vec::new();
+            loop {
+                let before = self.pos;
+                constraints.push(self.constraint_atom());
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                if self.pos == before {
+                    break;
+                }
+            }
+            clauses.push(WhereClause {
+                span: self.finish(lo),
+                name,
+                constraints,
+            });
+        }
+        clauses
+    }
+
+    /// One constraint atom: a type, or a keyword like `class`/`struct`/
+    /// `new`/`delete` (synthesised as a single-ident Path).
+    fn constraint_atom(&mut self) -> Type {
+        if let TokenKind::Keyword(k) = self.kind()
+            && matches!(
+                k,
+                Keyword::Class
+                    | Keyword::Struct
+                    | Keyword::New
+                    | Keyword::Delete
+                    | Keyword::Const
+                    | Keyword::Var
+            )
+        {
+            let span = self.bump().span;
+            return Type::Path {
+                span,
+                segments: vec![TypeSeg {
+                    name: span,
+                    args: Vec::new(),
+                }],
+            };
+        }
+        self.ty()
+    }
+
+    // ── members ─────────────────────────────────────────────────────────
+
+    fn members(&mut self, kind: TypeKind) -> Vec<Member> {
+        let mut out = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            out.push(self.member(kind));
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        out
+    }
+
+    fn member(&mut self, kind: TypeKind) -> Member {
+        let lo = self.start();
+        let attributes = self.attributes();
+        let modifiers = self.modifiers();
+
+        // Enum case: `case Name [(payload)] [= value];`
+        if kind == TypeKind::Enum && self.at_kw(Keyword::Case) {
+            return self.enum_case(lo, attributes);
+        }
+
+        // Nested type
+        if self.at_type_kind_kw() {
+            return Member::Nested(self.type_decl(lo, attributes, modifiers));
+        }
+
+        // Constructor: `this(...)`
+        if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LParen {
+            self.bump(); // this
+            let params = self.params();
+            let body = self.method_body();
+            return Member::Constructor {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                params,
+                body,
+            };
+        }
+
+        // Destructor: `~this()`
+        if self.at(TokenKind::Tilde) && self.nth_kind(1) == TokenKind::Keyword(Keyword::This) {
+            self.bump(); // ~
+            self.bump(); // this
+            self.expect(TokenKind::LParen, "`(` after `~this`");
+            self.expect(TokenKind::RParen, "`)` after `~this(`");
+            let body = self.method_body();
+            return Member::Destructor {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                body,
+            };
+        }
+
+        // Otherwise: `Type Name …` — a field / method / property.
+        let ty = self.ty();
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected member name");
+            self.skip_to_member_boundary();
+            return Member::Error(self.finish(lo));
+        };
+
+        // Optional generic params on a method.
+        let generic_params = if self.at(TokenKind::Lt) {
+            self.generic_params()
+        } else {
+            Vec::new()
+        };
+
+        match self.kind() {
+            TokenKind::LParen => {
+                let params = self.params();
+                let constraints = self.where_clauses();
+                let body = self.method_body();
+                Member::Method {
+                    span: self.finish(lo),
+                    attributes,
+                    modifiers,
+                    return_ty: ty,
+                    name,
+                    generic_params,
+                    params,
+                    constraints,
+                    body,
+                }
+            }
+            TokenKind::LBrace => {
+                self.bump(); // {
+                let mut accessors = Vec::new();
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    let before = self.pos;
+                    accessors.push(self.accessor());
+                    if self.pos == before {
+                        self.bump();
+                    }
+                }
+                self.expect(TokenKind::RBrace, "`}` to close property body");
+                Member::Property {
+                    span: self.finish(lo),
+                    attributes,
+                    modifiers,
+                    ty,
+                    name,
+                    accessors,
+                }
+            }
+            _ => {
+                let init = if self.eat(TokenKind::Assign) {
+                    Some(self.expr())
+                } else {
+                    None
+                };
+                self.expect(TokenKind::Semicolon, "`;` after field");
+                Member::Field {
+                    span: self.finish(lo),
+                    attributes,
+                    modifiers,
+                    ty,
+                    name,
+                    init,
+                }
+            }
+        }
+    }
+
+    fn enum_case(&mut self, lo: u32, attributes: Vec<Attribute>) -> Member {
+        self.bump(); // case
+        let name = if self.at(TokenKind::Ident) {
+            self.bump().span
+        } else {
+            self.error("expected case name");
+            self.cur().span
+        };
+        let payload = if self.at(TokenKind::LParen) {
+            self.params()
+        } else {
+            Vec::new()
+        };
+        let value = if self.eat(TokenKind::Assign) {
+            Some(self.expr())
+        } else {
+            None
+        };
+        // Beef enum cases are terminated by `,`, `;`, or just the next `case`.
+        let _ = self.eat(TokenKind::Comma) || self.eat(TokenKind::Semicolon);
+        Member::EnumCase {
+            span: self.finish(lo),
+            attributes,
+            name,
+            payload,
+            value,
+        }
+    }
+
+    fn method_body(&mut self) -> MethodBody {
+        if self.at(TokenKind::LBrace) {
+            return MethodBody::Block(self.block());
+        }
+        if self.eat(TokenKind::FatArrow) {
+            let e = self.expr();
+            self.expect(TokenKind::Semicolon, "`;` after expression-bodied member");
+            return MethodBody::Expr(e);
+        }
+        self.expect(
+            TokenKind::Semicolon,
+            "`;` or `{ … }` or `=> expr;` for method body",
+        );
+        MethodBody::None
+    }
+
+    fn params(&mut self) -> Vec<Param> {
+        self.expect(TokenKind::LParen, "`(`");
+        let mut params = Vec::new();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            params.push(self.param());
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "`)`");
+        params
+    }
+
+    fn param(&mut self) -> Param {
+        let lo = self.start();
+        let attributes = self.attributes();
+        let modifier = self.peek_param_modifier().map(|m| {
+            let span = self.cur().span;
+            self.bump();
+            (m, span)
+        });
+        let ty = self.ty();
+        let name = if self.at(TokenKind::Ident) {
+            Some(self.bump().span)
+        } else {
+            None
+        };
+        let default = if self.eat(TokenKind::Assign) {
+            Some(self.expr())
+        } else {
+            None
+        };
+        Param {
+            span: self.finish(lo),
+            attributes,
+            modifier,
+            ty,
+            name,
+            default,
+        }
+    }
+
+    fn peek_param_modifier(&self) -> Option<ParamModifier> {
+        let TokenKind::Keyword(k) = self.kind() else {
+            return None;
+        };
+        Some(match k {
+            Keyword::Ref => ParamModifier::Ref,
+            Keyword::Out => ParamModifier::Out,
+            Keyword::Mut => ParamModifier::Mut,
+            Keyword::Params => ParamModifier::Params,
+            Keyword::In => ParamModifier::In,
+            Keyword::This => ParamModifier::This,
+            _ => return None,
+        })
+    }
+
+    fn accessor(&mut self) -> Accessor {
+        let lo = self.start();
+        let attributes = self.attributes();
+        let modifiers = self.modifiers();
+        let kind = if self.eat_ident_text("get") {
+            AccessorKind::Get
+        } else if self.eat_ident_text("set") {
+            AccessorKind::Set
+        } else {
+            self.error("expected `get` or `set`");
+            self.bump();
+            return Accessor {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                kind: AccessorKind::Get,
+                body: MethodBody::None,
+            };
+        };
+        let body = self.method_body();
+        Accessor {
+            span: self.finish(lo),
+            attributes,
+            modifiers,
+            kind,
+            body,
+        }
+    }
+
+    // ── recovery ────────────────────────────────────────────────────────
+
+    /// Skip to the next plausible item boundary on a top-level error: a
+    /// `;` (consume it) or `}` (leave it) at depth 0.
+    fn skip_to_item_boundary(&mut self) {
+        let mut depth = 0i32;
+        while !self.at(TokenKind::Eof) {
+            match self.kind() {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                    self.bump();
+                }
+                TokenKind::Semicolon if depth == 0 => {
+                    self.bump();
+                    return;
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Skip to the next plausible member boundary inside a type body:
+    /// `;` (consume) or `}` (leave) at depth 0.
+    fn skip_to_member_boundary(&mut self) {
+        self.skip_to_item_boundary();
+    }
 }
 
 /// Parse a single type reference from `src`.
@@ -1119,4 +1776,12 @@ pub fn parse_type(src: &str, file: FileId) -> (Type, Vec<Diagnostic>) {
         p.error("trailing tokens after type");
     }
     (t, p.diagnostics)
+}
+
+/// Parse a whole .bf compilation unit from `src` (the parser phase
+/// report behind `newbf-driver dump-ast`).
+pub fn parse_file(src: &str, file: FileId) -> (CompUnit, Vec<Diagnostic>) {
+    let mut p = Parser::new(src, file);
+    let unit = p.comp_unit();
+    (unit, p.diagnostics)
 }

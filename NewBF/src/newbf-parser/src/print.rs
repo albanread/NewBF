@@ -29,9 +29,34 @@ pub fn format_expr(src: &str, e: &Expr) -> String {
     p.out
 }
 
+/// Render a parsed compilation unit as an indented AST tree. This is the
+/// `dump-ast` report.
+pub fn format_ast(src: &str, unit: &CompUnit) -> String {
+    let mut p = Printer {
+        src,
+        out: String::new(),
+    };
+    p.line(0, "CompUnit");
+    for item in &unit.items {
+        p.item(item, 1);
+    }
+    p.out
+}
+
 struct Printer<'a> {
     src: &'a str,
     out: String,
+}
+
+fn mods_string(mods: &[(Modifier, Span)]) -> String {
+    let mut s = String::new();
+    for (i, (m, _)) in mods.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(m.as_str());
+    }
+    s
 }
 
 impl Printer<'_> {
@@ -208,6 +233,307 @@ impl Printer<'_> {
                 for e in elems {
                     self.ty(e, d + 1);
                 }
+            }
+        }
+    }
+
+    fn item(&mut self, item: &Item, d: usize) {
+        match item {
+            Item::Using {
+                attributes,
+                is_static,
+                alias,
+                target,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let head = match alias {
+                    Some(a) => format!(
+                        "Using{} alias={}",
+                        if *is_static { " static" } else { "" },
+                        self.txt(*a)
+                    ),
+                    None => format!("Using{}", if *is_static { " static" } else { "" }),
+                };
+                self.line(d, &head);
+                self.ty(target, d + 1);
+            }
+            Item::Namespace {
+                attributes,
+                path,
+                body,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let head = match body {
+                    Some(_) => "Namespace",
+                    None => "Namespace (file-scoped)",
+                };
+                self.line(d, head);
+                self.line(d + 1, "path:");
+                self.ty(path, d + 2);
+                if let Some(items) = body {
+                    self.line(d + 1, "items:");
+                    for it in items {
+                        self.item(it, d + 2);
+                    }
+                }
+            }
+            Item::Type(td) => self.type_decl(td, d),
+            Item::Error(_) => self.line(d, "Item:Error"),
+        }
+    }
+
+    fn type_decl(&mut self, td: &TypeDecl, d: usize) {
+        self.attrs(&td.attributes, d);
+        let mods = mods_string(&td.modifiers);
+        let head = format!(
+            "{kind}{mods} {name}",
+            kind = td.kind.as_str(),
+            mods = if mods.is_empty() {
+                String::new()
+            } else {
+                format!(" [{mods}]")
+            },
+            name = self.txt(td.name),
+        );
+        self.line(d, &head);
+        if !td.generic_params.is_empty() {
+            self.line(d + 1, "generics:");
+            for g in &td.generic_params {
+                self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+            }
+        }
+        if !td.bases.is_empty() {
+            self.line(d + 1, "bases:");
+            for b in &td.bases {
+                self.ty(b, d + 2);
+            }
+        }
+        if !td.constraints.is_empty() {
+            self.line(d + 1, "where:");
+            for w in &td.constraints {
+                self.line(d + 2, &format!("on {}:", self.txt(w.name)));
+                for c in &w.constraints {
+                    self.ty(c, d + 3);
+                }
+            }
+        }
+        if !td.members.is_empty() {
+            self.line(d + 1, "members:");
+            for m in &td.members {
+                self.member(m, d + 2);
+            }
+        }
+    }
+
+    fn attrs(&mut self, attrs: &[Attribute], d: usize) {
+        for a in attrs {
+            self.line(d, "Attribute");
+            self.ty(&a.name, d + 1);
+            if !a.args.is_empty() {
+                self.line(d + 1, "args:");
+                for e in &a.args {
+                    self.expr(e, d + 2);
+                }
+            }
+        }
+    }
+
+    fn member(&mut self, m: &Member, d: usize) {
+        match m {
+            Member::Field {
+                attributes,
+                modifiers,
+                ty,
+                name,
+                init,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("Field {}", self.txt(*name))
+                } else {
+                    format!("Field [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                self.line(d + 1, "ty:");
+                self.ty(ty, d + 2);
+                if let Some(e) = init {
+                    self.labeled_expr(d + 1, "init", e);
+                }
+            }
+            Member::Method {
+                attributes,
+                modifiers,
+                return_ty,
+                name,
+                generic_params,
+                params,
+                constraints,
+                body,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("Method {}", self.txt(*name))
+                } else {
+                    format!("Method [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                self.line(d + 1, "returns:");
+                self.ty(return_ty, d + 2);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+                if !constraints.is_empty() {
+                    self.line(d + 1, "where:");
+                    for w in constraints {
+                        self.line(d + 2, &format!("on {}:", self.txt(w.name)));
+                        for c in &w.constraints {
+                            self.ty(c, d + 3);
+                        }
+                    }
+                }
+                self.method_body(body, d + 1);
+            }
+            Member::Constructor {
+                attributes,
+                modifiers,
+                params,
+                body,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    "Constructor".to_string()
+                } else {
+                    format!("Constructor [{mods}]")
+                };
+                self.line(d, &head);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+                self.method_body(body, d + 1);
+            }
+            Member::Destructor {
+                attributes,
+                modifiers,
+                body,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    "Destructor".to_string()
+                } else {
+                    format!("Destructor [{mods}]")
+                };
+                self.line(d, &head);
+                self.method_body(body, d + 1);
+            }
+            Member::Property {
+                attributes,
+                modifiers,
+                ty,
+                name,
+                accessors,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("Property {}", self.txt(*name))
+                } else {
+                    format!("Property [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                self.line(d + 1, "ty:");
+                self.ty(ty, d + 2);
+                for a in accessors {
+                    self.accessor(a, d + 1);
+                }
+            }
+            Member::EnumCase {
+                attributes,
+                name,
+                payload,
+                value,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                self.line(d, &format!("EnumCase {}", self.txt(*name)));
+                if !payload.is_empty() {
+                    self.line(d + 1, "payload:");
+                    for p in payload {
+                        self.param(p, d + 2);
+                    }
+                }
+                if let Some(e) = value {
+                    self.labeled_expr(d + 1, "value", e);
+                }
+            }
+            Member::Nested(td) => self.type_decl(td, d),
+            Member::Error(_) => self.line(d, "Member:Error"),
+        }
+    }
+
+    fn param(&mut self, p: &Param, d: usize) {
+        self.attrs(&p.attributes, d);
+        let m = p.modifier.map_or("", |(m, _)| m.as_str());
+        let n = p
+            .name
+            .map_or("_".to_string(), |s| s.text(self.src).to_string());
+        let head = if m.is_empty() {
+            format!("Param {n}")
+        } else {
+            format!("Param {m} {n}")
+        };
+        self.line(d, &head);
+        self.line(d + 1, "ty:");
+        self.ty(&p.ty, d + 2);
+        if let Some(e) = &p.default {
+            self.labeled_expr(d + 1, "default", e);
+        }
+    }
+
+    fn accessor(&mut self, a: &Accessor, d: usize) {
+        self.attrs(&a.attributes, d);
+        let mods = mods_string(&a.modifiers);
+        let head = if mods.is_empty() {
+            format!("Accessor {}", a.kind.as_str())
+        } else {
+            format!("Accessor [{mods}] {}", a.kind.as_str())
+        };
+        self.line(d, &head);
+        self.method_body(&a.body, d + 1);
+    }
+
+    fn method_body(&mut self, body: &MethodBody, d: usize) {
+        match body {
+            MethodBody::None => self.line(d, "body: (none)"),
+            MethodBody::Block(s) => {
+                self.line(d, "body:");
+                self.stmt(s, d + 1);
+            }
+            MethodBody::Expr(e) => {
+                self.line(d, "body: => expr");
+                self.expr(e, d + 1);
             }
         }
     }

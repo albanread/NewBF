@@ -477,3 +477,306 @@ impl Type {
         }
     }
 }
+
+// ── declarations ────────────────────────────────────────────────────────
+
+/// A compilation unit — a single source file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompUnit {
+    pub span: Span,
+    pub items: Vec<Item>,
+}
+
+/// A top-level (or namespace-nested) item.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Item {
+    /// `using NS;` / `using static NS;` / `using A = NS.Type;`
+    Using {
+        span: Span,
+        attributes: Vec<Attribute>,
+        is_static: bool,
+        alias: Option<Span>,
+        target: Type,
+    },
+    /// `namespace A.B { items… }` or file-scoped `namespace A.B;`
+    Namespace {
+        span: Span,
+        attributes: Vec<Attribute>,
+        path: Type,
+        body: Option<Vec<Item>>,
+    },
+    /// A type declaration (class/struct/interface/enum/extension).
+    Type(TypeDecl),
+    /// Recovery placeholder for a malformed item.
+    Error(Span),
+}
+
+impl Item {
+    pub fn span(&self) -> Span {
+        match self {
+            Item::Using { span, .. } | Item::Namespace { span, .. } => *span,
+            Item::Type(t) => t.span,
+            Item::Error(s) => *s,
+        }
+    }
+}
+
+/// `[Attr]`, `[Attr(args)]`, or `[A, B(x)]` (multiple in one bracket).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Attribute {
+    pub span: Span,
+    pub name: Type,
+    pub args: Vec<Expr>,
+}
+
+/// A keyword modifier on a type or member.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Modifier {
+    Public,
+    Private,
+    Protected,
+    Internal,
+    Static,
+    Abstract,
+    Sealed,
+    Virtual,
+    Override,
+    Extern,
+    ReadOnly,
+    Const,
+    Mut,
+    New,
+    Inline,
+    Mixin,
+    Append,
+    Concrete,
+    Implicit,
+    Explicit,
+    Volatile,
+}
+
+impl Modifier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Modifier::Public => "public",
+            Modifier::Private => "private",
+            Modifier::Protected => "protected",
+            Modifier::Internal => "internal",
+            Modifier::Static => "static",
+            Modifier::Abstract => "abstract",
+            Modifier::Sealed => "sealed",
+            Modifier::Virtual => "virtual",
+            Modifier::Override => "override",
+            Modifier::Extern => "extern",
+            Modifier::ReadOnly => "readonly",
+            Modifier::Const => "const",
+            Modifier::Mut => "mut",
+            Modifier::New => "new",
+            Modifier::Inline => "inline",
+            Modifier::Mixin => "mixin",
+            Modifier::Append => "append",
+            Modifier::Concrete => "concrete",
+            Modifier::Implicit => "implicit",
+            Modifier::Explicit => "explicit",
+            Modifier::Volatile => "volatile",
+        }
+    }
+}
+
+/// A type declaration: class/struct/interface/enum/extension.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TypeDecl {
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    pub modifiers: Vec<(Modifier, Span)>,
+    pub kind: TypeKind,
+    pub name: Span,
+    pub generic_params: Vec<GenericParam>,
+    pub bases: Vec<Type>,
+    pub constraints: Vec<WhereClause>,
+    pub members: Vec<Member>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeKind {
+    Class,
+    Struct,
+    Interface,
+    Enum,
+    Extension,
+}
+
+impl TypeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeKind::Class => "class",
+            TypeKind::Struct => "struct",
+            TypeKind::Interface => "interface",
+            TypeKind::Enum => "enum",
+            TypeKind::Extension => "extension",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GenericParam {
+    pub span: Span,
+    pub name: Span,
+}
+
+/// `where T : Base, IFoo, new` — name + comma-separated constraint
+/// "types" (parsed as types but may semantically be `class`/`struct`/
+/// `new`/`delete` etc. ident-keywords).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WhereClause {
+    pub span: Span,
+    pub name: Span,
+    pub constraints: Vec<Type>,
+}
+
+/// A member of a type declaration.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Member {
+    /// `Type name [= init];` (single-name fields only for now).
+    Field {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        ty: Type,
+        name: Span,
+        init: Option<Expr>,
+    },
+    /// `Type name<G…>(params) where … { body }` — block or expression body.
+    Method {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        return_ty: Type,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        params: Vec<Param>,
+        constraints: Vec<WhereClause>,
+        body: MethodBody,
+    },
+    /// `this(params) { body }` (constructor).
+    Constructor {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        params: Vec<Param>,
+        body: MethodBody,
+    },
+    /// `~this() { body }` (destructor).
+    Destructor {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        body: MethodBody,
+    },
+    /// `Type name { get; set; }` / `Type name { get => …; set { … } }`.
+    Property {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        ty: Type,
+        name: Span,
+        accessors: Vec<Accessor>,
+    },
+    /// An enum payload-bearing case: `case Foo(int x) [= value];`.
+    EnumCase {
+        span: Span,
+        attributes: Vec<Attribute>,
+        name: Span,
+        payload: Vec<Param>,
+        value: Option<Expr>,
+    },
+    /// A nested type declaration.
+    Nested(TypeDecl),
+    /// Recovery placeholder for a malformed member.
+    Error(Span),
+}
+
+impl Member {
+    pub fn span(&self) -> Span {
+        match self {
+            Member::Field { span, .. }
+            | Member::Method { span, .. }
+            | Member::Constructor { span, .. }
+            | Member::Destructor { span, .. }
+            | Member::Property { span, .. }
+            | Member::EnumCase { span, .. } => *span,
+            Member::Nested(t) => t.span,
+            Member::Error(s) => *s,
+        }
+    }
+}
+
+/// What follows a method/constructor/accessor signature.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MethodBody {
+    /// `{ stmts… }`
+    Block(Stmt),
+    /// `=> expr;`
+    Expr(Expr),
+    /// `;` (interface signature, abstract, extern, …)
+    None,
+}
+
+/// A method or constructor parameter.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Param {
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    pub modifier: Option<(ParamModifier, Span)>,
+    pub ty: Type,
+    pub name: Option<Span>, // optional only for `this` / discards in patterns
+    pub default: Option<Expr>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParamModifier {
+    Ref,
+    Out,
+    Mut,
+    Params,
+    In,
+    This, // first-parameter `this` for extension methods
+}
+
+impl ParamModifier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParamModifier::Ref => "ref",
+            ParamModifier::Out => "out",
+            ParamModifier::Mut => "mut",
+            ParamModifier::Params => "params",
+            ParamModifier::In => "in",
+            ParamModifier::This => "this",
+        }
+    }
+}
+
+/// A property accessor: `get`/`set` (with optional modifiers, body).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Accessor {
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    pub modifiers: Vec<(Modifier, Span)>,
+    pub kind: AccessorKind,
+    pub body: MethodBody,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccessorKind {
+    Get,
+    Set,
+}
+
+impl AccessorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessorKind::Get => "get",
+            AccessorKind::Set => "set",
+        }
+    }
+}

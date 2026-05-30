@@ -43,6 +43,12 @@ enum Command {
         /// Path to a `.bf` source file (a statement fragment).
         input: String,
     },
+    /// Dump the parsed AST of a whole .bf file (the declaration-parser
+    /// phase report — using directives, namespaces, types, members).
+    DumpAst {
+        /// Path to a `.bf` source file.
+        input: String,
+    },
 }
 
 fn main() {
@@ -82,6 +88,22 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("dump-parse: cannot read {input}: {e}");
+                std::process::exit(1);
+            }
+        },
+        Some(Command::DumpAst { input }) => match std::fs::read_to_string(&input) {
+            Ok(src) => {
+                let (unit, diags) = newbf_parser::parse_file(&src, newbf_lexer::FileId(0));
+                print!("{}", newbf_parser::format_ast(&src, &unit));
+                for d in &diags {
+                    eprintln!("{}..{}: {}", d.span.lo, d.span.hi, d.message);
+                }
+                if !diags.is_empty() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("dump-ast: cannot read {input}: {e}");
                 std::process::exit(1);
             }
         },

@@ -14,9 +14,13 @@ mod ast;
 mod parser;
 mod print;
 
-pub use ast::{AssignOp, BinOp, Expr, PrefixKw, Stmt, SwitchArm, Type, TypeSeg, UnOp};
-pub use parser::{Diagnostic, parse_expr, parse_fragment, parse_type};
-pub use print::{format_expr, format_parse};
+pub use ast::{
+    Accessor, AccessorKind, AssignOp, Attribute, BinOp, CompUnit, Expr, GenericParam, Item, Member,
+    MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm, Type, TypeDecl,
+    TypeKind, TypeSeg, UnOp, WhereClause,
+};
+pub use parser::{Diagnostic, parse_expr, parse_file, parse_fragment, parse_type};
+pub use print::{format_ast, format_expr, format_parse};
 
 #[cfg(test)]
 mod tests {
@@ -630,6 +634,254 @@ mod tests {
         assert_eq!(ok("a < b + c"), "(< a (+ b c))");
         // even when `>` is followed by an ident, no generic commit
         assert_eq!(ok("x < y + z"), "(< x (+ y z))");
+    }
+
+    // ── declaration parser (whole files) ────────────────────────────────
+
+    fn ok_file(src: &str) -> CompUnit {
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(
+            diags.is_empty(),
+            "unexpected diagnostics for {src:?}:\n{diags:?}"
+        );
+        unit
+    }
+
+    #[test]
+    fn using_directive_simple() {
+        let unit = ok_file("using System;");
+        assert_eq!(unit.items.len(), 1);
+        match &unit.items[0] {
+            Item::Using {
+                is_static: false,
+                alias: None,
+                target,
+                ..
+            } => {
+                if let Type::Path { segments, .. } = target {
+                    assert_eq!(segments.len(), 1);
+                    assert_eq!(segments[0].name.text("using System;"), "System");
+                } else {
+                    panic!("expected path");
+                }
+            }
+            _ => panic!("expected Using"),
+        }
+    }
+
+    #[test]
+    fn using_static_and_alias() {
+        let src = "using static System.Math;\nusing Strs = System.Strings;\n";
+        let unit = ok_file(src);
+        assert_eq!(unit.items.len(), 2);
+        match &unit.items[0] {
+            Item::Using {
+                is_static: true,
+                alias: None,
+                ..
+            } => {}
+            other => panic!("expected `using static`, got {other:?}"),
+        }
+        match &unit.items[1] {
+            Item::Using {
+                is_static: false,
+                alias: Some(a),
+                ..
+            } => {
+                assert_eq!(a.text(src), "Strs");
+            }
+            other => panic!("expected aliased `using`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_block() {
+        let unit = ok_file("namespace A.B { }");
+        match &unit.items[0] {
+            Item::Namespace {
+                body: Some(items),
+                path,
+                ..
+            } => {
+                assert!(items.is_empty());
+                if let Type::Path { segments, .. } = path {
+                    assert_eq!(segments.len(), 2);
+                } else {
+                    panic!("expected path");
+                }
+            }
+            _ => panic!("expected namespace"),
+        }
+    }
+
+    #[test]
+    fn file_scoped_namespace() {
+        let unit = ok_file("namespace A.B;");
+        match &unit.items[0] {
+            Item::Namespace { body: None, .. } => {}
+            _ => panic!("expected file-scoped namespace"),
+        }
+    }
+
+    #[test]
+    fn empty_class() {
+        let unit = ok_file("public class Foo { }");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected type");
+        };
+        assert_eq!(td.kind, TypeKind::Class);
+        assert_eq!(td.name.text("public class Foo { }"), "Foo");
+        assert_eq!(td.modifiers.len(), 1);
+        assert_eq!(td.modifiers[0].0, Modifier::Public);
+        assert!(td.members.is_empty());
+    }
+
+    #[test]
+    fn class_with_field_method_ctor_dtor() {
+        let src = "
+class Foo {
+    public int x = 0;
+    public this(int n) { x = n; }
+    public ~this() { }
+    public int Square() { return x * x; }
+}
+";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected type");
+        };
+        assert_eq!(td.members.len(), 4);
+        assert!(matches!(td.members[0], Member::Field { .. }));
+        assert!(matches!(td.members[1], Member::Constructor { .. }));
+        assert!(matches!(td.members[2], Member::Destructor { .. }));
+        assert!(matches!(td.members[3], Member::Method { .. }));
+    }
+
+    #[test]
+    fn expression_bodied_method() {
+        let unit = ok_file("class C { public int Sq(int x) => x * x; }");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert!(matches!(
+            &td.members[0],
+            Member::Method {
+                body: MethodBody::Expr(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interface_method_has_none_body() {
+        let unit = ok_file("interface IFoo { int Bar(); }");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.kind, TypeKind::Interface);
+        assert!(matches!(
+            &td.members[0],
+            Member::Method {
+                body: MethodBody::None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn property_with_get_set() {
+        let src = "class C { public int X { get; set; } }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        let Member::Property { accessors, .. } = &td.members[0] else {
+            panic!("expected property")
+        };
+        assert_eq!(accessors.len(), 2);
+        assert_eq!(accessors[0].kind, AccessorKind::Get);
+        assert_eq!(accessors[1].kind, AccessorKind::Set);
+    }
+
+    #[test]
+    fn generic_type_with_where_constraint() {
+        let src = "class List<T> where T : class { }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.generic_params.len(), 1);
+        assert_eq!(td.generic_params[0].name.text(src), "T");
+        assert_eq!(td.constraints.len(), 1);
+        assert_eq!(td.constraints[0].name.text(src), "T");
+    }
+
+    #[test]
+    fn attributes_on_class_and_member() {
+        let src = "[CRepr] class Foo { [Inline] public int Bar() { return 0; } }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.attributes.len(), 1);
+        let Member::Method { attributes, .. } = &td.members[0] else {
+            panic!("method")
+        };
+        assert_eq!(attributes.len(), 1);
+    }
+
+    #[test]
+    fn enum_with_cases() {
+        let src = "enum Color { case Red, case Green = 2, case Blue }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.kind, TypeKind::Enum);
+        let cases: Vec<_> = td
+            .members
+            .iter()
+            .filter(|m| matches!(m, Member::EnumCase { .. }))
+            .collect();
+        assert_eq!(cases.len(), 3);
+    }
+
+    #[test]
+    fn class_with_bases() {
+        let src = "class Bar : Base, IFoo { }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.bases.len(), 2);
+    }
+
+    #[test]
+    fn whole_file_with_namespace_and_class() {
+        let src = "
+using System;
+namespace Demo {
+    public class Point {
+        public int x;
+        public int y;
+        public this(int x, int y) { this.x = x; this.y = y; }
+        public int LenSq() => x * x + y * y;
+    }
+}
+";
+        let unit = ok_file(src);
+        assert_eq!(unit.items.len(), 2);
+        let Item::Namespace {
+            body: Some(items), ..
+        } = &unit.items[1]
+        else {
+            panic!("expected namespace block");
+        };
+        let Item::Type(td) = &items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.name.text(src), "Point");
+        assert_eq!(td.members.len(), 4);
     }
 
     #[test]

@@ -161,17 +161,30 @@ parse whole real files.
       pointer/nullable/array composition; generic call vs. comparison
       disambiguation; typed locals vs. expr-stmts; switch.
 
-### Remaining (Sprint 04b)
-- [ ] Declaration parser: `using` directives, `namespace` (block + file-
-      scoped), top-level type decls (`class`/`struct`/`interface`/`enum`/
-      `extension`) with modifiers, attributes `[Attr]`, generic params +
-      `where`-constraints, base list, and members (fields, methods,
-      `this`/`~this`, properties).
-- [ ] `dump-ast` report + `newbf-driver dump-ast`.
-- [ ] Whole-file corpus parse gate over `corlib-slice` + `feature-suite`.
+### Delivered (Sprint 04b — declarations + dump-ast + corpus gate)
+- [x] Declaration parser: `using` (simple / `using static` / `using A =
+      B`), `namespace` (block + file-scoped), type decls (`class`/`struct`
+      /`interface`/`enum`/`extension`) with modifiers, attributes
+      `[Attr]` / `[A, B(x)]`, generic params + `where`-constraints, base
+      list, and members — fields, methods (block + expression body +
+      `;`-only), constructors `this(…)`, destructors `~this()`, properties
+      with `get`/`set` accessors, nested types, enum cases with payloads
+      and values. Error recovery at item/member boundaries.
+- [x] `dump-ast` report (`format_ast`) + `newbf-driver dump-ast`.
+- [x] Whole-file corpus parse gate: parses every `.bf` in `corlib-slice`
+      (89) and `feature-suite/src/` (70). Hard gate: **no panics on 152
+      real Beef files**. Soft gate: ≥5% clean parses; current run reports
+      ~11% clean. Coverage grows incrementally — Beef-specific
+      indexers, operators, mixins, attribute targets, and `get/set` body
+      forms are open follow-on work that the no-panic gate keeps honest.
+- [x] +14 declaration tests on top of Sprint 04a, now 44 parser unit
+      tests + corpus + lexer suites, all green under build/clippy
+      `-D warnings`/fmt/test.
 
 ### Demo
-`newbf-driver dump-ast beef-tests/samples/point.bf` (lands with 04b).
+`cargo run -p newbf-driver -- dump-ast beef-tests/samples/hello.bf`
+emits a clean `CompUnit` → `Using` → `Namespace (file-scoped)` → `class
+Program` → `Method [public static] Main` tree.
 
 ---
 
