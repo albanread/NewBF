@@ -645,7 +645,15 @@ impl<'a> Parser<'a> {
         self.bump(); // {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let before = self.pos;
-            let _ = self.expr();
+            // Indexed collection-initializer entry: `[key] = value`.
+            if self.at(TokenKind::LBracket) {
+                self.skip_balanced(TokenKind::LBracket, TokenKind::RBracket);
+                if self.eat(TokenKind::Assign) {
+                    let _ = self.expr();
+                }
+            } else {
+                let _ = self.expr();
+            }
             if !self.eat(TokenKind::Comma) {
                 break;
             }
@@ -1282,6 +1290,7 @@ impl<'a> Parser<'a> {
                         | Keyword::Comptype
                         | Keyword::Decltype
                         | Keyword::RetType
+                        | Keyword::AllocType
                 )
         ) {
             return None;
@@ -1368,6 +1377,7 @@ impl<'a> Parser<'a> {
                         | Keyword::Comptype
                         | Keyword::Decltype
                         | Keyword::RetType
+                        | Keyword::AllocType
                 )
         ) {
             return None;
@@ -1844,13 +1854,17 @@ impl<'a> Parser<'a> {
             // placeholder for now.
             TokenKind::Keyword(Keyword::Comptype)
             | TokenKind::Keyword(Keyword::Decltype)
-            | TokenKind::Keyword(Keyword::RetType) => {
+            | TokenKind::Keyword(Keyword::RetType)
+            | TokenKind::Keyword(Keyword::AllocType) => {
                 self.bump();
-                self.expect(TokenKind::LParen, "`(` after comptype/decltype/rettype");
+                self.expect(
+                    TokenKind::LParen,
+                    "`(` after comptype/decltype/rettype/alloctype",
+                );
                 let _e = self.expr();
                 self.expect(
                     TokenKind::RParen,
-                    "`)` after comptype/decltype/rettype argument",
+                    "`)` after comptype/decltype/rettype/alloctype argument",
                 );
                 Type::Var(self.finish(lo))
             }
@@ -2525,11 +2539,30 @@ impl<'a> Parser<'a> {
         while self.at_kw(Keyword::Where) {
             let lo = self.start();
             self.bump(); // where
-            let name = if self.at(TokenKind::Ident) {
+            // The constrained entity is usually a type-parameter name, but
+            // can be a type expression: `where alloctype(T) : delete`.
+            // Consume everything up to the `:` as the name span.
+            let name = if self.at(TokenKind::Ident) && matches!(self.nth_kind(1), TokenKind::Colon)
+            {
                 self.bump().span
             } else {
-                self.error("expected type parameter name after `where`");
-                self.cur().span
+                let name_lo = self.cur().span.lo;
+                let mut depth = 0i32;
+                loop {
+                    if self.at(TokenKind::Eof) || self.at(TokenKind::LBrace) {
+                        break;
+                    }
+                    if depth == 0 && self.at(TokenKind::Colon) {
+                        break;
+                    }
+                    match self.kind() {
+                        TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                        TokenKind::RParen | TokenKind::RBracket => depth -= 1,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+                Span::new(self.file, name_lo, self.toks[self.pos - 1].span.hi)
             };
             self.expect(TokenKind::Colon, "`:` after `where T`");
             let mut constraints = Vec::new();
@@ -2755,11 +2788,19 @@ impl<'a> Parser<'a> {
             };
         }
 
-        // Constructor: `this(...)` or paren-less `this { … }`.
+        // Constructor: `this(...)`, generic `this<T>(...)`, or paren-less
+        // `this { … }`.
         if self.at_kw(Keyword::This)
-            && matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::LBrace)
+            && matches!(
+                self.nth_kind(1),
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::Lt
+            )
         {
             self.bump(); // this
+            // Optional generic parameters: `this<T3>(…)`.
+            if self.at(TokenKind::Lt) {
+                let _ = self.generic_params();
+            }
             let params = if self.at(TokenKind::LParen) {
                 self.params()
             } else {
@@ -2776,6 +2817,8 @@ impl<'a> Parser<'a> {
                 let _ = self.expr();
                 self.suppress_init = prev;
             }
+            // Optional `where` constraints on a generic constructor.
+            let _ = self.where_clauses();
             let body = self.method_body();
             return Member::Constructor {
                 span: self.finish(lo),
