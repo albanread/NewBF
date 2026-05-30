@@ -137,24 +137,41 @@ parse as comparisons until then). NewBF also folds Beef's raw-tree →
 
 ---
 
-## Sprint 04 — Declarations + AST reduction
-**Goal:** Parse top-level declarations and reduce the parse tree to an AST.
+## Sprint 04 — Types, deferrals, and declarations
+**Goal:** Land the type grammar (the keystone that unblocks everything
+else), the Sprint-03 deferrals, and a declaration parser strong enough to
+parse whole real files.
 **Length:** 2 weeks · **Phase:** 1
 
-### Deliverables
-- [ ] Declaration parsing: `namespace`, `using`, `class`/`struct`/
-      `interface`/`enum`, fields, methods, properties, constructors
-      (`this`)/destructors (`~this`), attributes, generic parameter lists
-      + constraints.
-- [ ] Reduced AST (`newbf-parser::ast`) with spans throughout.
-- [ ] `dump-ast` report.
+### Delivered (Sprint 04a — the type-grammar core)
+- [x] **Type AST + parser**: qualified paths with per-segment generic
+      args, postfix suffixes (`*` pointer, `?` nullable, `[]`/`[,]`
+      array, `[N]` sized), tuple types, `var`. Handles `List<List<int>>`
+      via in-place `>>`→`>` splitting with rollback.
+- [x] **Generic-argument disambiguation in expressions**: speculative
+      parse + Roslyn-style follow-set (`Foo<T>(x)` → `Generic` + `Call`;
+      `a < b > c` stays comparisons). Speculation rolls back any `>>`
+      splits.
+- [x] **Typed locals**: `int x = 5;`, `List<int> xs;`, `int* p;` — by
+      speculative `type Ident (=|;|,)` lookahead; `a.b = c;` and `Foo();`
+      remain expression statements.
+- [x] **`switch` statement** with `case`/`default` arms (pattern as expr;
+      richer patterns later).
+- [x] Tests: 12 new tests covering type forms incl. nested generics,
+      pointer/nullable/array composition; generic call vs. comparison
+      disambiguation; typed locals vs. expr-stmts; switch.
 
-### Acceptance criteria
-- The curated corlib subset reduces to a stable AST; `dump-ast`
-  schema-stable.
+### Remaining (Sprint 04b)
+- [ ] Declaration parser: `using` directives, `namespace` (block + file-
+      scoped), top-level type decls (`class`/`struct`/`interface`/`enum`/
+      `extension`) with modifiers, attributes `[Attr]`, generic params +
+      `where`-constraints, base list, and members (fields, methods,
+      `this`/`~this`, properties).
+- [ ] `dump-ast` report + `newbf-driver dump-ast`.
+- [ ] Whole-file corpus parse gate over `corlib-slice` + `feature-suite`.
 
 ### Demo
-`newbf-driver dump-ast beef-tests/samples/point.bf`.
+`newbf-driver dump-ast beef-tests/samples/point.bf` (lands with 04b).
 
 ---
 

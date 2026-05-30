@@ -14,8 +14,8 @@ mod ast;
 mod parser;
 mod print;
 
-pub use ast::{AssignOp, BinOp, Expr, PrefixKw, Stmt, UnOp};
-pub use parser::{Diagnostic, parse_expr, parse_fragment};
+pub use ast::{AssignOp, BinOp, Expr, PrefixKw, Stmt, SwitchArm, Type, TypeSeg, UnOp};
+pub use parser::{Diagnostic, parse_expr, parse_fragment, parse_type};
 pub use print::{format_expr, format_parse};
 
 #[cfg(test)]
@@ -107,6 +107,64 @@ mod tests {
                 format!("({} {} {})", dot, sx(src, base), name.text(src))
             }
             Expr::Prefix { kw, operand, .. } => format!("({} {})", kw.as_str(), sx(src, operand)),
+            Expr::Generic { base, args, .. } => {
+                let mut s = format!("(generic {}", sx(src, base));
+                for a in args {
+                    s.push(' ');
+                    s.push_str(&sxt(src, a));
+                }
+                s.push(')');
+                s
+            }
+        }
+    }
+
+    /// Compact s-expression of a type.
+    fn sxt(src: &str, t: &Type) -> String {
+        match t {
+            Type::Var(_) => "var".into(),
+            Type::Error(_) => "type-error".into(),
+            Type::Path { segments, .. } => {
+                let mut s = String::new();
+                for (i, seg) in segments.iter().enumerate() {
+                    if i > 0 {
+                        s.push('.');
+                    }
+                    s.push_str(seg.name.text(src));
+                    if !seg.args.is_empty() {
+                        s.push('<');
+                        for (j, a) in seg.args.iter().enumerate() {
+                            if j > 0 {
+                                s.push(',');
+                            }
+                            s.push_str(&sxt(src, a));
+                        }
+                        s.push('>');
+                    }
+                }
+                s
+            }
+            Type::Pointer { inner, .. } => format!("(* {})", sxt(src, inner)),
+            Type::Nullable { inner, .. } => format!("(? {})", sxt(src, inner)),
+            Type::Array { inner, rank, .. } => {
+                if *rank == 1 {
+                    format!("(arr {})", sxt(src, inner))
+                } else {
+                    format!("(arr{} {})", rank, sxt(src, inner))
+                }
+            }
+            Type::Sized { inner, size, .. } => {
+                format!("(arr[{}] {})", sx(src, size), sxt(src, inner))
+            }
+            Type::Tuple { elems, .. } => {
+                let mut s = String::from("(tup");
+                for e in elems {
+                    s.push(' ');
+                    s.push_str(&sxt(src, e));
+                }
+                s.push(')');
+                s
+            }
         }
     }
 
@@ -176,6 +234,29 @@ mod tests {
             Stmt::Break { .. } => "(break)".into(),
             Stmt::Continue { .. } => "(continue)".into(),
             Stmt::Defer { body, .. } => format!("(defer {})", sxs(src, body)),
+            Stmt::Switch {
+                scrutinee, arms, ..
+            } => {
+                let mut s = format!("(switch {}", sx(src, scrutinee));
+                for arm in arms {
+                    s.push(' ');
+                    s.push_str(match &arm.pattern {
+                        Some(_) => "(case",
+                        None => "(default",
+                    });
+                    if let Some(p) = &arm.pattern {
+                        s.push(' ');
+                        s.push_str(&sx(src, p));
+                    }
+                    for st in &arm.body {
+                        s.push(' ');
+                        s.push_str(&sxs(src, st));
+                    }
+                    s.push(')');
+                }
+                s.push(')');
+                s
+            }
         }
     }
 
@@ -379,6 +460,176 @@ mod tests {
         // A broken statement fragment must terminate and diagnose.
         let (_stmts, diags) = parse_fragment("if ( while )) for {{{", FileId(0));
         assert!(!diags.is_empty());
+    }
+
+    // ── type parser ─────────────────────────────────────────────────────
+
+    fn ok_type(src: &str) -> String {
+        let (t, diags) = parse_type(src, FileId(0));
+        assert!(
+            diags.is_empty(),
+            "unexpected diagnostics for {src:?}: {diags:?}"
+        );
+        sxt(src, &t)
+    }
+
+    #[test]
+    fn simple_path_types() {
+        assert_eq!(ok_type("int"), "int");
+        assert_eq!(ok_type("System.String"), "System.String");
+        assert_eq!(ok_type("var"), "var");
+    }
+
+    #[test]
+    fn generic_types() {
+        assert_eq!(ok_type("List<int>"), "List<int>");
+        assert_eq!(ok_type("Dictionary<K, V>"), "Dictionary<K,V>");
+        assert_eq!(ok_type("Outer<T>.Inner"), "Outer<T>.Inner");
+        // Nested generics close cleanly even though `>>` is one token.
+        assert_eq!(ok_type("List<List<int>>"), "List<List<int>>");
+        assert_eq!(
+            ok_type("Dictionary<string, List<int>>"),
+            "Dictionary<string,List<int>>"
+        );
+    }
+
+    #[test]
+    fn pointer_nullable_array_sized_compose() {
+        assert_eq!(ok_type("int*"), "(* int)");
+        assert_eq!(ok_type("int**"), "(* (* int))");
+        assert_eq!(ok_type("T?"), "(? T)");
+        assert_eq!(ok_type("int[]"), "(arr int)");
+        assert_eq!(ok_type("int[,]"), "(arr2 int)");
+        assert_eq!(ok_type("int[,,]"), "(arr3 int)");
+        assert_eq!(ok_type("uint8[16]"), "(arr[16] uint8)");
+        // composition reads left-to-right (innermost first)
+        assert_eq!(ok_type("int*[]"), "(arr (* int))");
+        assert_eq!(ok_type("List<int>?"), "(? List<int>)");
+    }
+
+    #[test]
+    fn tuple_types() {
+        assert_eq!(ok_type("(int, int)"), "(tup int int)");
+        assert_eq!(ok_type("(A, B, C<T>)"), "(tup A B C<T>)");
+    }
+
+    #[test]
+    fn type_node_spans_cover_the_source() {
+        let src = "List<int>?";
+        let (t, _) = parse_type(src, FileId(0));
+        assert_eq!(t.span().text(src), "List<int>?");
+        if let Type::Nullable { inner, .. } = &t {
+            assert_eq!(inner.span().text(src), "List<int>");
+        } else {
+            panic!("expected outer Nullable");
+        }
+    }
+
+    // ── typed locals ────────────────────────────────────────────────────
+
+    #[test]
+    fn typed_locals_with_simple_types() {
+        // `int x = 5;` — typed local, NOT an expression statement.
+        let (stmts, diags) = parse_fragment("int x = 5;", FileId(0));
+        assert!(diags.is_empty(), "{diags:?}");
+        match &stmts[0] {
+            Stmt::Local {
+                is_let: false,
+                ty: Some(t),
+                name,
+                init: Some(_),
+                ..
+            } => {
+                assert_eq!(sxt("int x = 5;", t), "int");
+                assert_eq!(name.text("int x = 5;"), "x");
+            }
+            other => panic!("expected typed local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_locals_with_generics_and_pointers() {
+        let src = "List<int> xs = create();";
+        let (stmts, diags) = parse_fragment(src, FileId(0));
+        assert!(diags.is_empty(), "{diags:?}");
+        let Stmt::Local { ty: Some(t), .. } = &stmts[0] else {
+            panic!("expected typed local");
+        };
+        assert_eq!(sxt(src, t), "List<int>");
+
+        let src2 = "int* p;";
+        let (stmts2, diags2) = parse_fragment(src2, FileId(0));
+        assert!(diags2.is_empty(), "{diags2:?}");
+        let Stmt::Local {
+            ty: Some(t),
+            init: None,
+            ..
+        } = &stmts2[0]
+        else {
+            panic!("expected typed local with no init");
+        };
+        assert_eq!(sxt(src2, t), "(* int)");
+    }
+
+    #[test]
+    fn expression_statements_arent_misparsed_as_typed_locals() {
+        // `a.b = c;` is assignment, not a typed local.
+        assert_eq!(ok_stmt("a.b = c;"), "(expr (= (. a b) c))");
+        // `Foo();` is a call, not a typed local.
+        assert_eq!(ok_stmt("Foo();"), "(expr (call Foo))");
+        // `x++;` postfix expression statement.
+        assert_eq!(ok_stmt("x++;"), "(expr (post++ x))");
+    }
+
+    // ── switch statement ────────────────────────────────────────────────
+
+    #[test]
+    fn switch_with_cases_and_default() {
+        let s = ok_stmt("switch (x) { case 1: a(); case 2: b(); default: c(); }");
+        assert!(s.contains("(switch x"), "got {s}");
+        assert!(s.contains("(case 1"), "got {s}");
+        assert!(s.contains("(case 2"), "got {s}");
+        assert!(s.contains("(default"), "got {s}");
+    }
+
+    #[test]
+    fn switch_arms_can_have_multiple_statements() {
+        let src = "switch (e) { case 0: a(); b(); break; default: return; }";
+        let (stmts, diags) = parse_fragment(src, FileId(0));
+        assert!(diags.is_empty(), "{diags:?}");
+        let Stmt::Switch { arms, .. } = &stmts[0] else {
+            panic!("expected switch");
+        };
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].body.len(), 3); // a(); b(); break;
+        assert!(arms[1].pattern.is_none());
+    }
+
+    // ── generic-arg disambiguation in expressions ───────────────────────
+
+    #[test]
+    fn generic_calls_disambiguate_against_comparisons() {
+        // generic call: `<T>` followed by `(`  →  Generic + Call
+        assert_eq!(ok("Foo<T>(x)"), "(call (generic Foo T) x)");
+        assert_eq!(
+            ok("Foo<int, string>(x, y)"),
+            "(call (generic Foo int string) x y)"
+        );
+        assert_eq!(ok("Foo<List<int>>(x)"), "(call (generic Foo List<int>) x)");
+        // generic member chain: `Foo<T>.Bar`
+        assert_eq!(ok("Foo<T>.Bar"), "(. (generic Foo T) Bar)");
+        // generic without trailing call/member is fine if EOF or `;`/`,`
+        assert_eq!(ok("Foo<T>"), "(generic Foo T)");
+    }
+
+    #[test]
+    fn comparisons_are_not_misparsed_as_generics() {
+        // pure comparisons stay comparisons (follow-token isn't generic-y)
+        assert_eq!(ok("a < b"), "(< a b)");
+        assert_eq!(ok("a < b > c"), "(> (< a b) c)");
+        assert_eq!(ok("a < b + c"), "(< a (+ b c))");
+        // even when `>` is followed by an ident, no generic commit
+        assert_eq!(ok("x < y + z"), "(< x (+ y z))");
     }
 
     #[test]

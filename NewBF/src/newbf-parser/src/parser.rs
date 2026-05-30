@@ -50,6 +50,17 @@ struct Parser {
     file: FileId,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// History of `>>`→`>` mutations made by [`Parser::close_gt`], so
+    /// speculative parses (generic-arg disambiguation) can roll them back.
+    splits: Vec<(usize, Token)>,
+}
+
+/// Snapshot of parser state used by speculative parses.
+#[derive(Clone, Copy)]
+struct Save {
+    pos: usize,
+    diag_len: usize,
+    splits_len: usize,
 }
 
 impl Parser {
@@ -63,7 +74,25 @@ impl Parser {
             file,
             pos: 0,
             diagnostics: Vec::new(),
+            splits: Vec::new(),
         }
+    }
+
+    fn save(&self) -> Save {
+        Save {
+            pos: self.pos,
+            diag_len: self.diagnostics.len(),
+            splits_len: self.splits.len(),
+        }
+    }
+
+    fn restore(&mut self, s: Save) {
+        while self.splits.len() > s.splits_len {
+            let (idx, original) = self.splits.pop().unwrap();
+            self.toks[idx] = original;
+        }
+        self.pos = s.pos;
+        self.diagnostics.truncate(s.diag_len);
     }
 
     // ── cursor ──────────────────────────────────────────────────────────
@@ -315,10 +344,69 @@ impl Parser {
                         operand: Box::new(e),
                     };
                 }
+                TokenKind::Lt if Self::can_be_generic_base(&e) => {
+                    if let Some(generic) = self.try_generic(&e, lo) {
+                        e = generic;
+                    } else {
+                        break; // not a generic — let the binary loop handle `<`
+                    }
+                }
                 _ => break,
             }
         }
         e
+    }
+
+    /// Only `Ident`, `Member`, and `Generic` (chained) can sensibly be
+    /// the base of a generic-arg instantiation.
+    fn can_be_generic_base(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Generic { .. }
+        )
+    }
+
+    /// Speculatively parse `<typelist>`; commit only if the token after
+    /// `>` is in the generic-follow set. On failure, restore parser
+    /// state (including any `>>`-splits).
+    fn try_generic(&mut self, base: &Expr, lo: u32) -> Option<Expr> {
+        let save = self.save();
+        let args = self.type_args();
+        if self.diagnostics.len() > save.diag_len || !Self::is_generic_follow(self.kind()) {
+            self.restore(save);
+            return None;
+        }
+        Some(Expr::Generic {
+            span: self.finish(lo),
+            base: Box::new(base.clone()),
+            args,
+        })
+    }
+
+    /// The token kinds that can legitimately follow a generic-arg list in
+    /// expression position. Anything else means the `<…>` was actually a
+    /// pair of comparisons. (Standard Roslyn-style heuristic, trimmed.)
+    fn is_generic_follow(k: TokenKind) -> bool {
+        matches!(
+            k,
+            TokenKind::LParen
+                | TokenKind::RParen
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::Dot
+                | TokenKind::QuestionDot
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::Colon
+                | TokenKind::Question
+                | TokenKind::Assign
+                | TokenKind::EqEq
+                | TokenKind::NotEq
+                | TokenKind::FatArrow
+                | TokenKind::Eof
+        )
     }
 
     fn arg_list(&mut self, close: TokenKind) -> Vec<Expr> {
@@ -534,7 +622,102 @@ impl Parser {
             TokenKind::Keyword(Keyword::Continue) => self.break_continue(false),
             TokenKind::Keyword(Keyword::Defer) => self.defer_stmt(),
             TokenKind::Keyword(Keyword::Var) | TokenKind::Keyword(Keyword::Let) => self.local(true),
-            _ => self.expr_stmt(),
+            TokenKind::Keyword(Keyword::Switch) => self.switch_stmt(),
+            _ => {
+                if let Some(s) = self.try_typed_local() {
+                    s
+                } else {
+                    self.expr_stmt()
+                }
+            }
+        }
+    }
+
+    /// Speculatively parse a typed local declaration `Type name [= init];`.
+    /// Returns `None` (restoring state) if the lookahead doesn't fit.
+    fn try_typed_local(&mut self) -> Option<Stmt> {
+        // Only attempt if the current token could plausibly start a type.
+        if !matches!(
+            self.kind(),
+            TokenKind::Ident | TokenKind::LParen | TokenKind::Keyword(Keyword::Var)
+        ) {
+            return None;
+        }
+        let lo = self.start();
+        let save = self.save();
+        let ty = self.ty();
+        // Demand: no errors, current is Ident, next is `=`/`;`/`,`.
+        if self.diagnostics.len() > save.diag_len || !self.at(TokenKind::Ident) {
+            self.restore(save);
+            return None;
+        }
+        let next = self.nth_kind(1);
+        if !matches!(
+            next,
+            TokenKind::Assign | TokenKind::Semicolon | TokenKind::Comma
+        ) {
+            self.restore(save);
+            return None;
+        }
+        let name = self.bump().span;
+        let init = if self.eat(TokenKind::Assign) {
+            Some(self.expr())
+        } else {
+            None
+        };
+        self.expect(TokenKind::Semicolon, "`;` after local variable");
+        Some(Stmt::Local {
+            span: self.finish(lo),
+            is_let: false,
+            ty: Some(ty),
+            name,
+            init,
+        })
+    }
+
+    fn switch_stmt(&mut self) -> Stmt {
+        let lo = self.start();
+        self.bump(); // switch
+        self.expect(TokenKind::LParen, "`(` after `switch`");
+        let scrutinee = self.expr();
+        self.expect(TokenKind::RParen, "`)` after switch scrutinee");
+        self.expect(TokenKind::LBrace, "`{` to open switch body");
+        let mut arms = Vec::new();
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            let arm_lo = self.start();
+            let pattern = if self.eat_kw(Keyword::Case) {
+                Some(self.expr())
+            } else if self.eat_kw(Keyword::Default) {
+                None
+            } else {
+                self.error("expected `case` or `default`");
+                self.bump(); // safety: guarantee progress
+                continue;
+            };
+            self.expect(TokenKind::Colon, "`:` after case/default label");
+            let mut body = Vec::new();
+            while !self.at(TokenKind::RBrace)
+                && !self.at_kw(Keyword::Case)
+                && !self.at_kw(Keyword::Default)
+                && !self.at(TokenKind::Eof)
+            {
+                let before = self.pos;
+                body.push(self.stmt());
+                if self.pos == before {
+                    self.bump();
+                }
+            }
+            arms.push(SwitchArm {
+                span: self.finish(arm_lo),
+                pattern,
+                body,
+            });
+        }
+        self.expect(TokenKind::RBrace, "`}` to close switch");
+        Stmt::Switch {
+            span: self.finish(lo),
+            scrutinee,
+            arms,
         }
     }
 
@@ -739,6 +922,7 @@ impl Parser {
         Stmt::Local {
             span: self.finish(lo),
             is_let,
+            ty: None,
             name,
             init,
         }
@@ -753,4 +937,186 @@ impl Parser {
             expr,
         }
     }
+
+    // ── types ───────────────────────────────────────────────────────────
+
+    /// Parse a type reference.
+    fn ty(&mut self) -> Type {
+        let lo = self.start();
+        let base = match self.kind() {
+            TokenKind::LParen => self.tuple_type(lo),
+            TokenKind::Keyword(Keyword::Var) => {
+                let s = self.cur().span;
+                self.bump();
+                Type::Var(s)
+            }
+            TokenKind::Ident => self.path_type(lo),
+            _ => {
+                self.error("expected a type");
+                self.bump();
+                Type::Error(self.finish(lo))
+            }
+        };
+        self.type_suffixes(base)
+    }
+
+    fn path_type(&mut self, lo: u32) -> Type {
+        let mut segments = Vec::new();
+        loop {
+            if !self.at(TokenKind::Ident) {
+                self.error("expected identifier in type path");
+                break;
+            }
+            let name = self.bump().span;
+            let args = if self.at(TokenKind::Lt) {
+                self.type_args()
+            } else {
+                Vec::new()
+            };
+            segments.push(TypeSeg { name, args });
+            // Only descend on `.ident` (avoid swallowing trailing dots).
+            if self.at(TokenKind::Dot) && self.nth_kind(1) == TokenKind::Ident {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if segments.is_empty() {
+            return Type::Error(self.finish(lo));
+        }
+        Type::Path {
+            span: self.finish(lo),
+            segments,
+        }
+    }
+
+    /// Parse `<T1, T2, …>` — consumes the `<` and the closing `>`,
+    /// splitting a `>>` token when it closes nested generics.
+    fn type_args(&mut self) -> Vec<Type> {
+        debug_assert!(self.at(TokenKind::Lt));
+        self.bump(); // <
+        let mut args = Vec::new();
+        if !self.at(TokenKind::Gt) && !self.at(TokenKind::Shr) {
+            loop {
+                let before = self.pos;
+                args.push(self.ty());
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                if self.pos == before {
+                    break;
+                }
+            }
+        }
+        self.close_gt();
+        args
+    }
+
+    /// Consume a single `>` close, splitting an adjacent `>>` (Shr) into
+    /// two halves so `List<List<int>>` closes both generics correctly.
+    fn close_gt(&mut self) -> bool {
+        if self.at(TokenKind::Gt) {
+            self.bump();
+            return true;
+        }
+        if self.at(TokenKind::Shr) {
+            let tok = self.toks[self.pos];
+            let half = Span::new(tok.span.file, tok.span.lo + 1, tok.span.hi);
+            // Replace `>>` with the remaining `>`; we've "consumed" the
+            // left half. Record the mutation so `restore` can undo it.
+            self.splits.push((self.pos, tok));
+            self.toks[self.pos] = Token {
+                kind: TokenKind::Gt,
+                span: half,
+            };
+            return true;
+        }
+        self.error("expected `>` to close generic arguments");
+        false
+    }
+
+    /// Parse trailing type modifiers: `*`, `?`, `[]`/`[,]`, `[N]`.
+    fn type_suffixes(&mut self, mut t: Type) -> Type {
+        let lo = t.span().lo;
+        loop {
+            t = match self.kind() {
+                TokenKind::Star => {
+                    self.bump();
+                    Type::Pointer {
+                        span: self.finish(lo),
+                        inner: Box::new(t),
+                    }
+                }
+                TokenKind::Question => {
+                    self.bump();
+                    Type::Nullable {
+                        span: self.finish(lo),
+                        inner: Box::new(t),
+                    }
+                }
+                TokenKind::LBracket => {
+                    self.bump();
+                    if self.at(TokenKind::RBracket) {
+                        self.bump();
+                        Type::Array {
+                            span: self.finish(lo),
+                            inner: Box::new(t),
+                            rank: 1,
+                        }
+                    } else if self.at(TokenKind::Comma) {
+                        let mut rank = 1u32;
+                        while self.eat(TokenKind::Comma) {
+                            rank += 1;
+                        }
+                        self.expect(TokenKind::RBracket, "`]` to close array type");
+                        Type::Array {
+                            span: self.finish(lo),
+                            inner: Box::new(t),
+                            rank,
+                        }
+                    } else {
+                        let size = Box::new(self.expr());
+                        self.expect(TokenKind::RBracket, "`]` to close sized-array");
+                        Type::Sized {
+                            span: self.finish(lo),
+                            inner: Box::new(t),
+                            size,
+                        }
+                    }
+                }
+                _ => break,
+            };
+        }
+        t
+    }
+
+    fn tuple_type(&mut self, lo: u32) -> Type {
+        self.bump(); // (
+        let mut elems = Vec::new();
+        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+            let before = self.pos;
+            elems.push(self.ty());
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, "`)` to close tuple type");
+        Type::Tuple {
+            span: self.finish(lo),
+            elems,
+        }
+    }
+}
+
+/// Parse a single type reference from `src`.
+pub fn parse_type(src: &str, file: FileId) -> (Type, Vec<Diagnostic>) {
+    let mut p = Parser::new(src, file);
+    let t = p.ty();
+    if !p.at(TokenKind::Eof) {
+        p.error("trailing tokens after type");
+    }
+    (t, p.diagnostics)
 }

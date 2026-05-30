@@ -151,6 +151,64 @@ impl Printer<'_> {
                 self.line(d, &format!("Prefix {:?}{q}", kw.as_str()));
                 self.expr(operand, d + 1);
             }
+            Expr::Generic { base, args, .. } => {
+                self.line(d, "Generic");
+                self.labeled_expr(d + 1, "base", base);
+                self.line(d + 1, "args:");
+                for a in args {
+                    self.ty(a, d + 2);
+                }
+            }
+        }
+    }
+
+    fn ty(&mut self, t: &Type, d: usize) {
+        match t {
+            Type::Var(_) => self.line(d, "TyVar"),
+            Type::Error(_) => self.line(d, "TyError"),
+            Type::Path { segments, .. } => {
+                let mut head = String::from("TyPath");
+                for (i, seg) in segments.iter().enumerate() {
+                    if i > 0 {
+                        head.push('.');
+                    } else {
+                        head.push(' ');
+                    }
+                    head.push_str(seg.name.text(self.src));
+                }
+                self.line(d, &head);
+                for seg in segments {
+                    if !seg.args.is_empty() {
+                        self.line(d + 1, &format!("args of {}:", seg.name.text(self.src)));
+                        for a in &seg.args {
+                            self.ty(a, d + 2);
+                        }
+                    }
+                }
+            }
+            Type::Pointer { inner, .. } => {
+                self.line(d, "TyPointer");
+                self.ty(inner, d + 1);
+            }
+            Type::Nullable { inner, .. } => {
+                self.line(d, "TyNullable");
+                self.ty(inner, d + 1);
+            }
+            Type::Array { inner, rank, .. } => {
+                self.line(d, &format!("TyArray rank={rank}"));
+                self.ty(inner, d + 1);
+            }
+            Type::Sized { inner, size, .. } => {
+                self.line(d, "TySized");
+                self.ty(inner, d + 1);
+                self.labeled_expr(d + 1, "size", size);
+            }
+            Type::Tuple { elems, .. } => {
+                self.line(d, "TyTuple");
+                for e in elems {
+                    self.ty(e, d + 1);
+                }
+            }
         }
     }
 
@@ -169,10 +227,18 @@ impl Printer<'_> {
                 self.expr(expr, d + 1);
             }
             Stmt::Local {
-                is_let, name, init, ..
+                is_let,
+                ty,
+                name,
+                init,
+                ..
             } => {
                 let kw = if *is_let { "let" } else { "var" };
                 self.line(d, &format!("Local {kw} {}", self.txt(*name)));
+                if let Some(t) = ty {
+                    self.line(d + 1, "ty:");
+                    self.ty(t, d + 2);
+                }
                 if let Some(e) = init {
                     self.labeled_expr(d + 1, "init", e);
                 }
@@ -243,6 +309,24 @@ impl Printer<'_> {
             Stmt::Defer { body, .. } => {
                 self.line(d, "Defer");
                 self.stmt(body, d + 1);
+            }
+            Stmt::Switch {
+                scrutinee, arms, ..
+            } => {
+                self.line(d, "Switch");
+                self.labeled_expr(d + 1, "on", scrutinee);
+                for arm in arms {
+                    match &arm.pattern {
+                        Some(p) => {
+                            self.line(d + 1, "Case");
+                            self.labeled_expr(d + 2, "pattern", p);
+                        }
+                        None => self.line(d + 1, "Default"),
+                    }
+                    for s in &arm.body {
+                        self.stmt(s, d + 2);
+                    }
+                }
             }
         }
     }

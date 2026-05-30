@@ -283,6 +283,14 @@ pub enum Expr {
         qualifier: Option<Span>,
         operand: Box<Expr>,
     },
+    /// `base<T1, T2, …>` — a generic-instantiated name in expression
+    /// position (built when generic-arg disambiguation succeeds; the
+    /// following `(args)` then makes it a [`Expr::Call`]).
+    Generic {
+        span: Span,
+        base: Box<Expr>,
+        args: Vec<Type>,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
 }
@@ -310,7 +318,8 @@ impl Expr {
             | Expr::Call { span, .. }
             | Expr::Index { span, .. }
             | Expr::Member { span, .. }
-            | Expr::Prefix { span, .. } => *span,
+            | Expr::Prefix { span, .. }
+            | Expr::Generic { span, .. } => *span,
         }
     }
 }
@@ -324,10 +333,12 @@ pub enum Stmt {
     Expr { span: Span, expr: Expr },
     /// `;`
     Empty(Span),
-    /// `var`/`let` local: `var name = init;` (typed locals → Sprint 04)
+    /// Local variable declaration. `ty` is `None` for `var`/`let`
+    /// (inferred); `Some(Type)` for typed locals like `int x = 5;`.
     Local {
         span: Span,
         is_let: bool,
+        ty: Option<Type>,
         name: Span,
         init: Option<Expr>,
     },
@@ -373,8 +384,24 @@ pub enum Stmt {
     Continue { span: Span, label: Option<Span> },
     /// `defer body`
     Defer { span: Span, body: Box<Stmt> },
+    /// `switch (e) { (case p: …)* (default: …)? }`
+    Switch {
+        span: Span,
+        scrutinee: Expr,
+        arms: Vec<SwitchArm>,
+    },
     /// recovery placeholder for a malformed statement
     Error(Span),
+}
+
+/// One arm of a `switch` statement. `pattern` is `None` for `default:`,
+/// `Some(expr)` for `case <expr>:` (full pattern syntax is incremental;
+/// for now we accept any expression as the pattern).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SwitchArm {
+    pub span: Span,
+    pub pattern: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 impl Stmt {
@@ -392,7 +419,61 @@ impl Stmt {
             | Stmt::Return { span, .. }
             | Stmt::Break { span, .. }
             | Stmt::Continue { span, .. }
-            | Stmt::Defer { span, .. } => *span,
+            | Stmt::Defer { span, .. }
+            | Stmt::Switch { span, .. } => *span,
+        }
+    }
+}
+
+/// One segment of a qualified type path, optionally with generic args:
+/// `A`, `A<T>`, `Outer<T>.Inner<U>` is two segments.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TypeSeg {
+    pub name: Span,
+    pub args: Vec<Type>,
+}
+
+/// A type reference. Function/delegate types and `decltype`/`comptype`
+/// are deferred — they're rare in current corpus material.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Type {
+    /// `A`, `A.B`, `List<int>`, `Outer<T>.Inner` — a qualified path with
+    /// optional generic args on any segment.
+    Path { span: Span, segments: Vec<TypeSeg> },
+    /// `T*`
+    Pointer { span: Span, inner: Box<Type> },
+    /// `T?`
+    Nullable { span: Span, inner: Box<Type> },
+    /// `T[]`, `T[,]` (multi-dim by `rank`)
+    Array {
+        span: Span,
+        inner: Box<Type>,
+        rank: u32,
+    },
+    /// `T[N]` — fixed-size array
+    Sized {
+        span: Span,
+        inner: Box<Type>,
+        size: Box<Expr>,
+    },
+    /// `(A, B, …)` tuple type
+    Tuple { span: Span, elems: Vec<Type> },
+    /// `var` used as a type position (inferred local)
+    Var(Span),
+    /// recovery placeholder for a malformed type
+    Error(Span),
+}
+
+impl Type {
+    pub fn span(&self) -> Span {
+        match self {
+            Type::Var(s) | Type::Error(s) => *s,
+            Type::Path { span, .. }
+            | Type::Pointer { span, .. }
+            | Type::Nullable { span, .. }
+            | Type::Array { span, .. }
+            | Type::Sized { span, .. }
+            | Type::Tuple { span, .. } => *span,
         }
     }
 }
