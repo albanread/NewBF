@@ -1787,6 +1787,16 @@ impl<'a> Parser<'a> {
                     params,
                 }
             }
+            // Anonymous type in type position: `struct { … }`, `enum { … }`,
+            // `enum : int { … }` (used as a field/return/property type). The
+            // body is parsed and dropped for now; a placeholder type stands
+            // in. (Named `struct Foo { … }` is a nested type decl, handled in
+            // `member`.)
+            TokenKind::Keyword(Keyword::Struct | Keyword::Class | Keyword::Enum)
+                if matches!(self.nth_kind(1), TokenKind::LBrace | TokenKind::Colon) =>
+            {
+                self.anonymous_type(lo)
+            }
             // Bare `.` in type position = inferred type — the `(.)`
             // cast-to-inferred-type, `StructA v = .();` etc.
             TokenKind::Dot if self.nth_kind(1) != TokenKind::Ident => {
@@ -1802,6 +1812,23 @@ impl<'a> Parser<'a> {
             }
         };
         self.type_suffixes(base)
+    }
+
+    /// Parse an anonymous type used in type position: `struct { members }`,
+    /// `enum { cases }`, `enum : Base { cases }`. The body's members are
+    /// parsed (to balance braces) and dropped; a `Var` placeholder stands in
+    /// for the anonymous type for now.
+    fn anonymous_type(&mut self, lo: u32) -> Type {
+        let kind = self.type_kind().unwrap_or(TypeKind::Struct);
+        // Optional underlying/base type: `enum : int`.
+        if self.eat(TokenKind::Colon) {
+            let _ = self.ty();
+        }
+        if self.eat(TokenKind::LBrace) {
+            let _ = self.members(kind);
+            self.expect(TokenKind::RBrace, "`}` to close anonymous type");
+        }
+        Type::Var(self.finish(lo))
     }
 
     fn path_type(&mut self, lo: u32) -> Type {
@@ -2211,6 +2238,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse attributes and modifiers in any order / interleaved (Beef
+    /// allows `public [Inline] static`, `[Union] public`, etc.).
+    fn attrs_and_modifiers(&mut self) -> (Vec<Attribute>, Vec<(Modifier, Span)>) {
+        let mut attributes = Vec::new();
+        let mut modifiers = Vec::new();
+        loop {
+            let before = self.pos;
+            attributes.extend(self.attributes());
+            modifiers.extend(self.modifiers());
+            if self.pos == before {
+                break;
+            }
+        }
+        (attributes, modifiers)
+    }
+
     fn at_type_kind_kw(&self) -> bool {
         matches!(
             self.kind(),
@@ -2492,8 +2535,7 @@ impl<'a> Parser<'a> {
 
     fn member(&mut self, kind: TypeKind) -> Member {
         let lo = self.start();
-        let attributes = self.attributes();
-        let modifiers = self.modifiers();
+        let (attributes, modifiers) = self.attrs_and_modifiers();
 
         // Enum case: `case Name [(payload)] [= value];`
         if kind == TypeKind::Enum && self.at_kw(Keyword::Case) {
@@ -2530,8 +2572,10 @@ impl<'a> Parser<'a> {
             return self.type_alias_member(lo, attributes, modifiers);
         }
 
-        // Nested type
-        if self.at_type_kind_kw() {
+        // Nested *named* type. An anonymous `struct {…}` / `enum {…}` /
+        // `enum : int {…}` (no name after the keyword) is instead a member
+        // whose *type* is anonymous — it falls through to `self.ty()` below.
+        if self.at_type_kind_kw() && self.nth_kind(1) == TokenKind::Ident {
             return Member::Nested(self.type_decl(lo, attributes, modifiers));
         }
 
@@ -2667,6 +2711,21 @@ impl<'a> Parser<'a> {
         // operator. After the return type we may instead see `operator`
         // (operator method) — the "name" then spans the operator symbol(s).
         let ty = self.ty();
+
+        // Anonymous field: `public struct { … };` — the (anonymous) type IS
+        // the member, with no name. Emit a name-less field (empty-span name).
+        if self.at(TokenKind::Semicolon) {
+            let name = Span::new(self.file, lo, lo);
+            self.bump(); // ;
+            return Member::Field {
+                span: self.finish(lo),
+                attributes,
+                modifiers,
+                ty,
+                name,
+                init: None,
+            };
+        }
 
         // Indexer: `Type this[params] { accessors }` or `=> expr;`.
         if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LBracket {

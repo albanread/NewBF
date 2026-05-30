@@ -957,6 +957,22 @@ class Foo {
     }
 
     #[test]
+    fn anonymous_types_and_interleaved_attrs() {
+        // Anonymous struct/enum member types, a nameless anonymous field, and
+        // an attribute interleaved after a modifier (`public [Union] …`).
+        let src = "struct S { \
+            public [Union] struct { public int mX, mY; } mVals; \
+            public enum { A, B } Dir() => .A; \
+            public struct { int q; }; \
+        }";
+        let unit = ok_file(src);
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("type")
+        };
+        assert_eq!(td.members.len(), 3);
+    }
+
+    #[test]
     fn generic_type_with_where_constraint() {
         let src = "class List<T> where T : class { }";
         let unit = ok_file(src);
