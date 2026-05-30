@@ -10,6 +10,7 @@ publish = false
 newbf-lexer.workspace = true
 newbf-parser.workspace = true
 newbf-sema.workspace = true
+newbf-llvm.workspace = true
 newbf-winapi.workspace = true
 
 [lints]

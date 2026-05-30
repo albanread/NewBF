@@ -381,6 +381,7 @@ name = "newbf-tests"
 version = "0.0.1"
 dependencies = [
  "newbf-lexer",
+ "newbf-llvm",
  "newbf-parser",
  "newbf-sema",
  "newbf-winapi",

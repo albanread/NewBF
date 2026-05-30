@@ -213,7 +213,12 @@ impl Lowerer {
                     None => init_ty.unwrap_or(IrType::I64), // `var`/`let`: infer from init
                 };
                 let slot = self.fb.alloca(slot_ty);
-                if let Some(v) = init_val {
+                // Coerce the initializer to the slot's type before storing —
+                // otherwise e.g. `int32 x = 0` stores an i64 literal into a
+                // 4-byte slot, overrunning the stack (a store's width follows
+                // the value type under opaque pointers).
+                if let (Some(v), Some(t)) = (init_val, init_ty) {
+                    let v = self.coerce(v, t, slot_ty);
                     self.fb.store(slot.clone(), v);
                 }
                 self.bind(name.text(src), slot, slot_ty);
