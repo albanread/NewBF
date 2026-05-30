@@ -702,9 +702,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Token kinds that commit `(X) …` to a C-style cast. Deliberately
-    /// excludes tokens that are *also* binary/postfix operators (`. * & +
-    /// - ++ --`): `(a).b`, `(a)*b`, `(a)-b` are member-access / arithmetic,
-    /// not casts. Only unambiguous unary starts qualify.
+    /// excludes tokens that are also binary/postfix operators (dot, star,
+    /// amp, plus, minus, increment, decrement): `(a).b`, `(a)*b`, `(a)-b`
+    /// are member-access / arithmetic, not casts. Only unambiguous unary
+    /// starts qualify.
     fn can_start_unary(k: TokenKind) -> bool {
         matches!(
             k,
