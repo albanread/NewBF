@@ -129,6 +129,7 @@ dependencies = [
  "clap",
  "newbf-lexer",
  "newbf-parser",
+ "newbf-sema",
 ]
 
 [[package]]
@@ -165,6 +166,10 @@ version = "0.0.1"
 [[package]]
 name = "newbf-sema"
 version = "0.0.1"
+dependencies = [
+ "newbf-lexer",
+ "newbf-parser",
+]
 
 [[package]]
 name = "newbf-test-matrix"

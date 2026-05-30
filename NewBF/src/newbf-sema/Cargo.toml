@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "NewBF: semantic analysis — resolution, generics, dispatch, ownership."
 
+[dependencies]
+newbf-lexer.workspace = true
+newbf-parser.workspace = true
+
 [lints]
 workspace = true

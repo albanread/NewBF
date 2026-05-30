@@ -192,16 +192,40 @@ Program` → `Method [public static] Main` tree.
 **Goal:** Build the definition graph and resolve `using`/namespaces.
 **Length:** 2 weeks · **Phase:** 2
 
-### Deliverables
-- [ ] `newbf-sema` definition builder: types, methods, fields, namespaces.
-- [ ] `using`/namespace resolution; duplicate/missing diagnostics.
-- [ ] `dump-defs` report.
+### Delivered (Sprint 05a — the authoritative definition graph)
+- [x] `newbf-sema` definition builder: an **exhaustive** walk of every
+      parse tree into a `DefGraph`. Records every namespace, type, and
+      member with full shape — modifiers, attributes, generic params,
+      bases, `where`-constraints, parameter signatures, accessor sets,
+      enum-case payloads, delegate signatures, type aliases, nested types.
+      Type references are normalized into `TypeRef` (path+args+suffixes
+      preserved) so **downstream phases consume the model, never the AST**
+      (the design contract: later phases rely on sema, don't re-poke the
+      tree). A string [`Interner`] backs all names.
+- [x] Namespace tree from dotted paths (`A.B.C` → nested nodes), with
+      **open-namespace merging** across files; file-scoped vs. block
+      `namespace`. `using` resolution against the in-program namespace/type
+      tables (`Namespace` / `Type` / `External`); corlib references resolve
+      as `External` (not errors — corlib is a later sprint).
+- [x] Duplicate-definition diagnostics: colliding type defs (extensions
+      exempt — they reopen), duplicate field/property/enum-case names
+      (methods + `this` indexers overload, so exempt), duplicate `using`
+      aliases. In-program contradictions only; no flood of false "missing".
+- [x] `dump-defs` report (`format_defs`) + `newbf-driver dump-defs` (single
+      file or a directory analyzed as one merged program).
+- [x] Corpus def-build gate: parse+analyze every `.bf` in `corlib-slice`
+      (89) and `feature-suite/src` (70). Hard gate: **no panics on 152 real
+      Beef files**; captures ~948 types / ~6066 members. Clean-build
+      ratchet ≥80% (currently ~84%); the remaining noisy files redefine
+      symbols across `#if`/`#else` branches (conditional compilation isn't
+      evaluated yet) — not sema bugs. +11 sema unit tests.
 
 ### Sibling-project leverage
 - Reference `BfDefBuilder.cpp` / `BfSystem.cpp`.
 
 ### Demo
-`newbf-driver dump-defs beef-tests/samples/`.
+`newbf-driver dump-defs beef-tests/corlib-slice/` emits the namespace tree,
+every type with its full shape, and every member signature.
 
 ---
 

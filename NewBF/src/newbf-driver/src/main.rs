@@ -49,6 +49,14 @@ enum Command {
         /// Path to a `.bf` source file.
         input: String,
     },
+    /// Dump the definition graph for a .bf file or a directory of them (the
+    /// sema phase report — namespaces, types with full shapes, members,
+    /// usings). A directory is walked recursively and analyzed as one
+    /// program (open namespaces merge across files).
+    DumpDefs {
+        /// Path to a `.bf` source file or a directory.
+        input: String,
+    },
 }
 
 fn main() {
@@ -107,5 +115,81 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some(Command::DumpDefs { input }) => dump_defs(&input),
+    }
+}
+
+/// Collect `.bf` files: just `path` if it's a file, else every `.bf` under
+/// it (recursively). Returns paths sorted for deterministic FileIds.
+fn collect_bf(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            let mut children: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            children.sort();
+            for c in children {
+                collect_bf(&c, out);
+            }
+        }
+    } else if path.extension().and_then(|x| x.to_str()) == Some("bf") {
+        out.push(path.to_path_buf());
+    }
+}
+
+fn dump_defs(input: &str) {
+    let root = std::path::Path::new(input);
+    let mut paths = Vec::new();
+    if root.is_file() {
+        paths.push(root.to_path_buf());
+    } else {
+        collect_bf(root, &mut paths);
+    }
+    if paths.is_empty() {
+        eprintln!("dump-defs: no .bf files at {input}");
+        std::process::exit(1);
+    }
+
+    // Read + parse every file; keep sources and units alive for the borrow.
+    let mut srcs: Vec<String> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(s) => srcs.push(s),
+            Err(e) => {
+                eprintln!("dump-defs: cannot read {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut units = Vec::with_capacity(paths.len());
+    let mut parse_diags = 0usize;
+    for (i, src) in srcs.iter().enumerate() {
+        let (unit, diags) = newbf_parser::parse_file(src, newbf_lexer::FileId(i as u32));
+        parse_diags += diags.len();
+        units.push(unit);
+    }
+    let files: Vec<newbf_sema::SourceFile<'_>> = srcs
+        .iter()
+        .zip(units.iter())
+        .enumerate()
+        .map(|(i, (src, unit))| newbf_sema::SourceFile {
+            file: newbf_lexer::FileId(i as u32),
+            src,
+            unit,
+        })
+        .collect();
+
+    let program = newbf_sema::analyze(&files);
+    print!("{}", newbf_sema::format_defs(&program));
+
+    if parse_diags > 0 {
+        eprintln!(
+            "(note: {parse_diags} parse diagnostics across {} files)",
+            paths.len()
+        );
+    }
+    for d in &program.diagnostics {
+        eprintln!("{}..{}: {}", d.span.lo, d.span.hi, d.message);
+    }
+    if !program.diagnostics.is_empty() {
+        std::process::exit(1);
     }
 }
