@@ -92,6 +92,7 @@ impl Printer<'_> {
             Const::Bool(b) => b.to_string(),
             Const::Null => "null".to_string(),
             Const::Undef(_) => "undef".to_string(),
+            Const::Str(s) => format!("{s:?}"),
         }
     }
 

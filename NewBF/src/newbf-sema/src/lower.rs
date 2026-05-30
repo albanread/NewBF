@@ -302,7 +302,7 @@ impl Lowerer {
             Expr::Bool(s) => (Value::bool(s.text(src) == "true"), IrType::Bool),
             Expr::Char(_) => (Value::int(0, IrType::U8), IrType::U8),
             Expr::Null(_) => (Value::Const(Const::Null), IrType::Ptr),
-            Expr::Str(_) => (undef(IrType::Ptr), IrType::Ptr),
+            Expr::Str(s) => (Value::str(decode_string_literal(s.text(src))), IrType::Ptr),
             Expr::Paren { inner, .. } => self.expr(inner, src),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
@@ -636,6 +636,43 @@ fn zero_of(ty: IrType) -> Value {
 
 fn undef(ty: IrType) -> Value {
     Value::Const(Const::Undef(ty))
+}
+
+/// Decode a string-literal token (surrounding quotes + escapes) into its
+/// runtime bytes. Handles plain `"..."` with the common C escapes; the `@`
+/// (verbatim) / `$` (interpolated) prefixes are stripped best-effort —
+/// interpolation itself isn't lowered yet, so `$"…"` keeps its literal text.
+fn decode_string_literal(raw: &str) -> String {
+    let verbatim = raw.starts_with('@') || raw.starts_with("$@") || raw.starts_with("@$");
+    let body = raw.trim_start_matches(['@', '$']);
+    let body = body.strip_prefix('"').unwrap_or(body);
+    let body = body.strip_suffix('"').unwrap_or(body);
+    if verbatim {
+        return body.replace("\"\"", "\"");
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Map an AST type to its concrete IR type. Reference/unknown types collapse

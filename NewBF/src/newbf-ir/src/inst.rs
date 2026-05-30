@@ -31,6 +31,9 @@ impl Value {
     pub fn bool(v: bool) -> Value {
         Value::Const(Const::Bool(v))
     }
+    pub fn str(s: impl Into<String>) -> Value {
+        Value::Const(Const::Str(s.into()))
+    }
 }
 
 /// An inline constant.
@@ -43,6 +46,9 @@ pub enum Const {
     Null,
     /// An undefined value of the given type (uninitialized `?`).
     Undef(IrType),
+    /// A string literal. Lowers to a private, NUL-terminated `[N x i8]`
+    /// constant global; the value is a `ptr` to its first byte (a C `char*`).
+    Str(String),
 }
 
 /// Binary arithmetic/bitwise operators. Signed vs. unsigned division and

@@ -211,6 +211,22 @@ impl<'ctx> Codegen<'ctx, '_> {
                 .const_null()
                 .into(),
             Const::Undef(ty) => self.undef_of(*ty),
+            Const::Str(s) => {
+                // A private, NUL-terminated `[N x i8]` constant; the value is
+                // a `ptr` to its first byte (a C `char*`).
+                let i8t = self.ctx.i8_type();
+                let bytes: Vec<_> = s
+                    .bytes()
+                    .chain(std::iter::once(0u8))
+                    .map(|b| i8t.const_int(u64::from(b), false))
+                    .collect();
+                let arr = i8t.const_array(&bytes);
+                let g = self.module.add_global(arr.get_type(), None, ".str");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                g.set_linkage(inkwell::module::Linkage::Private);
+                g.as_pointer_value().into()
+            }
         }
     }
 
@@ -728,6 +744,21 @@ mod tests {
         let ir = lower_to_string(&m);
         assert!(ir.contains("declare i32 @puts(ptr"), "{ir}");
         assert!(ir.contains("call i32 @puts(ptr null)"), "{ir}");
+    }
+
+    #[test]
+    fn string_constant_lowers_to_global() {
+        // void greet() { puts("hi"); }
+        let mut m = IrModule::new("t");
+        let mut f = FunctionBuilder::new("greet", vec![], IrType::Void);
+        f.call("puts", vec![Value::str("hi")], IrType::I32);
+        f.ret(None);
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("string program verifies");
+        let ir = lower_to_string(&m);
+        assert!(ir.contains("private constant [3 x i8]"), "{ir}"); // 'h','i','\0'
+        assert!(ir.contains("@puts(ptr "), "{ir}");
     }
 
     #[test]

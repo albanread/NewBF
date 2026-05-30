@@ -380,6 +380,7 @@ version = "0.0.1"
 name = "newbf-tests"
 version = "0.0.1"
 dependencies = [
+ "newbf-ir",
  "newbf-lexer",
  "newbf-llvm",
  "newbf-parser",
