@@ -53,20 +53,10 @@ fn run_main(src: &str) {
     let _ = main();
 }
 
-#[test]
-fn console_writeline_emits_exact_bytes() {
-    const SRC: &str = r#"
-class Program {
-    public static int32 Main() {
-        String s = "Hello, world!";
-        Console.WriteLine(s);
-        delete s;
-        return 0;
-    }
-}
-"#;
-
-    let captured = unsafe {
+/// Run `src`'s `Program.Main` with `STD_OUTPUT_HANDLE` redirected to an
+/// anonymous pipe, returning everything it wrote.
+fn capture_stdout(src: &str) -> String {
+    unsafe {
         let saved = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut rd: *mut c_void = ptr::null_mut();
         let mut wr: *mut c_void = ptr::null_mut();
@@ -79,7 +69,7 @@ class Program {
             "SetStdHandle (redirect) failed"
         );
 
-        run_main(SRC);
+        run_main(src);
 
         // Restore real stdout and drop the write end so the read terminates.
         SetStdHandle(STD_OUTPUT_HANDLE, saved);
@@ -97,7 +87,48 @@ class Program {
         CloseHandle(rd);
         assert!(ok != 0, "ReadFile from capture pipe failed");
         String::from_utf8(buf[..n as usize].to_vec()).expect("captured bytes are utf8")
-    };
+    }
+}
 
-    assert_eq!(captured, "Hello, world!\n", "captured stdout mismatch");
+// One test, two captures run sequentially: redirecting the *process-global*
+// STD_OUTPUT_HANDLE isn't thread-safe, and libtest runs separate `#[test]`s in
+// parallel — so both stdout checks live in a single test to avoid clobbering.
+#[test]
+fn console_output_is_exact() {
+    // A plain literal printed verbatim.
+    let literal = capture_stdout(
+        r#"
+class Program {
+    public static int32 Main() {
+        String s = "Hello, world!";
+        Console.WriteLine(s);
+        delete s;
+        return 0;
+    }
+}
+"#,
+    );
+    assert_eq!(literal, "Hello, world!\n", "literal stdout mismatch");
+
+    // Built at runtime via Append(String) (overload-by-type), then printed: the
+    // bytes must be the concatenation, proving the two features compose.
+    let concatenated = capture_stdout(
+        r#"
+class Program {
+    public static int32 Main() {
+        String s = "Hello, ";
+        String w = "world!";
+        s.Append(w);
+        Console.WriteLine(s);
+        delete s;
+        delete w;
+        return 0;
+    }
+}
+"#,
+    );
+    assert_eq!(
+        concatenated, "Hello, world!\n",
+        "concatenated stdout mismatch"
+    );
 }

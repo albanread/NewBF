@@ -64,7 +64,9 @@ struct StructTable {
     dtors: Vec<Option<String>>,
     /// Per-id method table (name → signature, this-aware), for resolving
     /// `obj.Method()` and same-type bare calls. First declaration wins.
-    methods: Vec<HashMap<String, MethodSig>>,
+    /// Per-id method table, keyed by name → all same-name overloads. Resolution
+    /// picks among them by argument type (see [`pick_overload`]).
+    methods: Vec<HashMap<String, Vec<MethodSig>>>,
     /// Per-id, per-field pointer element type (parallel to `defs[id].fields`):
     /// `Some` for a `T*` field, so `obj.field[i]` knows the element.
     field_elems: Vec<Vec<Option<IrType>>>,
@@ -242,20 +244,29 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                     ..
                 } => {
                     let nm = name.text(src).to_string();
-                    if t.methods[id.0 as usize].contains_key(&nm) {
-                        continue;
-                    }
-                    // A body-having method emits `{prefix}{name}`; a body-less
-                    // `[Intrinsic]`/`[LinkName]` extern resolves to its symbol;
-                    // any other body-less method (abstract/interface) isn't
-                    // callable and is skipped.
+                    let explicit: Vec<IrType> =
+                        params.iter().map(|p| lower_ty(&p.ty, src, t)).collect();
+                    // A body-having method emits `{prefix}{name}` — suffixed by
+                    // parameter types when it's a *later* overload of that name
+                    // (the first keeps the plain symbol), so each overload's body
+                    // is distinct. A body-less `[Intrinsic]`/`[LinkName]` extern
+                    // resolves to its symbol; any other body-less member
+                    // (abstract/interface) isn't callable and is skipped.
                     let full_name = if matches!(body, MethodBody::None) {
                         match extern_symbol(attributes, src) {
                             Some(sym) => sym,
                             None => continue,
                         }
                     } else {
-                        format!("{}{}", t.prefixes[id.0 as usize], nm)
+                        let base = format!("{}{}", t.prefixes[id.0 as usize], nm);
+                        if t.methods[id.0 as usize]
+                            .get(&nm)
+                            .is_some_and(|b| !b.is_empty())
+                        {
+                            format!("{base}${}", type_codes(&explicit))
+                        } else {
+                            base
+                        }
                     };
                     let is_instance = !modifiers
                         .iter()
@@ -264,16 +275,20 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                     if is_instance {
                         ps.push(IrType::Ref(id));
                     }
-                    for p in params {
-                        ps.push(lower_ty(&p.ty, src, t));
-                    }
+                    ps.extend(explicit.iter().copied());
                     let sig = MethodSig {
                         full_name,
                         ret: lower_ty(return_ty, src, t),
                         params: ps,
                         is_instance,
                     };
-                    t.methods[id.0 as usize].insert(nm, sig);
+                    // Keep all same-name overloads; the call site discriminates
+                    // by argument type. Skip an exact-signature duplicate (e.g.
+                    // a type re-walked) so the bucket stays a true overload set.
+                    let bucket = t.methods[id.0 as usize].entry(nm).or_default();
+                    if !bucket.iter().any(|s| s.params == sig.params) {
+                        bucket.push(sig);
+                    }
                 }
                 _ => {}
             }
@@ -350,14 +365,78 @@ struct MethodSig {
     is_instance: bool,
 }
 
+/// Pick the best-matching overload from `cands` (all sharing a name) for the
+/// given argument types — the receiver is *not* among `arg_tys`. An instance
+/// candidate matches against its params past the leading `this`; it's eligible
+/// only at a member-call site (`members`), since a `this`-less site (a bare or
+/// `Type.M` call) has no receiver to pass. Among arity-matching candidates the
+/// one with the most exact type matches wins; ties keep the first registered (a
+/// coercion bridges any non-exact arg, so arity alone resolves a lone overload).
+fn pick_overload<'s>(
+    cands: &'s [MethodSig],
+    arg_tys: &[IrType],
+    members: bool,
+) -> Option<&'s MethodSig> {
+    let mut best: Option<(&MethodSig, usize)> = None;
+    for c in cands {
+        if c.is_instance && !members {
+            continue;
+        }
+        let formal: &[IrType] = if c.is_instance {
+            &c.params[1..]
+        } else {
+            &c.params[..]
+        };
+        if formal.len() != arg_tys.len() {
+            continue;
+        }
+        let score = formal.iter().zip(arg_tys).filter(|(f, a)| f == a).count();
+        if best.is_none_or(|(_, bs)| score > bs) {
+            best = Some((c, score));
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+/// A compact, deterministic encoding of a parameter-type list, used to suffix
+/// the mangled symbol of an overloaded method so each overload is distinct
+/// (e.g. `Append(char8)` vs `Append(String)` → `…$i8` vs `…$R3`).
+fn type_codes(tys: &[IrType]) -> String {
+    let mut s = String::new();
+    for t in tys {
+        match t {
+            IrType::Void => s.push('v'),
+            IrType::Bool => s.push('b'),
+            IrType::Int { bits, signed } => {
+                s.push(if *signed { 'i' } else { 'u' });
+                s.push_str(&bits.to_string());
+            }
+            IrType::Float { bits } => {
+                s.push('f');
+                s.push_str(&bits.to_string());
+            }
+            IrType::Ptr => s.push('p'),
+            IrType::Ref(id) => {
+                s.push('R');
+                s.push_str(&id.0.to_string());
+            }
+            IrType::Struct(id) => {
+                s.push('S');
+                s.push_str(&id.0.to_string());
+            }
+        }
+    }
+    s
+}
+
 fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
     // The type's own method table (this-aware, built in the pre-pass) resolves
     // same-type bare calls; an empty map covers unregistered types (generics,
     // interfaces).
     let owner_id = structs.by_name.get(td.name.text(src)).copied();
-    let empty: HashMap<String, MethodSig> = HashMap::new();
-    let sigs: &HashMap<String, MethodSig> = match owner_id {
+    let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+    let sigs: &HashMap<String, Vec<MethodSig>> = match owner_id {
         Some(id) => &structs.methods[id.0 as usize],
         None => &empty,
     };
@@ -371,7 +450,27 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                 modifiers,
                 ..
             } => {
-                let full_name = format!("{new_prefix}{}", name.text(src));
+                // Reuse the table's mangled symbol (it disambiguates overloads)
+                // by matching this overload's explicit parameter types; fall back
+                // to the plain name for unregistered types (generics/interfaces).
+                let explicit: Vec<IrType> = params
+                    .iter()
+                    .map(|p| lower_ty(&p.ty, src, structs))
+                    .collect();
+                let full_name = sigs
+                    .get(name.text(src))
+                    .and_then(|cands| {
+                        cands.iter().find(|s| {
+                            let formal: &[IrType] = if s.is_instance {
+                                &s.params[1..]
+                            } else {
+                                &s.params[..]
+                            };
+                            formal == explicit.as_slice()
+                        })
+                    })
+                    .map(|s| s.full_name.clone())
+                    .unwrap_or_else(|| format!("{new_prefix}{}", name.text(src)));
                 let ret = lower_ty(return_ty, src, structs);
                 // Instance methods take a leading `this`; static ones don't.
                 let is_static = modifiers
@@ -435,7 +534,7 @@ fn lower_method(
     params: &[AstParam],
     body: &MethodBody,
     src: &str,
-    methods: &HashMap<String, MethodSig>,
+    methods: &HashMap<String, Vec<MethodSig>>,
     structs: &StructTable,
     this_ty: Option<IrType>,
 ) -> Option<Function> {
@@ -513,8 +612,9 @@ struct Lowerer<'a> {
     scopes: Vec<HashMap<String, Binding>>,
     /// Whether the current block already has a terminator (stop emitting).
     terminated: bool,
-    /// Sibling methods (same type), for resolving bare-name calls.
-    methods: &'a HashMap<String, MethodSig>,
+    /// Sibling methods (same type), for resolving bare-name calls. Each name
+    /// maps to its overload set, discriminated by argument type at the call.
+    methods: &'a HashMap<String, Vec<MethodSig>>,
     /// Value-struct layouts, for resolving `obj.field` and struct-typed locals.
     structs: &'a StructTable,
     /// Enclosing-loop target stack: `(continue_target, break_target)`. The
@@ -530,7 +630,7 @@ impl<'a> Lowerer<'a> {
     fn new(
         fb: FunctionBuilder,
         ret_ty: IrType,
-        methods: &'a HashMap<String, MethodSig>,
+        methods: &'a HashMap<String, Vec<MethodSig>>,
         structs: &'a StructTable,
     ) -> Self {
         Self {
@@ -888,16 +988,16 @@ impl<'a> Lowerer<'a> {
                     args.iter().map(|a| self.expr(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
                     let name = s.text(src);
-                    // Resolve to a same-type method ONLY when the arg count
-                    // matches its arity. Coercion then makes every arg exactly
-                    // the param type, so the call matches the declared
-                    // signature. On an arity mismatch (a different overload, or
-                    // no such method) we fall back to a defaulted external —
-                    // overload resolution by type lands with the type sprint.
+                    // Resolve among the same-type overloads by argument type
+                    // (`this`-less candidates — statics and free fns; an instance
+                    // method's leading `this` won't match here, so a bare call
+                    // reaches it only via `this.M(..)`). Coercion then makes each
+                    // arg exactly the param type. No match → a defaulted external.
+                    let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
                     let resolved = self
                         .methods
                         .get(name)
-                        .filter(|sig| sig.params.len() == arg_vals.len())
+                        .and_then(|cands| pick_overload(cands, &arg_tys, false))
                         .cloned();
                     if let Some(sig) = resolved {
                         // Same-type call (incl. recursion).
@@ -1238,31 +1338,40 @@ impl<'a> Lowerer<'a> {
         args: &[Expr],
         src: &str,
     ) -> (Value, IrType) {
+        // Evaluate arguments once: their types drive overload selection, their
+        // values feed whichever site resolves. (Static and instance sites are
+        // mutually exclusive — a type name isn't a receiver and vice versa — so
+        // there's no double-emit.)
+        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.expr(a, src)).collect();
+        let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
+
         // Qualified static call `Type.Method(args)`: the base names a registered
-        // type (not a local) and the method is static (no `this`).
+        // type (not a local). `members: false` keeps only static overloads.
         if let Expr::Ident(s) = base {
             let name = s.text(src);
             if self.lookup(name).is_none()
                 && let Some(&id) = self.structs.by_name.get(name)
-                && let Some(sig) = self.structs.methods[id.0 as usize].get(mname).cloned()
-                && !sig.is_instance
+                && let Some(sig) = self.structs.methods[id.0 as usize]
+                    .get(mname)
+                    .and_then(|cands| pick_overload(cands, &arg_tys, false))
+                    .cloned()
             {
-                let mut call_args = Vec::new();
-                for (i, a) in args.iter().enumerate() {
-                    let (v, t) = self.expr(a, src);
-                    let pt = sig.params.get(i).copied().unwrap_or(t);
-                    call_args.push(self.coerce(v, t, pt));
-                }
-                if call_args.len() == sig.params.len() {
-                    let r = self.fb.call(sig.full_name, call_args, sig.ret);
-                    return (r, sig.ret);
-                }
+                let call_args: Vec<Value> = arg_vals
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
+                    .collect();
+                let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                return (r, sig.ret);
             }
         }
-        // Instance call `obj.Method(args)` / `this.Method(args)`.
+        // Instance call `obj.Method(args)` / `this.Method(args)`. `members: true`
+        // admits instance overloads (matched past `this`) and statics.
         if let Some((body_ptr, owner_id)) = self.struct_base(base, src)
             && let Some(sig) = self.structs.methods[owner_id.0 as usize]
                 .get(mname)
+                .and_then(|cands| pick_overload(cands, &arg_tys, true))
                 .cloned()
         {
             let mut call_args = Vec::new();
@@ -1271,22 +1380,15 @@ impl<'a> Lowerer<'a> {
                 call_args.push(body_ptr);
                 pidx = 1;
             }
-            for a in args {
-                let (v, t) = self.expr(a, src);
+            for (v, t) in arg_vals {
                 let pt = sig.params.get(pidx).copied().unwrap_or(t);
                 call_args.push(self.coerce(v, t, pt));
                 pidx += 1;
             }
-            // Arity must match the declared signature for the call to be
-            // well-typed; otherwise fall through to the degrade path.
-            if call_args.len() == sig.params.len() {
-                let r = self.fb.call(sig.full_name, call_args, sig.ret);
-                return (r, sig.ret);
-            }
+            let r = self.fb.call(sig.full_name, call_args, sig.ret);
+            return (r, sig.ret);
         }
-        for a in args {
-            self.expr(a, src);
-        }
+        // Unresolved — arguments were already evaluated for their effects.
         (undef(IrType::I64), IrType::I64)
     }
 

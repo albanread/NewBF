@@ -26,10 +26,27 @@ class String {
 	// The raw buffer, for length-based I/O (e.g. Console.Write over WriteFile).
 	public char8* Ptr() { return this.mPtr; }
 
+	// Value equality: same length and same bytes.
+	public bool Equals(String other) {
+		if (this.mLength != other.Length()) { return false; }
+		for (int i = 0; i < this.mLength; i++) {
+			if (this.mPtr[i] != other.CharAt(i)) { return false; }
+		}
+		return true;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
 		this.mLength = this.mLength + 1;
+	}
+	// Append-overloaded by argument type: this appends a whole String by
+	// delegating to Append(char8) per character — selected over Append(char8)
+	// because `other` is a String, not a char8.
+	public void Append(String other) {
+		for (int i = 0; i < other.Length(); i++) {
+			this.Append(other.CharAt(i));
+		}
 	}
 	void Grow() {
 		int nc = this.mCapacity * 2;
