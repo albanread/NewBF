@@ -19,6 +19,7 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         ("Internal.bf", include_str!("../bf/Internal.bf")),
         ("String.bf", include_str!("../bf/String.bf")),
         ("Console.bf", include_str!("../bf/Console.bf")),
+        ("Pool.bf", include_str!("../bf/Pool.bf")),
         ("Probe.bf", include_str!("../bf/Probe.bf")),
         ("Math.bf", include_str!("../bf/Math.bf")),
     ]
