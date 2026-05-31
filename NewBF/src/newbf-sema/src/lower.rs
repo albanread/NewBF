@@ -631,7 +631,7 @@ fn pick_overload<'s>(
     arg_tys: &[IrType],
     members: bool,
 ) -> Option<&'s MethodSig> {
-    let mut best: Option<(&MethodSig, usize)> = None;
+    let mut best: Option<(&MethodSig, u32)> = None;
     for c in cands {
         if c.is_instance && !members {
             continue;
@@ -644,12 +644,33 @@ fn pick_overload<'s>(
         if formal.len() != arg_tys.len() {
             continue;
         }
-        let score = formal.iter().zip(arg_tys).filter(|(f, a)| f == a).count();
+        let score: u32 = formal
+            .iter()
+            .zip(arg_tys)
+            .map(|(f, a)| type_affinity(*f, *a))
+            .sum();
         if best.is_none_or(|(_, bs)| score > bs) {
             best = Some((c, score));
         }
     }
     best.map(|(c, _)| c)
+}
+
+/// How well an argument type fits a parameter type for overload ranking: an
+/// exact match beats a same-category match (int↔int of any width, float↔float,
+/// pointer↔pointer) beats no relation. So an `int` argument prefers an `int`
+/// parameter over a `String` one even when neither is the exact width.
+fn type_affinity(f: IrType, a: IrType) -> u32 {
+    if f == a {
+        2
+    } else if (f.is_int() && a.is_int())
+        || (f.is_float() && a.is_float())
+        || (f.is_pointer() && a.is_pointer())
+    {
+        1
+    } else {
+        0
+    }
 }
 
 /// A compact, deterministic encoding of a parameter-type list, used to suffix

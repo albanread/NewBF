@@ -30,4 +30,29 @@ class Console {
 		Console.Write(nl);
 		delete nl;
 	}
+
+	// Decimal rendering of an int, printed with a trailing newline. Selected
+	// over WriteLine(String) by the argument's type (overload resolution).
+	public static void WriteLine(int n) {
+		String s = new String();
+		if (n < 0) {
+			s.Append('-');
+			Console.AppendDigits(s, -n);
+		} else {
+			Console.AppendDigits(s, n);
+		}
+		Console.WriteLine(s);
+		delete s;
+	}
+
+	// Append n's decimal digits most-significant-first: the recursion emits the
+	// high digits before appending the current low one.
+	static void AppendDigits(String s, int n) {
+		if (n >= 10) {
+			Console.AppendDigits(s, n / 10);
+		}
+		int d = n % 10;
+		char8 c = '0' + d;
+		s.Append(c);
+	}
 }

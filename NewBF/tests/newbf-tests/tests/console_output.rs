@@ -131,4 +131,20 @@ class Program {
         concatenated, "Hello, world!\n",
         "concatenated stdout mismatch"
     );
+
+    // Decimal int rendering via WriteLine(int) — overload-by-type + itoa,
+    // covering a multi-digit value, a negative, and zero.
+    let numbers = capture_stdout(
+        r#"
+class Program {
+    public static int32 Main() {
+        Console.WriteLine(12345);
+        Console.WriteLine(-7);
+        Console.WriteLine(0);
+        return 0;
+    }
+}
+"#,
+    );
+    assert_eq!(numbers, "12345\n-7\n0\n", "int stdout mismatch");
 }
