@@ -53,13 +53,20 @@ struct StructTable {
     by_name: HashMap<String, StructId>,
     kinds: Vec<StructKind>,
     defs: Vec<StructDef>,
+    /// Per-id mangled-name prefix (`"C."` / `"Outer.Inner."`) — matches the
+    /// prefix `lower_type` builds, so ctor/dtor symbol names line up.
+    prefixes: Vec<String>,
+    /// Per-id first constructor signature (`this` + explicit params) and
+    /// destructor symbol, for wiring `new`/`delete`.
+    ctors: Vec<Option<MethodSig>>,
+    dtors: Vec<Option<String>>,
 }
 
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
         let mut t = StructTable::default();
         for f in files {
-            register_struct_names(&f.unit.items, f.src, &mut t);
+            register_struct_names(&f.unit.items, "", f.src, &mut t);
         }
         for f in files {
             fill_struct_fields(&f.unit.items, f.src, &mut t);
@@ -77,21 +84,30 @@ impl StructTable {
                 StructKind::Ref => IrType::Ref(id),
             })
     }
+
+    fn ctor_of(&self, id: StructId) -> Option<MethodSig> {
+        self.ctors[id.0 as usize].clone()
+    }
+
+    fn dtor_of(&self, id: StructId) -> Option<String> {
+        self.dtors[id.0 as usize].clone()
+    }
 }
 
-fn register_struct_names(items: &[Item], src: &str, t: &mut StructTable) {
+fn register_struct_names(items: &[Item], prefix: &str, src: &str, t: &mut StructTable) {
     for item in items {
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => register_struct_names(body, src, t),
-            Item::Type(td) => register_type_struct(td, src, t),
+            } => register_struct_names(body, prefix, src, t),
+            Item::Type(td) => register_type_struct(td, prefix, src, t),
             _ => {}
         }
     }
 }
 
-fn register_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
+fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTable) {
+    let new_prefix = format!("{prefix}{}.", td.name.text(src));
     // Register non-generic value `struct`s (inline) and `class`es (referenced);
     // generics await monomorphization, interfaces/enums are separate.
     if let Some(kind) = struct_kind(td)
@@ -105,12 +121,15 @@ fn register_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                 fields: Vec::new(),
             });
             t.kinds.push(kind);
+            t.prefixes.push(new_prefix.clone());
+            t.ctors.push(None);
+            t.dtors.push(None);
             t.by_name.insert(name, id);
         }
     }
     for m in &td.members {
         if let Member::Nested(n) = m {
-            register_type_struct(n, src, t);
+            register_type_struct(n, &new_prefix, src, t);
         }
     }
 }
@@ -163,6 +182,29 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
             }
         }
         t.defs[id.0 as usize].fields = fields;
+
+        // Record the (first) constructor + a destructor for `new`/`delete`.
+        // The implicit `this` is a reference to the instance body.
+        for m in &td.members {
+            match m {
+                Member::Constructor { params, .. } if t.ctors[id.0 as usize].is_none() => {
+                    let mut ps = vec![IrType::Ref(id)];
+                    for p in params {
+                        ps.push(lower_ty(&p.ty, src, t));
+                    }
+                    let full_name = format!("{}$ctor", t.prefixes[id.0 as usize]);
+                    t.ctors[id.0 as usize] = Some(MethodSig {
+                        full_name,
+                        ret: IrType::Void,
+                        params: ps,
+                    });
+                }
+                Member::Destructor { .. } => {
+                    t.dtors[id.0 as usize] = Some(format!("{}$dtor", t.prefixes[id.0 as usize]));
+                }
+                _ => {}
+            }
+        }
     }
     for m in &td.members {
         if let Member::Nested(n) = m {
@@ -245,21 +287,55 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                 body,
                 ..
             } => {
-                if let Some(func) = lower_method(
-                    &new_prefix,
-                    name.text(src),
-                    return_ty,
-                    params,
-                    body,
-                    src,
-                    &sigs,
-                    structs,
-                ) {
+                let full_name = format!("{new_prefix}{}", name.text(src));
+                let ret = lower_ty(return_ty, src, structs);
+                if let Some(func) =
+                    lower_method(full_name, ret, params, body, src, &sigs, structs, None)
+                {
                     m.add_function(func);
                 }
             }
+            // Constructors/destructors lower like instance methods with a
+            // leading `this` (a reference to the body); `new`/`delete` call
+            // them by the `$ctor`/`$dtor` mangled names recorded in the table.
+            Member::Constructor { params, body, .. } => {
+                if let Some(&id) = structs.by_name.get(td.name.text(src)) {
+                    let full_name = format!("{new_prefix}$ctor");
+                    let this = Some(IrType::Ref(id));
+                    if let Some(func) = lower_method(
+                        full_name,
+                        IrType::Void,
+                        params,
+                        body,
+                        src,
+                        &sigs,
+                        structs,
+                        this,
+                    ) {
+                        m.add_function(func);
+                    }
+                }
+            }
+            Member::Destructor { body, .. } => {
+                if let Some(&id) = structs.by_name.get(td.name.text(src)) {
+                    let full_name = format!("{new_prefix}$dtor");
+                    let this = Some(IrType::Ref(id));
+                    if let Some(func) = lower_method(
+                        full_name,
+                        IrType::Void,
+                        &[],
+                        body,
+                        src,
+                        &sigs,
+                        structs,
+                        this,
+                    ) {
+                        m.add_function(func);
+                    }
+                }
+            }
             Member::Nested(nested) => lower_type(nested, &new_prefix, src, structs, m),
-            _ => {} // fields / properties / ctors / dtors / enum-cases — later
+            _ => {} // fields / properties / enum-cases — later
         }
     }
 }
@@ -268,14 +344,14 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
 // signature; a context struct is a future cleanup, not worth the churn now.
 #[allow(clippy::too_many_arguments)]
 fn lower_method(
-    prefix: &str,
-    name: &str,
-    return_ty: &AstType,
+    full_name: String,
+    ret: IrType,
     params: &[AstParam],
     body: &MethodBody,
     src: &str,
     methods: &HashMap<String, MethodSig>,
     structs: &StructTable,
+    this_ty: Option<IrType>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -283,17 +359,31 @@ fn lower_method(
         other => other,
     };
 
-    let ret = lower_ty(return_ty, src, structs);
-    let ir_params: Vec<IrParam> = params
-        .iter()
-        .map(|p| IrParam {
-            name: p.name.map(|s| s.text(src).to_string()),
-            ty: lower_ty(&p.ty, src, structs),
-        })
-        .collect();
+    // Instance methods / ctors / dtors take a leading `this` (a reference to
+    // the instance body); explicit params follow, so their LLVM `Param` index
+    // is offset by one.
+    let mut ir_params: Vec<IrParam> = Vec::new();
+    if let Some(t) = this_ty {
+        ir_params.push(IrParam {
+            name: Some("this".to_string()),
+            ty: t,
+        });
+    }
+    ir_params.extend(params.iter().map(|p| IrParam {
+        name: p.name.map(|s| s.text(src).to_string()),
+        ty: lower_ty(&p.ty, src, structs),
+    }));
 
-    let fb = FunctionBuilder::new(format!("{prefix}{name}"), ir_params, ret);
+    let fb = FunctionBuilder::new(full_name, ir_params, ret);
     let mut lw = Lowerer::new(fb, ret, methods, structs);
+
+    // Spill `this` into a slot at entry, recorded for `Expr::This`.
+    let base = if this_ty.is_some() { 1 } else { 0 };
+    if let Some(t) = this_ty {
+        let slot = lw.fb.alloca(t);
+        lw.fb.store(slot.clone(), Value::Param(0));
+        lw.this_slot = Some((slot, t));
+    }
 
     // Make parameters addressable: spill each into a stack slot at entry so
     // reads are `load`s and assignments just `store` (LLVM mem2reg cleans up).
@@ -301,7 +391,7 @@ fn lower_method(
         if let Some(nm) = &p.name {
             let ty = lower_ty(&p.ty, src, structs);
             let slot = lw.fb.alloca(ty);
-            lw.fb.store(slot.clone(), Value::Param(i as u32));
+            lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty);
         }
     }
@@ -338,6 +428,9 @@ struct Lowerer<'a> {
     /// innermost loop is last; `break`/`continue` branch to it. (Loop labels
     /// aren't honoured yet — the kernel always targets the innermost loop.)
     loops: Vec<(BlockId, BlockId)>,
+    /// The `this` slot in an instance method / ctor / dtor: a stack slot
+    /// holding the `Ref` to the instance body. `None` in static contexts.
+    this_slot: Option<(Value, IrType)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -355,6 +448,7 @@ impl<'a> Lowerer<'a> {
             methods,
             structs,
             loops: Vec::new(),
+            this_slot: None,
         }
     }
 
@@ -663,6 +757,10 @@ impl<'a> Lowerer<'a> {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
             },
+            Expr::This(_) => match self.this_slot.clone() {
+                Some((slot, ty)) => (self.fb.load(slot, ty), ty),
+                None => (undef(IrType::Ptr), IrType::Ptr),
+            },
             Expr::Unary { op, operand, .. } => self.unary(*op, operand, src),
             Expr::PostInc { operand, .. } => self.incdec(operand, 1, false, src),
             Expr::PostDec { operand, .. } => self.incdec(operand, -1, false, src),
@@ -855,6 +953,7 @@ impl<'a> Lowerer<'a> {
         match e {
             Expr::Paren { inner, .. } => self.lvalue(inner, src),
             Expr::Ident(s) => self.lookup(s.text(src)),
+            Expr::This(_) => self.this_slot.clone(),
             Expr::Member { base, name, .. } => {
                 let (body_ptr, id) = self.struct_base(base, src)?;
                 let fname = name.text(src);
@@ -907,6 +1006,19 @@ impl<'a> Lowerer<'a> {
             // Object header (ClassVData*) at offset 0 — null until vtables.
             let hdr = self.fb.field_addr(p.clone(), id, 0);
             self.fb.store(hdr, Value::Const(Const::Null));
+            // Run the constructor if one exists and the arg count matches
+            // (`this` + explicit args); coercion makes each arg its param type.
+            if let Some(ctor) = self.structs.ctor_of(id) {
+                let mut call_args = vec![p.clone()];
+                for (i, a) in ctor_args(operand).iter().enumerate() {
+                    let (v, t) = self.expr(a, src);
+                    let pt = ctor.params.get(i + 1).copied().unwrap_or(t);
+                    call_args.push(self.coerce(v, t, pt));
+                }
+                if call_args.len() == ctor.params.len() {
+                    self.fb.call(ctor.full_name, call_args, IrType::Void);
+                }
+            }
             return (p, IrType::Ref(id));
         }
         (undef(IrType::Ptr), IrType::Ptr)
@@ -914,7 +1026,13 @@ impl<'a> Lowerer<'a> {
 
     /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).
     fn lower_delete(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
-        let (v, _t) = self.expr(operand, src);
+        let (v, t) = self.expr(operand, src);
+        // Run the destructor before freeing, if the type has one.
+        if let IrType::Ref(id) = t
+            && let Some(dtor) = self.structs.dtor_of(id)
+        {
+            self.fb.call(dtor, vec![v.clone()], IrType::Void);
+        }
         self.fb.call("free", vec![v], IrType::Void);
         (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
     }
@@ -1188,6 +1306,16 @@ fn ctor_class_name<'s>(e: &Expr, src: &'s str) -> Option<&'s str> {
         Expr::Call { callee, .. } => ctor_class_name(callee, src),
         Expr::Generic { base, .. } => ctor_class_name(base, src),
         _ => None,
+    }
+}
+
+/// The constructor argument expressions in a `new` operand: `new C(a, b)` →
+/// `[a, b]`; empty for `new C` / `new C()`.
+fn ctor_args(e: &Expr) -> &[Expr] {
+    match e {
+        Expr::Call { args, .. } => args,
+        Expr::Paren { inner, .. } => ctor_args(inner),
+        _ => &[],
     }
 }
 
