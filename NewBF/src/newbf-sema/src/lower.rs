@@ -1197,6 +1197,23 @@ impl<'a> Lowerer<'a> {
         (undef(IrType::Ptr), IrType::Ptr)
     }
 
+    /// Construct a corlib `String` from a C-string pointer (the target-typed
+    /// literal path): `malloc` the body, zero the header, run `String(char8*)`.
+    fn construct_string(&mut self, cstr: Value) -> Value {
+        let Some(id) = self.structs.by_name.get("String").copied() else {
+            return cstr;
+        };
+        let size = self.fb.size_of(id);
+        let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
+        let hdr = self.fb.field_addr(p.clone(), id, 0);
+        self.fb.store(hdr, Value::Const(Const::Null));
+        if let Some(ctor) = self.structs.ctor_for(id, 1) {
+            self.fb
+                .call(ctor.full_name, vec![p.clone(), cstr], IrType::Void);
+        }
+        p
+    }
+
     /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).
     fn lower_delete(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
         let (v, t) = self.expr(operand, src);
@@ -1332,6 +1349,16 @@ impl<'a> Lowerer<'a> {
         // To bool is a truthiness test, not a bit-level cast.
         if to == IrType::Bool {
             return self.coerce_bool(v, from);
+        }
+        // Target-typed literal: a C-string (`char8*`/`Ptr`, e.g. a string
+        // literal) used where `String` is expected → construct a `String` from
+        // it. So `String s = "hi"` and passing a literal to a `String` param /
+        // returning one all wrap automatically.
+        if from == IrType::Ptr
+            && let IrType::Ref(rid) = to
+            && self.structs.by_name.get("String") == Some(&rid)
+        {
+            return self.construct_string(v);
         }
         match (from, to) {
             // Same-width integers share one LLVM type (signedness isn't in the
