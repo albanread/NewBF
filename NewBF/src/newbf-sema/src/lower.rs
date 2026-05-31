@@ -1208,6 +1208,28 @@ impl<'a> Lowerer<'a> {
         args: &[Expr],
         src: &str,
     ) -> (Value, IrType) {
+        // Qualified static call `Type.Method(args)`: the base names a registered
+        // type (not a local) and the method is static (no `this`).
+        if let Expr::Ident(s) = base {
+            let name = s.text(src);
+            if self.lookup(name).is_none()
+                && let Some(&id) = self.structs.by_name.get(name)
+                && let Some(sig) = self.structs.methods[id.0 as usize].get(mname).cloned()
+                && !sig.is_instance
+            {
+                let mut call_args = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    let (v, t) = self.expr(a, src);
+                    let pt = sig.params.get(i).copied().unwrap_or(t);
+                    call_args.push(self.coerce(v, t, pt));
+                }
+                if call_args.len() == sig.params.len() {
+                    let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                    return (r, sig.ret);
+                }
+            }
+        }
+        // Instance call `obj.Method(args)` / `this.Method(args)`.
         if let Some((body_ptr, owner_id)) = self.struct_base(base, src)
             && let Some(sig) = self.structs.methods[owner_id.0 as usize]
                 .get(mname)

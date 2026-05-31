@@ -15,5 +15,8 @@
 /// user's program and lowers them together — composed at the AST, lowered once
 /// (see `docs/STDLIB.md`). Order is dependency-respecting (lowest layer first).
 pub fn prelude() -> &'static [(&'static str, &'static str)] {
-    &[("Probe.bf", include_str!("../bf/Probe.bf"))]
+    &[
+        ("Probe.bf", include_str!("../bf/Probe.bf")),
+        ("Math.bf", include_str!("../bf/Math.bf")),
+    ]
 }
