@@ -23,14 +23,29 @@ reflection, and the phase-report convention.
 
 ## Status
 
-**Sprint 01 — workspace skeleton.** Empty `newbf-*` crates and a driver
-that prints a version banner. No language features yet.
+A working compiler: lexer → parser → sema → typed SSA IR → LLVM 22 → **ORC JIT**
+*and* **AOT `.exe`**. Runs real Beef — primitives, full control flow,
+intra-program calls + recursion, value `struct`s, heap `class`es with manual
+`new`/`delete`, constructors/destructors, and instance methods (`obj.Method()`,
+`this`) — checked by a JIT-and-run corpus, with a curated feature corpus that
+verifies clean under the LLVM verifier. See [`docs/journals/`](docs/journals)
+for the running build log and [`../SPRINTS.md`](../SPRINTS.md) for what's next.
+
+## Building
+
+Needs a **Rust** toolchain and **LLVM 22.1** (Windows x86-64 / MSVC only for now —
+the runtime uses Win64 SEH and `link.exe`):
 
 ```
+set LLVM_SYS_221_PREFIX=C:\path\to\llvm-22.1
 cargo build --workspace
+cargo test  --workspace
 cargo run -p newbf-driver -- --version
-# newbf-driver 0.0.1 (LLVM 22.1, pending)
 ```
+
+`newbf-winapi` embeds a committed Win32 ABI snapshot, so no external data is
+needed to build; set `NEWBF_WINDOWS_API_DB` to refresh it from a Win32-metadata
+SQLite DB ([details](src/newbf-winapi/data/README.md)).
 
 ## Workspace layout
 
