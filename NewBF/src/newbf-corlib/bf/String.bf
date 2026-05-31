@@ -23,6 +23,8 @@ class String {
 
 	public int Length() { return this.mLength; }
 	public char8 CharAt(int i) { return this.mPtr[i]; }
+	// The raw buffer, for length-based I/O (e.g. Console.Write over WriteFile).
+	public char8* Ptr() { return this.mPtr; }
 
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }

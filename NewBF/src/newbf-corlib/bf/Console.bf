@@ -1,0 +1,33 @@
+// NewBF corlib — Console: text output over the Win32 console API.
+//
+// Uses GetStdHandle + WriteFile directly. WriteFile is unbuffered and
+// length-based, so output is captured correctly even when stdout is redirected
+// to a pipe or file (unlike WriteConsole, which needs a real console). The
+// `[LinkName]` externs resolve from kernel32 via the JIT's process search
+// generator — the same path the Internal allocator floor uses for the CRT.
+class Console {
+	[LinkName("GetStdHandle")]
+	public static extern void* GetStdHandle(int32 nStdHandle);
+	[LinkName("WriteFile")]
+	public static extern int32 WriteFile(void* handle, void* buffer, int32 bytes, void* written, void* overlapped);
+
+	// STD_OUTPUT_HANDLE is -11. The bytes-written out-param must be non-null for
+	// a synchronous write, so borrow a scratch cell from the allocator floor.
+	static void WriteBytes(void* buffer, int32 bytes) {
+		void* handle = Console.GetStdHandle(-11);
+		void* written = Internal.Malloc(8);
+		Console.WriteFile(handle, buffer, bytes, written, null);
+		Internal.Free(written);
+	}
+
+	public static void Write(String s) {
+		Console.WriteBytes(s.Ptr(), s.Length());
+	}
+
+	public static void WriteLine(String s) {
+		Console.Write(s);
+		String nl = "\n";
+		Console.Write(nl);
+		delete nl;
+	}
+}
