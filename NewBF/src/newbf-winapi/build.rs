@@ -266,44 +266,68 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_DB));
 
+    // The committed Win32 snapshot lives in the crate, so a clean clone builds
+    // without the external DB. `include_bytes!(env!("WINAPI_DATA_BIN"))` in
+    // lib.rs reads exactly this file; we only *refresh* it from the DB when one
+    // is available (a maintainer action), and otherwise build from it as-is.
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let snapshot = manifest.join("data").join("winapi_data.bin.zst");
+
     println!("cargo:rerun-if-env-changed=NEWBF_WINDOWS_API_DB");
     println!("cargo:rerun-if-changed={}", db_path.display());
     println!("cargo:rerun-if-changed=src/data_schema.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=WINAPI_DATA_BIN={}", snapshot.display());
 
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap_or_else(|e| {
-            panic!(
-                "newbf-winapi: opening Win32 ABI DB at {} failed: {e}. Set NEWBF_WINDOWS_API_DB \
-                 to its location (the shared read-only E:\\windows_api\\windows_api.db).",
+    match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => {
+            let functions = project_functions(&conn).expect("project functions");
+            // Constants deferred: the DB carries enum *types* but not member values.
+            let constants: Vec<ConstantInfo> = Vec::new();
+            let mut dll_names: Vec<String> = functions.iter().map(|f| f.dll.clone()).collect();
+            dll_names.sort();
+            dll_names.dedup();
+
+            let idx = WinApiIndex {
+                functions,
+                constants,
+                dll_names,
+            };
+            let bytes = postcard::to_allocvec(&idx).expect("postcard serialise");
+            let compressed = zstd::stream::encode_all(&*bytes, 19).expect("zstd encode");
+
+            // Write only when the content actually changed, so an unchanged DB
+            // doesn't churn the file mtime (and force needless recompiles).
+            let changed = fs::read(&snapshot).map(|old| old != compressed).unwrap_or(true);
+            if changed {
+                if let Some(dir) = snapshot.parent() {
+                    fs::create_dir_all(dir).expect("create data dir");
+                }
+                fs::write(&snapshot, &compressed).expect("write snapshot");
+            }
+            println!(
+                "cargo:warning=newbf-winapi: snapshot {} — postcard {} bytes ➜ zstd-19 {} bytes; \
+                 {} functions, {} dlls",
+                if changed { "refreshed" } else { "unchanged" },
+                bytes.len(),
+                compressed.len(),
+                idx.functions.len(),
+                idx.dll_names.len(),
+            );
+        }
+        Err(e) => {
+            // No DB (e.g. a clean clone): the committed snapshot must exist.
+            assert!(
+                snapshot.exists(),
+                "newbf-winapi: no Win32 ABI DB at {} ({e}) and no committed snapshot at {}. \
+                 Set NEWBF_WINDOWS_API_DB to a windows_api.db to generate one.",
+                db_path.display(),
+                snapshot.display(),
+            );
+            println!(
+                "cargo:warning=newbf-winapi: using committed Win32 snapshot (no DB at {}).",
                 db_path.display()
-            )
-        });
-
-    let functions = project_functions(&conn).expect("project functions");
-    // Constants deferred: the DB carries enum *types* but not member values.
-    let constants: Vec<ConstantInfo> = Vec::new();
-    let mut dll_names: Vec<String> = functions.iter().map(|f| f.dll.clone()).collect();
-    dll_names.sort();
-    dll_names.dedup();
-
-    let idx = WinApiIndex {
-        functions,
-        constants,
-        dll_names,
-    };
-    let bytes = postcard::to_allocvec(&idx).expect("postcard serialise");
-    let compressed = zstd::stream::encode_all(&*bytes, 19).expect("zstd encode");
-
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("winapi_data.bin.zst");
-    fs::write(&out_path, &compressed).expect("write blob");
-
-    println!(
-        "cargo:warning=newbf-winapi: postcard {} bytes ➜ zstd-19 {} bytes; {} functions, {} dlls",
-        bytes.len(),
-        compressed.len(),
-        idx.functions.len(),
-        idx.dll_names.len(),
-    );
-    println!("cargo:rustc-env=WINAPI_DATA_BIN={}", out_path.display());
+            );
+        }
+    }
 }
