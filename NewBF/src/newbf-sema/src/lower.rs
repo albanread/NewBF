@@ -803,7 +803,10 @@ impl<'a> Lowerer<'a> {
                 IrType::F64,
             ),
             Expr::Bool(s) => (Value::bool(s.text(src) == "true"), IrType::Bool),
-            Expr::Char(_) => (Value::int(0, IrType::U8), IrType::U8),
+            Expr::Char(s) => (
+                Value::int(decode_char_literal(s.text(src)), IrType::U8),
+                IrType::U8,
+            ),
             Expr::Null(_) => (Value::Const(Const::Null), IrType::Ptr),
             Expr::Str(s) => (Value::str(decode_string_literal(s.text(src))), IrType::Ptr),
             Expr::Paren { inner, .. } => self.expr(inner, src),
@@ -1413,6 +1416,29 @@ fn zero_of(ty: IrType) -> Value {
 
 fn undef(ty: IrType) -> Value {
     Value::Const(Const::Undef(ty))
+}
+
+/// Decode a char-literal token (`'A'`, `'\n'`, `'\''`, …) to its code value.
+/// Common C escapes; otherwise the first character's scalar value.
+fn decode_char_literal(raw: &str) -> i128 {
+    let body = raw.strip_prefix('\'').unwrap_or(raw);
+    let body = body.strip_suffix('\'').unwrap_or(body);
+    let mut chars = body.chars();
+    match chars.next() {
+        Some('\\') => match chars.next() {
+            Some('n') => 10,
+            Some('t') => 9,
+            Some('r') => 13,
+            Some('0') => 0,
+            Some('\\') => 92,
+            Some('\'') => 39,
+            Some('"') => 34,
+            Some(c) => c as i128,
+            None => 0,
+        },
+        Some(c) => c as i128,
+        None => 0,
+    }
 }
 
 /// Decode a string-literal token (surrounding quotes + escapes) into its
