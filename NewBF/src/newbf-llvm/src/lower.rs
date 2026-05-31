@@ -611,6 +611,15 @@ impl<'ctx> Codegen<'ctx, '_> {
             CastKind::Bitcast => b
                 .build_bit_cast(v, self.basic_type_of(to), "bitcast")
                 .unwrap(),
+            // int↔ptr reinterprets. The IR types are advisory for external
+            // calls: a symbol's *actual* LLVM signature is fixed by its first
+            // declaration, so a value the IR believes is an integer can already
+            // be a pointer (e.g. a bare `malloc` call whose `@malloc` was
+            // declared `ptr` by corlib's `Internal.Malloc`). When the operand is
+            // already in the target representation the conversion is the
+            // identity — pass it through rather than feeding `inttoptr`/`ptrtoint`
+            // an `undef` from `as_int`/`as_ptr`.
+            CastKind::IntToPtr if v.is_pointer_value() => v,
             CastKind::IntToPtr => b
                 .build_int_to_ptr(
                     self.as_int(v),
@@ -619,6 +628,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                 )
                 .unwrap()
                 .into(),
+            CastKind::PtrToInt if v.is_int_value() => v,
             CastKind::PtrToInt => b
                 .build_ptr_to_int(self.as_ptr(v), self.int_type_of(to), "ptrtoint")
                 .unwrap()
