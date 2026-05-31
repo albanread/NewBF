@@ -56,9 +56,10 @@ struct StructTable {
     /// Per-id mangled-name prefix (`"C."` / `"Outer.Inner."`) — matches the
     /// prefix `lower_type` builds, so ctor/dtor symbol names line up.
     prefixes: Vec<String>,
-    /// Per-id first constructor signature (`this` + explicit params) and
-    /// destructor symbol, for wiring `new`/`delete`.
-    ctors: Vec<Option<MethodSig>>,
+    /// Per-id constructor signatures (`this` + explicit params), one per
+    /// distinct arity (overloaded by argument count), and the destructor
+    /// symbol, for wiring `new`/`delete`.
+    ctors: Vec<Vec<MethodSig>>,
     dtors: Vec<Option<String>>,
     /// Per-id method table (name → signature, this-aware), for resolving
     /// `obj.Method()` and same-type bare calls. First declaration wins.
@@ -91,8 +92,13 @@ impl StructTable {
             })
     }
 
-    fn ctor_of(&self, id: StructId) -> Option<MethodSig> {
-        self.ctors[id.0 as usize].clone()
+    /// The constructor of `id` taking `arity` explicit args (its `params`
+    /// include the leading `this`, so it has `arity + 1` entries).
+    fn ctor_for(&self, id: StructId, arity: usize) -> Option<MethodSig> {
+        self.ctors[id.0 as usize]
+            .iter()
+            .find(|c| c.params.len() == arity + 1)
+            .cloned()
     }
 
     fn dtor_of(&self, id: StructId) -> Option<String> {
@@ -128,7 +134,7 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             });
             t.kinds.push(kind);
             t.prefixes.push(new_prefix.clone());
-            t.ctors.push(None);
+            t.ctors.push(Vec::new());
             t.dtors.push(None);
             t.methods.push(HashMap::new());
             t.field_elems.push(Vec::new());
@@ -197,23 +203,30 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
         t.defs[id.0 as usize].fields = fields;
         t.field_elems[id.0 as usize] = elems;
 
-        // Record the (first) constructor + a destructor for `new`/`delete`, and
-        // the method table (this-aware) for call resolution. First name wins;
-        // the implicit `this` is a reference to the instance body.
+        // Record constructors (one per distinct arity → `$ctorN`), a destructor,
+        // and the method table (this-aware) for call resolution. First of each
+        // wins; the implicit `this` is a reference to the instance body.
         for m in &td.members {
             match m {
-                Member::Constructor { params, .. } if t.ctors[id.0 as usize].is_none() => {
-                    let mut ps = vec![IrType::Ref(id)];
-                    for p in params {
-                        ps.push(lower_ty(&p.ty, src, t));
+                Member::Constructor { params, .. } => {
+                    let arity = params.len();
+                    // Overload by arity; first constructor of each arity wins.
+                    if t.ctors[id.0 as usize]
+                        .iter()
+                        .all(|c| c.params.len() != arity + 1)
+                    {
+                        let mut ps = vec![IrType::Ref(id)];
+                        for p in params {
+                            ps.push(lower_ty(&p.ty, src, t));
+                        }
+                        let full_name = format!("{}$ctor{arity}", t.prefixes[id.0 as usize]);
+                        t.ctors[id.0 as usize].push(MethodSig {
+                            full_name,
+                            ret: IrType::Void,
+                            params: ps,
+                            is_instance: true,
+                        });
                     }
-                    let full_name = format!("{}$ctor", t.prefixes[id.0 as usize]);
-                    t.ctors[id.0 as usize] = Some(MethodSig {
-                        full_name,
-                        ret: IrType::Void,
-                        params: ps,
-                        is_instance: true,
-                    });
                 }
                 Member::Destructor { .. } => {
                     t.dtors[id.0 as usize] = Some(format!("{}$dtor", t.prefixes[id.0 as usize]));
@@ -339,7 +352,8 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
             // them by the `$ctor`/`$dtor` mangled names recorded in the table.
             Member::Constructor { params, body, .. } => {
                 if let Some(&id) = structs.by_name.get(td.name.text(src)) {
-                    let full_name = format!("{new_prefix}$ctor");
+                    // Overloaded by arity: `$ctor{N}` matches what `new` calls.
+                    let full_name = format!("{new_prefix}$ctor{}", params.len());
                     let this = Some(IrType::Ref(id));
                     if let Some(func) = lower_method(
                         full_name,
@@ -1126,18 +1140,17 @@ impl<'a> Lowerer<'a> {
             // Object header (ClassVData*) at offset 0 — null until vtables.
             let hdr = self.fb.field_addr(p.clone(), id, 0);
             self.fb.store(hdr, Value::Const(Const::Null));
-            // Run the constructor if one exists and the arg count matches
-            // (`this` + explicit args); coercion makes each arg its param type.
-            if let Some(ctor) = self.structs.ctor_of(id) {
+            // Run the constructor overload matching the argument count; coercion
+            // makes each arg its declared param type.
+            let args = ctor_args(operand);
+            if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
                 let mut call_args = vec![p.clone()];
-                for (i, a) in ctor_args(operand).iter().enumerate() {
+                for (i, a) in args.iter().enumerate() {
                     let (v, t) = self.expr(a, src);
                     let pt = ctor.params.get(i + 1).copied().unwrap_or(t);
                     call_args.push(self.coerce(v, t, pt));
                 }
-                if call_args.len() == ctor.params.len() {
-                    self.fb.call(ctor.full_name, call_args, IrType::Void);
-                }
+                self.fb.call(ctor.full_name, call_args, IrType::Void);
             }
             return (p, IrType::Ref(id));
         }
