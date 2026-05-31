@@ -60,6 +60,9 @@ struct StructTable {
     /// destructor symbol, for wiring `new`/`delete`.
     ctors: Vec<Option<MethodSig>>,
     dtors: Vec<Option<String>>,
+    /// Per-id method table (name → signature, this-aware), for resolving
+    /// `obj.Method()` and same-type bare calls. First declaration wins.
+    methods: Vec<HashMap<String, MethodSig>>,
 }
 
 impl StructTable {
@@ -124,6 +127,7 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.prefixes.push(new_prefix.clone());
             t.ctors.push(None);
             t.dtors.push(None);
+            t.methods.push(HashMap::new());
             t.by_name.insert(name, id);
         }
     }
@@ -183,8 +187,9 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
         }
         t.defs[id.0 as usize].fields = fields;
 
-        // Record the (first) constructor + a destructor for `new`/`delete`.
-        // The implicit `this` is a reference to the instance body.
+        // Record the (first) constructor + a destructor for `new`/`delete`, and
+        // the method table (this-aware) for call resolution. First name wins;
+        // the implicit `this` is a reference to the instance body.
         for m in &td.members {
             match m {
                 Member::Constructor { params, .. } if t.ctors[id.0 as usize].is_none() => {
@@ -197,10 +202,41 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                         full_name,
                         ret: IrType::Void,
                         params: ps,
+                        is_instance: true,
                     });
                 }
                 Member::Destructor { .. } => {
                     t.dtors[id.0 as usize] = Some(format!("{}$dtor", t.prefixes[id.0 as usize]));
+                }
+                Member::Method {
+                    return_ty,
+                    name,
+                    params,
+                    body,
+                    modifiers,
+                    ..
+                } if !matches!(body, MethodBody::None) => {
+                    let nm = name.text(src).to_string();
+                    if t.methods[id.0 as usize].contains_key(&nm) {
+                        continue;
+                    }
+                    let is_instance = !modifiers
+                        .iter()
+                        .any(|(mo, _)| matches!(mo, Modifier::Static));
+                    let mut ps = Vec::new();
+                    if is_instance {
+                        ps.push(IrType::Ref(id));
+                    }
+                    for p in params {
+                        ps.push(lower_ty(&p.ty, src, t));
+                    }
+                    let sig = MethodSig {
+                        full_name: format!("{}{}", t.prefixes[id.0 as usize], nm),
+                        ret: lower_ty(return_ty, src, t),
+                        params: ps,
+                        is_instance,
+                    };
+                    t.methods[id.0 as usize].insert(nm, sig);
                 }
                 _ => {}
             }
@@ -244,40 +280,24 @@ fn lower_items(items: &[Item], prefix: &str, src: &str, structs: &StructTable, m
 struct MethodSig {
     full_name: String,
     ret: IrType,
+    /// Parameter types in ABI order. For an instance method this includes the
+    /// leading `this` (a `Ref` to the body); a static method has only its
+    /// explicit params.
     params: Vec<IrType>,
+    is_instance: bool,
 }
 
 fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
-    // Index this type's methods first so bodies can resolve calls to siblings
-    // (incl. recursion). First declaration of a name wins (overloads later).
-    let mut sigs: HashMap<String, MethodSig> = HashMap::new();
-    for member in &td.members {
-        if let Member::Method {
-            return_ty,
-            name,
-            params,
-            body,
-            ..
-        } = member
-        {
-            // Only body-having methods are lowered + declared; indexing a
-            // body-less overload (extern/abstract) would aim a same-arity call
-            // at a symbol that's never emitted (or a different overload).
-            if matches!(body, MethodBody::None) {
-                continue;
-            }
-            let nm = name.text(src).to_string();
-            sigs.entry(nm.clone()).or_insert_with(|| MethodSig {
-                full_name: format!("{new_prefix}{nm}"),
-                ret: lower_ty(return_ty, src, structs),
-                params: params
-                    .iter()
-                    .map(|p| lower_ty(&p.ty, src, structs))
-                    .collect(),
-            });
-        }
-    }
+    // The type's own method table (this-aware, built in the pre-pass) resolves
+    // same-type bare calls; an empty map covers unregistered types (generics,
+    // interfaces).
+    let owner_id = structs.by_name.get(td.name.text(src)).copied();
+    let empty: HashMap<String, MethodSig> = HashMap::new();
+    let sigs: &HashMap<String, MethodSig> = match owner_id {
+        Some(id) => &structs.methods[id.0 as usize],
+        None => &empty,
+    };
     for member in &td.members {
         match member {
             Member::Method {
@@ -285,12 +305,21 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                 name,
                 params,
                 body,
+                modifiers,
                 ..
             } => {
                 let full_name = format!("{new_prefix}{}", name.text(src));
                 let ret = lower_ty(return_ty, src, structs);
+                // Instance methods take a leading `this`; static ones don't.
+                let is_static = modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static));
+                let this_ty = match owner_id {
+                    Some(id) if !is_static => Some(IrType::Ref(id)),
+                    _ => None,
+                };
                 if let Some(func) =
-                    lower_method(full_name, ret, params, body, src, &sigs, structs, None)
+                    lower_method(full_name, ret, params, body, src, sigs, structs, this_ty)
                 {
                     m.add_function(func);
                 }
@@ -308,7 +337,7 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                         params,
                         body,
                         src,
-                        &sigs,
+                        sigs,
                         structs,
                         this,
                     ) {
@@ -320,16 +349,9 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                 if let Some(&id) = structs.by_name.get(td.name.text(src)) {
                     let full_name = format!("{new_prefix}$dtor");
                     let this = Some(IrType::Ref(id));
-                    if let Some(func) = lower_method(
-                        full_name,
-                        IrType::Void,
-                        &[],
-                        body,
-                        src,
-                        &sigs,
-                        structs,
-                        this,
-                    ) {
+                    if let Some(func) =
+                        lower_method(full_name, IrType::Void, &[], body, src, sigs, structs, this)
+                    {
                         m.add_function(func);
                     }
                 }
@@ -769,6 +791,10 @@ impl<'a> Lowerer<'a> {
                 op, target, value, ..
             } => self.assign(*op, target, value, src),
             Expr::Call { callee, args, .. } => {
+                // Method call on a receiver: `obj.Method(args)` / `this.M(args)`.
+                if let Expr::Member { base, name, .. } = &**callee {
+                    return self.lower_method_call(base, name.text(src), args, src);
+                }
                 let arg_vals: Vec<(Value, IrType)> =
                     args.iter().map(|a| self.expr(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
@@ -1035,6 +1061,47 @@ impl<'a> Lowerer<'a> {
         }
         self.fb.call("free", vec![v], IrType::Void);
         (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
+    }
+
+    /// Lower a method call `receiver.Method(args)`. Resolves the receiver's
+    /// type, looks up the method (this-aware), and emits a direct call — passing
+    /// the receiver as `this` for an instance method. Degrades (evaluating args
+    /// for their effects) when the method can't be resolved.
+    fn lower_method_call(
+        &mut self,
+        base: &Expr,
+        mname: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        if let Some((body_ptr, owner_id)) = self.struct_base(base, src)
+            && let Some(sig) = self.structs.methods[owner_id.0 as usize]
+                .get(mname)
+                .cloned()
+        {
+            let mut call_args = Vec::new();
+            let mut pidx = 0;
+            if sig.is_instance {
+                call_args.push(body_ptr);
+                pidx = 1;
+            }
+            for a in args {
+                let (v, t) = self.expr(a, src);
+                let pt = sig.params.get(pidx).copied().unwrap_or(t);
+                call_args.push(self.coerce(v, t, pt));
+                pidx += 1;
+            }
+            // Arity must match the declared signature for the call to be
+            // well-typed; otherwise fall through to the degrade path.
+            if call_args.len() == sig.params.len() {
+                let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                return (r, sig.ret);
+            }
+        }
+        for a in args {
+            self.expr(a, src);
+        }
+        (undef(IrType::I64), IrType::I64)
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, src: &str) -> (Value, IrType) {
