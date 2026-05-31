@@ -16,6 +16,7 @@
 /// (see `docs/STDLIB.md`). Order is dependency-respecting (lowest layer first).
 pub fn prelude() -> &'static [(&'static str, &'static str)] {
     &[
+        ("Internal.bf", include_str!("../bf/Internal.bf")),
         ("Probe.bf", include_str!("../bf/Probe.bf")),
         ("Math.bf", include_str!("../bf/Math.bf")),
     ]

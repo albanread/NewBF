@@ -22,7 +22,7 @@ use newbf_ir::{
 };
 use newbf_lexer::FileId;
 use newbf_parser::{
-    AssignOp, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody, Modifier,
+    AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody, Modifier,
     Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp, parse_file,
 };
 
@@ -238,12 +238,25 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                     params,
                     body,
                     modifiers,
+                    attributes,
                     ..
-                } if !matches!(body, MethodBody::None) => {
+                } => {
                     let nm = name.text(src).to_string();
                     if t.methods[id.0 as usize].contains_key(&nm) {
                         continue;
                     }
+                    // A body-having method emits `{prefix}{name}`; a body-less
+                    // `[Intrinsic]`/`[LinkName]` extern resolves to its symbol;
+                    // any other body-less method (abstract/interface) isn't
+                    // callable and is skipped.
+                    let full_name = if matches!(body, MethodBody::None) {
+                        match extern_symbol(attributes, src) {
+                            Some(sym) => sym,
+                            None => continue,
+                        }
+                    } else {
+                        format!("{}{}", t.prefixes[id.0 as usize], nm)
+                    };
                     let is_instance = !modifiers
                         .iter()
                         .any(|(mo, _)| matches!(mo, Modifier::Static));
@@ -255,7 +268,7 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                         ps.push(lower_ty(&p.ty, src, t));
                     }
                     let sig = MethodSig {
-                        full_name: format!("{}{}", t.prefixes[id.0 as usize], nm),
+                        full_name,
                         ret: lower_ty(return_ty, src, t),
                         params: ps,
                         is_instance,
@@ -1553,6 +1566,24 @@ fn ctor_class_name<'s>(e: &Expr, src: &'s str) -> Option<&'s str> {
         Expr::Generic { base, .. } => ctor_class_name(base, src),
         _ => None,
     }
+}
+
+/// The external symbol a body-less `[Intrinsic("sym")]` / `[LinkName("sym")]`
+/// method binds to (so `Internal.MemCpy` calls `memcpy`). `None` if the method
+/// has no such attribute.
+fn extern_symbol(attrs: &[Attribute], src: &str) -> Option<String> {
+    for a in attrs {
+        let aname = match &a.name {
+            AstType::Path { segments, .. } => segments.last().map(|s| s.name.text(src)),
+            _ => None,
+        };
+        if matches!(aname, Some("Intrinsic" | "LinkName"))
+            && let Some(Expr::Str(s)) = a.args.first()
+        {
+            return Some(decode_string_literal(s.text(src)));
+        }
+    }
+    None
 }
 
 /// The constructor argument expressions in a `new` operand: `new C(a, b)` →
