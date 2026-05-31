@@ -157,6 +157,12 @@ impl FunctionBuilder {
         self.emit(InstKind::SizeOf { struct_id }, IrType::I64, None)
     }
 
+    /// Address of element `index` of the typed pointer `base` (scaled by
+    /// `sizeof(elem)`); result is a `ptr` to that element.
+    pub fn elem_addr(&mut self, base: Value, elem: IrType, index: Value) -> Value {
+        self.emit(InstKind::ElemAddr { base, elem, index }, IrType::Ptr, None)
+    }
+
     pub fn call(&mut self, name: impl Into<String>, args: Vec<Value>, ret: IrType) -> Value {
         self.emit(
             InstKind::Call {

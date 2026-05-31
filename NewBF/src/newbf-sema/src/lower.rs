@@ -412,9 +412,10 @@ fn lower_method(
     for (i, p) in params.iter().enumerate() {
         if let Some(nm) = &p.name {
             let ty = lower_ty(&p.ty, src, structs);
+            let elem = pointer_elem(&p.ty, src, structs);
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
-            lw.bind(nm.text(src), slot, ty);
+            lw.bind(nm.text(src), slot, ty, elem);
         }
     }
 
@@ -435,11 +436,17 @@ fn lower_method(
     Some(lw.fb.finish())
 }
 
+/// A bound local/parameter: stack slot, slot type, and (for typed pointers)
+/// the element type — see [`Lowerer::lookup_elem`].
+type Binding = (Value, IrType, Option<IrType>);
+
 struct Lowerer<'a> {
     fb: FunctionBuilder,
     ret_ty: IrType,
-    /// Lexical scope stack: name → (stack-slot pointer, slot type).
-    scopes: Vec<HashMap<String, (Value, IrType)>>,
+    /// Lexical scope stack: name → (stack-slot pointer, slot type, pointer
+    /// element type). The third field is `Some` only for typed-pointer
+    /// locals/params (`T*`), so `p[i]` knows the element width/stride.
+    scopes: Vec<HashMap<String, Binding>>,
     /// Whether the current block already has a terminator (stop emitting).
     terminated: bool,
     /// Sibling methods (same type), for resolving bare-name calls.
@@ -474,15 +481,28 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn bind(&mut self, name: &str, slot: Value, ty: IrType) {
+    fn bind(&mut self, name: &str, slot: Value, ty: IrType, elem: Option<IrType>) {
         self.scopes
             .last_mut()
             .unwrap()
-            .insert(name.to_string(), (slot, ty));
+            .insert(name.to_string(), (slot, ty, elem));
     }
 
     fn lookup(&self, name: &str) -> Option<(Value, IrType)> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name))
+            .map(|(slot, ty, _)| (slot.clone(), *ty))
+    }
+
+    /// The element type recorded for a pointer local/param — for `p[i]`.
+    fn lookup_elem(&self, name: &str) -> Option<IrType> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name))
+            .and_then(|(_, _, elem)| *elem)
     }
 
     fn switch(&mut self, b: BlockId) {
@@ -549,7 +569,9 @@ impl<'a> Lowerer<'a> {
                     let v = self.coerce(v, t, slot_ty);
                     self.fb.store(slot.clone(), v);
                 }
-                self.bind(name.text(src), slot, slot_ty);
+                // Record the element type for a typed-pointer local (`T* p`).
+                let elem = ty.as_ref().and_then(|t| pointer_elem(t, src, self.structs));
+                self.bind(name.text(src), slot, slot_ty, elem);
             }
             Stmt::Return { value, .. } => {
                 // Coerce the returned value to the function's return type so
@@ -847,6 +869,11 @@ impl<'a> Lowerer<'a> {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
             },
+            // Index read (`p[i]`): load the element at the computed address.
+            Expr::Index { .. } => match self.lvalue(e, src) {
+                Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
+                None => (undef(IrType::I64), IrType::I64),
+            },
             // this/base, index, generic, cast, tuple, lambda, new/scope
             // prefixes, .Variant, named args — not lowered yet.
             _ => (undef(IrType::I64), IrType::I64),
@@ -992,6 +1019,25 @@ impl<'a> Lowerer<'a> {
                 };
                 Some((self.fb.field_addr(body_ptr, id, idx), fty))
             }
+            // `p[i]` over a typed pointer: address = base + index·sizeof(elem).
+            Expr::Index { base, args, .. } => {
+                let elem = self.ptr_elem_of(base, src)?;
+                let idx_expr = args.first()?;
+                let (basev, _bt) = self.expr(base, src);
+                let (iv, it) = self.expr(idx_expr, src);
+                let iv = self.coerce(iv, it, IrType::I64);
+                Some((self.fb.elem_addr(basev, elem, iv), elem))
+            }
+            _ => None,
+        }
+    }
+
+    /// The element type of a typed-pointer base expression (`T* p` → `T`), for
+    /// indexing. Resolves pointer locals/params (and through parens) today.
+    fn ptr_elem_of(&self, e: &Expr, src: &str) -> Option<IrType> {
+        match e {
+            Expr::Paren { inner, .. } => self.ptr_elem_of(inner, src),
+            Expr::Ident(s) => self.lookup_elem(s.text(src)),
             _ => None,
         }
     }
@@ -1383,6 +1429,16 @@ fn ctor_args(e: &Expr) -> &[Expr] {
         Expr::Call { args, .. } => args,
         Expr::Paren { inner, .. } => ctor_args(inner),
         _ => &[],
+    }
+}
+
+/// The element type of an AST pointer type (`T*` → `T`), for typed indexing.
+/// `None` for non-pointer types.
+fn pointer_elem(ty: &AstType, src: &str, structs: &StructTable) -> Option<IrType> {
+    match ty {
+        AstType::Pointer { inner, .. } => Some(lower_ty(inner, src, structs)),
+        AstType::Nullable { inner, .. } => pointer_elem(inner, src, structs),
+        _ => None,
     }
 }
 

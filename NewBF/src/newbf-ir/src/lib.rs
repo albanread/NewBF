@@ -240,6 +240,28 @@ mod tests {
     }
 
     #[test]
+    fn elem_addr_indexing_renders() {
+        // i32 at2(i32* p) => p[2]
+        let mut f = FunctionBuilder::new(
+            "at2",
+            vec![Param {
+                name: Some("p".into()),
+                ty: IrType::Ptr,
+            }],
+            IrType::I32,
+        );
+        let p = f.param(0);
+        let addr = f.elem_addr(p, IrType::I32, Value::int(2, IrType::I64)); // %1
+        let v = f.load(addr, IrType::I32); // %2
+        f.ret(Some(v));
+        let mut m = Module::new("t");
+        m.add_function(f.finish());
+        let r = format_ir(&m);
+        assert!(r.contains("%1 = elemaddr i32, %0, 2"), "{r}");
+        assert!(r.contains("%2 = load i32, %1"), "{r}");
+    }
+
+    #[test]
     fn types_and_floats() {
         let mut f = FunctionBuilder::new(
             "fma",

@@ -427,6 +427,15 @@ impl<'ctx> Codegen<'ctx, '_> {
             InstKind::SizeOf { struct_id } => self.struct_types[struct_id.0 as usize]
                 .size_of()
                 .map(Into::into),
+            InstKind::ElemAddr { base, elem, index } => {
+                let basep = self.as_ptr(self.value_of(base, results, llvm_fn)?);
+                let idx = self.as_int(self.value_of(index, results, llvm_fn)?);
+                let ety = self.basic_type_of(*elem);
+                // SAFETY: a single-index GEP from a base pointer (pointer +
+                // index scaled by sizeof(elem)). Degrades on a builder error.
+                let gep = unsafe { self.builder.build_in_bounds_gep(ety, basep, &[idx], "elem") };
+                gep.ok().map(Into::into)
+            }
             InstKind::Call { callee, args } => {
                 let argv: Vec<BasicValueEnum<'ctx>> = args
                     .iter()
@@ -787,6 +796,36 @@ mod tests {
         // `Ref` lowers to a plain pointer in the signature.
         assert!(ir.contains("define ptr @mk()"), "{ir}");
         assert!(ir.contains("call ptr @malloc"), "{ir}");
+    }
+
+    #[test]
+    fn elem_addr_indexing_verifies() {
+        // i32 at(i32* p, int i) { return p[i]; }
+        let mut f = FunctionBuilder::new(
+            "at",
+            vec![
+                Param {
+                    name: Some("p".into()),
+                    ty: IrType::Ptr,
+                },
+                Param {
+                    name: Some("i".into()),
+                    ty: IrType::I64,
+                },
+            ],
+            IrType::I32,
+        );
+        let p = f.param(0);
+        let i = f.param(1);
+        let addr = f.elem_addr(p, IrType::I32, i);
+        let v = f.load(addr, IrType::I32);
+        f.ret(Some(v));
+        let mut m = IrModule::new("t");
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("indexing verifies");
+        let ir = lower_to_string(&m);
+        assert!(ir.contains("getelementptr"), "{ir}");
     }
 
     #[test]

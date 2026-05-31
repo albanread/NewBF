@@ -155,6 +155,12 @@ impl Printer<'_> {
                 field,
             } => format!("fieldaddr %s{}, {}, {field}", struct_id.0, self.value(base)),
             InstKind::SizeOf { struct_id } => format!("sizeof %s{}", struct_id.0),
+            InstKind::ElemAddr { base, elem, index } => format!(
+                "elemaddr {}, {}, {}",
+                elem.mnemonic(),
+                self.value(base),
+                self.value(index)
+            ),
             InstKind::Call { callee, args } => {
                 let a: Vec<String> = args.iter().map(|v| self.value(v)).collect();
                 format!("call {} @{}({})", ty.mnemonic(), callee.name, a.join(", "))

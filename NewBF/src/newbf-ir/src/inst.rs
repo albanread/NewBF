@@ -244,6 +244,14 @@ pub enum InstKind {
     SizeOf {
         struct_id: StructId,
     },
+    /// Address of element `index` of a typed pointer/array: `base + index`
+    /// scaled by `sizeof(elem)`. Result is a `ptr` to the element (an LLVM
+    /// `getelementptr elem, ptr base, index`). For pointer/array subscripts.
+    ElemAddr {
+        base: Value,
+        elem: IrType,
+        index: Value,
+    },
     Call {
         callee: Callee,
         args: Vec<Value>,
