@@ -309,6 +309,60 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
+    /// Reconcile a value whose actual LLVM type differs from the type the IR
+    /// expects, coercing it to `ty`. The skew arises at external calls: a
+    /// symbol's signature is fixed by its *first* declaration, so overloaded
+    /// externs that share a C symbol (`Abs(float)`/`Abs(double)` → `@abs`) or a
+    /// bare `malloc` vs corlib's `void* Malloc` make the call yield one width
+    /// while sema expects another. Reconciling at the call site keeps every
+    /// downstream use well-typed (so comparisons/arithmetic don't see a skew).
+    fn reconcile_to(&self, v: BasicValueEnum<'ctx>, ty: IrType) -> BasicValueEnum<'ctx> {
+        if v.get_type() == self.basic_type_of(ty) {
+            return v;
+        }
+        let b = self.builder;
+        match ty {
+            IrType::Float { bits } if v.is_float_value() => {
+                let fv = v.into_float_value();
+                if bits >= 64 {
+                    b.build_float_ext(fv, self.ctx.f64_type(), "fpext")
+                        .unwrap()
+                        .into()
+                } else {
+                    b.build_float_trunc(fv, self.ctx.f32_type(), "fptrunc")
+                        .unwrap()
+                        .into()
+                }
+            }
+            IrType::Int { .. } | IrType::Bool if v.is_int_value() => {
+                let iv = v.into_int_value();
+                let want = self.int_type_of(ty);
+                if iv.get_type().get_bit_width() < want.get_bit_width() {
+                    if ty.is_signed() {
+                        b.build_int_s_extend(iv, want, "sext").unwrap().into()
+                    } else {
+                        b.build_int_z_extend(iv, want, "zext").unwrap().into()
+                    }
+                } else {
+                    b.build_int_truncate(iv, want, "trunc").unwrap().into()
+                }
+            }
+            IrType::Int { .. } | IrType::Bool if v.is_pointer_value() => b
+                .build_ptr_to_int(v.into_pointer_value(), self.int_type_of(ty), "ptrtoint")
+                .unwrap()
+                .into(),
+            IrType::Ptr | IrType::Ref(_) if v.is_int_value() => b
+                .build_int_to_ptr(
+                    v.into_int_value(),
+                    self.ctx.ptr_type(AddressSpace::default()),
+                    "inttoptr",
+                )
+                .unwrap()
+                .into(),
+            _ => v,
+        }
+    }
+
     // ── function bodies ───────────────────────────────────────────────────
 
     fn lower_function(&self, func: &IrFunction) {
@@ -448,7 +502,9 @@ impl<'ctx> Codegen<'ctx, '_> {
                 if ty == IrType::Void {
                     None
                 } else {
-                    cs.try_as_basic_value().basic()
+                    cs.try_as_basic_value()
+                        .basic()
+                        .map(|v| self.reconcile_to(v, ty))
                 }
             }
             // Phis are created in `lower_function` so their results exist
