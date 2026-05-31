@@ -21,19 +21,37 @@ use newbf_ir::{
     Module, Param as IrParam, StructDef, StructId, Value,
 };
 use newbf_parser::{
-    AssignOp, BinOp as AstBin, Expr, Item, Member, MethodBody, Modifier, Param as AstParam, Stmt,
-    Type as AstType, TypeDecl, TypeKind, UnOp,
+    AssignOp, BinOp as AstBin, Expr, Item, Member, MethodBody, Modifier, Param as AstParam,
+    PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp,
 };
 
 use crate::Program;
 use crate::build::SourceFile;
 
-/// Value-struct layouts collected before lowering: simple-name → id, plus the
-/// field lists (mirrored into [`Module::structs`] for the backend). Built in
-/// two passes so a struct field whose type is another struct resolves.
+/// Whether a registered type is a value `struct` (inline aggregate) or a
+/// `class` (heap object referenced by pointer).
+#[derive(Clone, Copy)]
+enum StructKind {
+    Value,
+    Ref,
+}
+
+fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
+    match td.kind {
+        TypeKind::Struct => Some(StructKind::Value),
+        TypeKind::Class => Some(StructKind::Ref),
+        _ => None, // interface / enum / extension — not yet
+    }
+}
+
+/// Type layouts collected before lowering: simple-name → id, the per-id kind
+/// (value vs reference), and field lists (mirrored into [`Module::structs`] for
+/// the backend). Two passes so a field whose type is another registered type
+/// resolves.
 #[derive(Default)]
 struct StructTable {
     by_name: HashMap<String, StructId>,
+    kinds: Vec<StructKind>,
     defs: Vec<StructDef>,
 }
 
@@ -47,6 +65,17 @@ impl StructTable {
             fill_struct_fields(&f.unit.items, f.src, &mut t);
         }
         t
+    }
+
+    /// The IR type naming `name`: a value struct → `Struct(id)`, a class →
+    /// `Ref(id)`. `None` if `name` isn't a registered type.
+    fn ty_of(&self, name: &str) -> Option<IrType> {
+        self.by_name
+            .get(name)
+            .map(|&id| match self.kinds[id.0 as usize] {
+                StructKind::Value => IrType::Struct(id),
+                StructKind::Ref => IrType::Ref(id),
+            })
     }
 }
 
@@ -63,9 +92,11 @@ fn register_struct_names(items: &[Item], src: &str, t: &mut StructTable) {
 }
 
 fn register_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
-    // Only non-generic value `struct`s become aggregate layouts; a `class` is a
-    // reference (stays `Ptr`), and generics await monomorphization.
-    if td.kind == TypeKind::Struct && td.generic_params.is_empty() {
+    // Register non-generic value `struct`s (inline) and `class`es (referenced);
+    // generics await monomorphization, interfaces/enums are separate.
+    if let Some(kind) = struct_kind(td)
+        && td.generic_params.is_empty()
+    {
         let name = td.name.text(src).to_string();
         if !t.by_name.contains_key(&name) {
             let id = StructId(t.defs.len() as u32);
@@ -73,6 +104,7 @@ fn register_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                 name: name.clone(),
                 fields: Vec::new(),
             });
+            t.kinds.push(kind);
             t.by_name.insert(name, id);
         }
     }
@@ -96,13 +128,18 @@ fn fill_struct_fields(items: &[Item], src: &str, t: &mut StructTable) {
 }
 
 fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
-    let id = if td.kind == TypeKind::Struct && td.generic_params.is_empty() {
-        t.by_name.get(td.name.text(src)).copied()
-    } else {
-        None
-    };
-    if let Some(id) = id {
+    let kind = struct_kind(td).filter(|_| td.generic_params.is_empty());
+    let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
+    if let (Some(kind), Some(id)) = (kind, id) {
         let mut fields = Vec::new();
+        // A class instance carries an object header (ClassVData*) at offset 0;
+        // a value struct has none. Real fields follow.
+        if matches!(kind, StructKind::Ref) {
+            fields.push(FieldDef {
+                name: "$header".into(),
+                ty: IrType::Ptr,
+            });
+        }
         for m in &td.members {
             if let Member::Field {
                 ty,
@@ -669,8 +706,19 @@ impl<'a> Lowerer<'a> {
                     (undef(IrType::I64), IrType::I64)
                 }
             }
-            // Member read (`obj.field`): load the resolved field; degrade if
-            // the base isn't a known value-struct place.
+            // Heap allocation / free.
+            Expr::Prefix {
+                kw: PrefixKw::New,
+                operand,
+                ..
+            } => self.lower_new(operand, src),
+            Expr::Prefix {
+                kw: PrefixKw::Delete,
+                operand,
+                ..
+            } => self.lower_delete(operand, src),
+            // Member read (`obj.field` / `ref.field`): load the resolved field;
+            // degrade if the base isn't a known struct/reference place.
             Expr::Member { .. } => match self.lvalue(e, src) {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
@@ -808,10 +856,7 @@ impl<'a> Lowerer<'a> {
             Expr::Paren { inner, .. } => self.lvalue(inner, src),
             Expr::Ident(s) => self.lookup(s.text(src)),
             Expr::Member { base, name, .. } => {
-                let (base_ptr, base_ty) = self.lvalue(base, src)?;
-                let IrType::Struct(id) = base_ty else {
-                    return None;
-                };
+                let (body_ptr, id) = self.struct_base(base, src)?;
                 let fname = name.text(src);
                 // Copy index + field type out, ending the `defs` borrow before
                 // the `&mut self` field-address emit.
@@ -820,10 +865,58 @@ impl<'a> Lowerer<'a> {
                     let i = def.fields.iter().position(|f| f.name == fname)?;
                     (i as u32, def.fields[i].ty)
                 };
-                Some((self.fb.field_addr(base_ptr, id, idx), fty))
+                Some((self.fb.field_addr(body_ptr, id, idx), fty))
             }
             _ => None,
         }
+    }
+
+    /// Resolve the base of a member access to `(body_pointer, struct_id)`.
+    /// A value struct's place *is* its body; a class reference's place holds a
+    /// pointer, so load it to reach the heap body.
+    fn struct_base(&mut self, base: &Expr, src: &str) -> Option<(Value, StructId)> {
+        match self.lvalue(base, src) {
+            Some((place, IrType::Struct(id))) => Some((place, id)),
+            Some((place, IrType::Ref(id))) => {
+                let body = self.fb.load(place, IrType::Ptr);
+                Some((body, id))
+            }
+            Some(_) => None,
+            None => {
+                // Non-lvalue base (e.g. `new C().x`): a reference rvalue is
+                // itself the body pointer.
+                let (v, t) = self.expr(base, src);
+                if let IrType::Ref(id) = t {
+                    Some((v, id))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// `new C(...)` → `malloc(sizeof C)` + a zeroed object header, yielding a
+    /// `Ref(C)`. The constructor call is deferred (a later sprint); fields are
+    /// left at their freshly-allocated (indeterminate) values for now.
+    fn lower_new(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
+        if let Some(name) = ctor_class_name(operand, src)
+            && let Some(IrType::Ref(id)) = self.structs.ty_of(name)
+        {
+            let size = self.fb.size_of(id);
+            let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
+            // Object header (ClassVData*) at offset 0 — null until vtables.
+            let hdr = self.fb.field_addr(p.clone(), id, 0);
+            self.fb.store(hdr, Value::Const(Const::Null));
+            return (p, IrType::Ref(id));
+        }
+        (undef(IrType::Ptr), IrType::Ptr)
+    }
+
+    /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).
+    fn lower_delete(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
+        let (v, _t) = self.expr(operand, src);
+        self.fb.call("free", vec![v], IrType::Void);
+        (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, src: &str) -> (Value, IrType) {
@@ -926,8 +1019,11 @@ impl<'a> Lowerer<'a> {
                 };
                 self.fb.cast(kind, v, to)
             }
-            (IrType::Ptr, b) if b.is_int() => self.fb.cast(CastKind::PtrToInt, v, to),
-            (a, IrType::Ptr) if a.is_int() => self.fb.cast(CastKind::IntToPtr, v, to),
+            // Pointer-like (`Ptr`/`Ref`) ↔ pointer-like: same LLVM `ptr`, so a
+            // plain reinterpret (no cast instruction needed).
+            (a, b) if a.is_pointer() && b.is_pointer() => v,
+            (a, b) if a.is_pointer() && b.is_int() => self.fb.cast(CastKind::PtrToInt, v, to),
+            (a, b) if a.is_int() && b.is_pointer() => self.fb.cast(CastKind::IntToPtr, v, to),
             // No single cast bridges the gap — stay well-typed with an undef.
             _ => undef(to),
         }
@@ -1032,6 +1128,8 @@ fn zero_of(ty: IrType) -> Value {
         IrType::Ptr => Value::Const(Const::Null),
         IrType::Void => Value::Const(Const::Undef(ty)),
         IrType::Int { .. } => Value::int(0, ty),
+        // A reference's zero is the null pointer.
+        IrType::Ref(_) => Value::Const(Const::Null),
         // Aggregates have no scalar zero; an `undef` keeps the IR well-typed.
         IrType::Struct(_) => Value::Const(Const::Undef(ty)),
     }
@@ -1081,16 +1179,25 @@ fn decode_string_literal(raw: &str) -> String {
 /// Map an AST type to its concrete IR type. Reference/unknown types collapse
 /// to an opaque pointer (correct for classes; a kernel approximation for
 /// value structs/tuples until the layout sprint).
+/// The class name a `new`/`scope` operand constructs: `C`, `C(args)`, and
+/// `C<T>(args)` all name `C`.
+fn ctor_class_name<'s>(e: &Expr, src: &'s str) -> Option<&'s str> {
+    match e {
+        Expr::Ident(s) => Some(s.text(src)),
+        Expr::Paren { inner, .. } => ctor_class_name(inner, src),
+        Expr::Call { callee, .. } => ctor_class_name(callee, src),
+        Expr::Generic { base, .. } => ctor_class_name(base, src),
+        _ => None,
+    }
+}
+
 fn lower_ty(ty: &AstType, src: &str, structs: &StructTable) -> IrType {
     match ty {
         AstType::Path { segments, .. } if segments.len() == 1 && segments[0].args.is_empty() => {
             // A single-segment name that's a registered value `struct` lowers to
             // its aggregate; otherwise a primitive (or `Ptr` for a reference).
             let name = segments[0].name.text(src);
-            match structs.by_name.get(name) {
-                Some(&id) => IrType::Struct(id),
-                None => primitive(name),
-            }
+            structs.ty_of(name).unwrap_or_else(|| primitive(name))
         }
         AstType::Pointer { .. } => IrType::Ptr,
         AstType::Nullable { inner, .. } => lower_ty(inner, src, structs),

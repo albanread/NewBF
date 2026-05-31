@@ -29,6 +29,10 @@ pub enum IrType {
     /// module's struct table. Used as an `alloca`'s element type and the base
     /// type of a `fieldaddr`; the field list lives in [`crate::StructDef`].
     Struct(StructId),
+    /// A typed reference: a pointer to a heap object whose body layout is the
+    /// struct `id` (a class instance). Lowers to a plain `ptr`, but carries the
+    /// nominal class so member access can `fieldaddr` through the body.
+    Ref(StructId),
 }
 
 impl IrType {
@@ -77,13 +81,19 @@ impl IrType {
         matches!(self, IrType::Int { signed: true, .. })
     }
 
+    /// Pointer-like: an opaque `Ptr` or a typed `Ref`. Both are LLVM `ptr`, so
+    /// coercion treats them interchangeably.
+    pub fn is_pointer(self) -> bool {
+        matches!(self, IrType::Ptr | IrType::Ref(_))
+    }
+
     /// Bit width of a scalar type (`Void`/`Ptr` report 0 / pointer width).
     pub fn bit_width(self) -> u16 {
         match self {
             IrType::Void => 0,
             IrType::Bool => 1,
             IrType::Int { bits, .. } | IrType::Float { bits } => bits,
-            IrType::Ptr => 64,
+            IrType::Ptr | IrType::Ref(_) => 64,
             // Aggregates have no single scalar width; scalar coercion never
             // reaches here for a struct.
             IrType::Struct(_) => 0,
@@ -99,6 +109,7 @@ impl IrType {
             IrType::Float { bits } => format!("f{bits}"),
             IrType::Ptr => "ptr".to_string(),
             IrType::Struct(id) => format!("%s{}", id.0),
+            IrType::Ref(id) => format!("&s{}", id.0),
         }
     }
 }

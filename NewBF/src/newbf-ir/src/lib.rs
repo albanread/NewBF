@@ -212,6 +212,34 @@ mod tests {
     }
 
     #[test]
+    fn ref_type_and_sizeof_render() {
+        // ref<C> mk() { return (C)malloc(sizeof C); }  — class C { int64 hdr; i32 x; }
+        let mut m = Module::new("t");
+        let c = m.add_struct(StructDef {
+            name: "C".into(),
+            fields: vec![
+                FieldDef {
+                    name: "$hdr".into(),
+                    ty: IrType::I64,
+                },
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        let mut f = FunctionBuilder::new("mk", vec![], IrType::Ref(c));
+        let sz = f.size_of(c); // %0 : i64
+        let p = f.call("malloc", vec![sz], IrType::Ref(c)); // %1 : &s0
+        f.ret(Some(p));
+        m.add_function(f.finish());
+        let r = format_ir(&m);
+        assert!(r.contains("func @mk() -> &s0"), "{r}");
+        assert!(r.contains("%0 = sizeof %s0"), "{r}");
+        assert!(r.contains("%1 = call &s0 @malloc(%0)"), "{r}");
+    }
+
+    #[test]
     fn types_and_floats() {
         let mut f = FunctionBuilder::new(
             "fma",

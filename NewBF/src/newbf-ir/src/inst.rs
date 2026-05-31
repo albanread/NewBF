@@ -239,6 +239,11 @@ pub enum InstKind {
         struct_id: StructId,
         field: u32,
     },
+    /// The ABI byte size of struct `struct_id`, as an `i64` — resolved by the
+    /// backend from the target layout. Used to size a heap allocation.
+    SizeOf {
+        struct_id: StructId,
+    },
     Call {
         callee: Callee,
         args: Vec<Value>,

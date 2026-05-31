@@ -152,6 +152,11 @@ impl FunctionBuilder {
         )
     }
 
+    /// The ABI byte size of `struct_id` as an `i64` (for sizing allocations).
+    pub fn size_of(&mut self, struct_id: StructId) -> Value {
+        self.emit(InstKind::SizeOf { struct_id }, IrType::I64, None)
+    }
+
     pub fn call(&mut self, name: impl Into<String>, args: Vec<Value>, ret: IrType) -> Value {
         self.emit(
             InstKind::Call {

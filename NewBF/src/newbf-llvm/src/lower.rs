@@ -120,7 +120,8 @@ impl<'ctx> Codegen<'ctx, '_> {
             IrType::Bool => self.ctx.bool_type().into(),
             IrType::Int { .. } => self.int_type_of(ty).into(),
             IrType::Float { .. } => self.float_type_of(ty).into(),
-            IrType::Ptr => self.ctx.ptr_type(AddressSpace::default()).into(),
+            // `Ref` is a typed reference but lowers to the same opaque `ptr`.
+            IrType::Ptr | IrType::Ref(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
             IrType::Struct(id) => self.struct_types[id.0 as usize].into(),
         }
     }
@@ -258,7 +259,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             IrType::Bool => self.ctx.bool_type().get_undef().into(),
             IrType::Int { .. } => self.int_type_of(ty).get_undef().into(),
             IrType::Float { .. } => self.float_type_of(ty).get_undef().into(),
-            IrType::Ptr => self
+            IrType::Ptr | IrType::Ref(_) => self
                 .ctx
                 .ptr_type(AddressSpace::default())
                 .get_undef()
@@ -423,6 +424,9 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .ok()
                     .map(Into::into)
             }
+            InstKind::SizeOf { struct_id } => self.struct_types[struct_id.0 as usize]
+                .size_of()
+                .map(Into::into),
             InstKind::Call { callee, args } => {
                 let argv: Vec<BasicValueEnum<'ctx>> = args
                     .iter()
@@ -739,6 +743,50 @@ mod tests {
         assert!(ir.contains("%s0 = type { i32, i32 }"), "{ir}");
         assert!(ir.contains("alloca %s0"), "{ir}");
         assert!(ir.contains("getelementptr"), "{ir}");
+    }
+
+    #[test]
+    fn new_shape_ref_and_sizeof_verifies() {
+        use newbf_ir::{FieldDef, StructDef};
+        // class C { int64 $hdr; i32 x; }
+        // ref<C> mk() { p = malloc(sizeof C); p.$hdr = 0; p.x = 42; return p; }
+        let mut m = IrModule::new("t");
+        let c = m.add_struct(StructDef {
+            name: "C".into(),
+            fields: vec![
+                FieldDef {
+                    name: "$hdr".into(),
+                    ty: IrType::I64,
+                },
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        m.declare_extern(
+            "malloc",
+            vec![Param {
+                name: None,
+                ty: IrType::I64,
+            }],
+            IrType::Ptr,
+        );
+        let mut f = FunctionBuilder::new("mk", vec![], IrType::Ref(c));
+        let sz = f.size_of(c);
+        let p = f.call("malloc", vec![sz], IrType::Ref(c));
+        let hdr = f.field_addr(p.clone(), c, 0);
+        f.store(hdr, Value::int(0, IrType::I64));
+        let xp = f.field_addr(p.clone(), c, 1);
+        f.store(xp, Value::int(42, IrType::I32));
+        f.ret(Some(p));
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("new-shape verifies");
+        let ir = lower_to_string(&m);
+        // `Ref` lowers to a plain pointer in the signature.
+        assert!(ir.contains("define ptr @mk()"), "{ir}");
+        assert!(ir.contains("call ptr @malloc"), "{ir}");
     }
 
     #[test]
