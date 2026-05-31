@@ -9,6 +9,7 @@ description = "NewBF: semantic analysis — resolution, generics, dispatch, owne
 newbf-lexer.workspace = true
 newbf-parser.workspace = true
 newbf-ir.workspace = true
+newbf-corlib.workspace = true
 
 [dev-dependencies]
 # The LLVM backend, used by the corpus verify gate (lower → emit → verify).

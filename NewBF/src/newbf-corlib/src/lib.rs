@@ -9,3 +9,11 @@
 //! The `.bf` sources live under `bf/` (added during the corlib port,
 //! SPRINTS.md Sprint 28+); this crate is the thin Rust shim that locates
 //! and registers them with the driver.
+
+/// The standard-library prelude: `(filename, source)` for each `bf/*.bf`,
+/// embedded at compile time. The compiler prepends these (parsed) before the
+/// user's program and lowers them together — composed at the AST, lowered once
+/// (see `docs/STDLIB.md`). Order is dependency-respecting (lowest layer first).
+pub fn prelude() -> &'static [(&'static str, &'static str)] {
+    &[("Probe.bf", include_str!("../bf/Probe.bf"))]
+}

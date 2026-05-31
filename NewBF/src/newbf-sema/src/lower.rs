@@ -20,9 +20,10 @@ use newbf_ir::{
     BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder, IrType,
     Module, Param as IrParam, StructDef, StructId, Value,
 };
+use newbf_lexer::FileId;
 use newbf_parser::{
-    AssignOp, BinOp as AstBin, Expr, Item, Member, MethodBody, Modifier, Param as AstParam,
-    PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp,
+    AssignOp, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody, Modifier,
+    Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp, parse_file,
 };
 
 use crate::Program;
@@ -275,10 +276,36 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
 /// Lower a whole program (the parsed files; the def graph is available for
 /// future resolution) into one IR [`Module`].
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
-    let mut m = Module::new("program");
-    let structs = StructTable::build(files);
-    m.structs = structs.defs.clone();
+    // Prepend the corlib prelude as source — parsed, then composed at the AST
+    // and lowered once with the user program (STDLIB.md). The prelude units are
+    // owned here for the duration of lowering.
+    let prelude = newbf_corlib::prelude();
+    let prelude_units: Vec<CompUnit> = prelude
+        .iter()
+        .enumerate()
+        .map(|(i, ns)| parse_file(ns.1, FileId(10_000u32 + i as u32)).0)
+        .collect();
+    let mut all: Vec<SourceFile> = prelude_units
+        .iter()
+        .enumerate()
+        .map(|(i, unit)| SourceFile {
+            file: FileId(10_000u32 + i as u32),
+            src: prelude[i].1,
+            unit,
+        })
+        .collect();
     for f in files {
+        all.push(SourceFile {
+            file: f.file,
+            src: f.src,
+            unit: f.unit,
+        });
+    }
+
+    let mut m = Module::new("program");
+    let structs = StructTable::build(&all);
+    m.structs = structs.defs.clone();
+    for f in &all {
         lower_items(&f.unit.items, "", f.src, &structs, &mut m);
     }
     m
