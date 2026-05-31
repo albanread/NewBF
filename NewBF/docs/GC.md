@@ -360,3 +360,55 @@ card barrier :3971); liveness `nod-dfm/src/liveness.rs:57`; backend feature
 `Cargo.toml:16` (newgc git dep `rev c500539`); `mutator.rs` (coordinator / roots / barrier
 façade); JIT root emit `src/ncl-llvm/src/lib.rs:1705` (`emit_safepoint_wrap`); lessons
 `docs/GC_LESSONS.md`, `docs/gc_bughunt_tinyleak.md`.
+
+---
+
+## 12. Considered & rejected: Locus's tagged-handle scheme (2026-05-31)
+
+Locus (`E:\RNIM`, `docs/gc.md`) reaches the *same* NewGC through a different binding:
+the program holds a **handle** — an index into one table — never a raw pointer. The
+table *is* the root set (so the compiler is GC-oblivious, like us), but because a
+handle is an index, **objects move freely**: the collector rewrites `table[h]`, the
+index `h` is stable forever. Conservative scanning is *sound* (a stray int that looks
+like a handle over-retains, never corrupts — it's not an address). Handles follow a
+stack discipline (V8 `HandleScope` / JNI local-refs / OCaml `CAMLparam`), so a
+600-node walk peaks at a live-root depth of 2. It is genuinely elegant.
+
+**Could it replace `malloc` / be our GC mode? No — and the reason is structural.**
+The scheme's entire payoff is *free relocation*, bought with one invariant: **no raw
+pointer to a heap object ever escapes** (handles name only locals; object fields hold
+traced pointers; FFI frames fall back to pinning). Beef is defined by the opposite —
+raw pointers escape *constantly* and by design:
+
+- `char8* buf = s.Ptr(); WriteFile(buf, …); buf[i]` — a handle can't be passed to a
+  Win32 API or indexed with pointer arithmetic. Resolve it to a raw pointer for FFI
+  and a moving GC dangles it.
+- Object **fields** hold raw `T*`, embedded structs, unions, passed to/from C; you
+  can't make them "traced handles, never pointers" without breaking C layout.
+- Interior pointers (`&array[i]`, a `Span`'s `mPtr`) can't be named by a handle table
+  at all.
+- C-compatible layout (`[CRepr]`, `sizeof`, Win32 structs) is incompatible with
+  tagged, pointers-first, header-prefixed cells.
+
+So Beef would **pin nearly everything** (every object reachable through an escaped raw
+pointer) — paying the indirection + layout incompatibility for *no* compaction. The
+clinching evidence: **real Beef's own collector is conservative + non-moving for
+exactly this reason** (§3) — the Beef team hit this wall and chose the side of the fork
+this doc already took. The handle scheme exists to *enable moving*; Beef can't move
+regardless; it solves a problem Beef isn't allowed to have. Locus and NewBF are
+correctly using **different bindings of the same collector** — the `HeapLayout` trait
+paying off as designed.
+
+**What we keep from it:**
+1. The soundness argument (an index / ambiguous root is read-only → over-retention,
+   never corruption) is *why* our conservative-pin root side is safe (§3, §6). Locus
+   pushes it to 100% (indices everywhere → full moving); we take the Beef-faithful 80%
+   (raw pointers, pin the ambiguous few).
+2. Demoted from "GC mechanism" to "optional safety type," the **generational handle**
+   (index + generation counter) is a real, Beef-idiomatic win: an optional `Handle<T>`
+   in corlib gives use-after-free safety *without* a moving GC and *without* forbidding
+   raw pointers (the slotmap / generational-index pattern game engines already use).
+   It coexists with raw `new`/`delete`; it does not replace the allocation floor.
+
+**Source:** Locus handle GC — `E:\RNIM\docs\gc.md` (handle table §2, GC-oblivious §3,
+`LocusLayout` 2-bit tag §4, stack-discipline scopes §5, escape §6, three root models §7).
