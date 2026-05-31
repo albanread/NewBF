@@ -63,6 +63,9 @@ struct StructTable {
     /// Per-id method table (name → signature, this-aware), for resolving
     /// `obj.Method()` and same-type bare calls. First declaration wins.
     methods: Vec<HashMap<String, MethodSig>>,
+    /// Per-id, per-field pointer element type (parallel to `defs[id].fields`):
+    /// `Some` for a `T*` field, so `obj.field[i]` knows the element.
+    field_elems: Vec<Vec<Option<IrType>>>,
 }
 
 impl StructTable {
@@ -128,6 +131,7 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.ctors.push(None);
             t.dtors.push(None);
             t.methods.push(HashMap::new());
+            t.field_elems.push(Vec::new());
             t.by_name.insert(name, id);
         }
     }
@@ -155,6 +159,9 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
     if let (Some(kind), Some(id)) = (kind, id) {
         let mut fields = Vec::new();
+        // `elems[i]` is the pointer element type of `fields[i]` (so `obj.f[i]`
+        // can index a pointer field); kept in lockstep with `fields`.
+        let mut elems: Vec<Option<IrType>> = Vec::new();
         // A class instance carries an object header (ClassVData*) at offset 0;
         // a value struct has none. Real fields follow.
         if matches!(kind, StructKind::Ref) {
@@ -162,6 +169,7 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                 name: "$header".into(),
                 ty: IrType::Ptr,
             });
+            elems.push(None);
         }
         for m in &td.members {
             if let Member::Field {
@@ -179,6 +187,7 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
                     continue;
                 }
                 let fty = lower_ty(ty, src, t);
+                elems.push(pointer_elem(ty, src, t));
                 fields.push(FieldDef {
                     name: name.text(src).to_string(),
                     ty: fty,
@@ -186,6 +195,7 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
             }
         }
         t.defs[id.0 as usize].fields = fields;
+        t.field_elems[id.0 as usize] = elems;
 
         // Record the (first) constructor + a destructor for `new`/`delete`, and
         // the method table (this-aware) for call resolution. First name wins;
@@ -1038,6 +1048,41 @@ impl<'a> Lowerer<'a> {
         match e {
             Expr::Paren { inner, .. } => self.ptr_elem_of(inner, src),
             Expr::Ident(s) => self.lookup_elem(s.text(src)),
+            // A pointer *field*: `obj.buf[i]` / `this.buf[i]`.
+            Expr::Member { base, name, .. } => {
+                let owner = self.expr_struct_id(base, src)?;
+                let fname = name.text(src);
+                let fidx = self.structs.defs[owner.0 as usize]
+                    .fields
+                    .iter()
+                    .position(|f| f.name == fname)?;
+                self.structs.field_elems[owner.0 as usize][fidx]
+            }
+            _ => None,
+        }
+    }
+
+    /// The struct/reference type id of an expression, by *static* type — emits
+    /// no code. Resolves `this`, locals/params, and (nested) fields, so member
+    /// and index resolution can find the owning layout.
+    fn expr_struct_id(&self, e: &Expr, src: &str) -> Option<StructId> {
+        let ty = match e {
+            Expr::Paren { inner, .. } => return self.expr_struct_id(inner, src),
+            Expr::This(_) => self.this_slot.as_ref().map(|(_, t)| *t)?,
+            Expr::Ident(s) => self.lookup(s.text(src)).map(|(_, t)| t)?,
+            Expr::Member { base, name, .. } => {
+                let owner = self.expr_struct_id(base, src)?;
+                let fname = name.text(src);
+                let fidx = self.structs.defs[owner.0 as usize]
+                    .fields
+                    .iter()
+                    .position(|f| f.name == fname)?;
+                self.structs.defs[owner.0 as usize].fields[fidx].ty
+            }
+            _ => return None,
+        };
+        match ty {
+            IrType::Struct(id) | IrType::Ref(id) => Some(id),
             _ => None,
         }
     }
