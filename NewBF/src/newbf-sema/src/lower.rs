@@ -75,11 +75,37 @@ struct StructTable {
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
         let mut t = StructTable::default();
+        // 1. Register every non-generic type's name/id.
         for f in files {
             register_struct_names(&f.unit.items, "", f.src, &mut t);
         }
+        // 2. Index generic declarations by name (with their owning file's src),
+        //    so an instantiation can find the template and its parameter names.
+        let mut generics: GenericDecls = HashMap::new();
+        for f in files {
+            index_generic_decls(&f.unit.items, f.src, &mut generics);
+        }
+        // 3. Collect generic instantiations across the program; register one
+        //    monomorphized type per distinct (generic, concrete-args) pair.
+        let mut monos: MonoList = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for f in files {
+            collect_insts_items(
+                &f.unit.items,
+                f.src,
+                &generics,
+                &mut t,
+                &mut seen,
+                &mut monos,
+            );
+        }
+        // 4. Fill ordinary types, then each monomorph's fields with its env.
         for f in files {
             fill_struct_fields(&f.unit.items, f.src, &mut t);
+        }
+        for (id, decl, decl_src, env) in &monos {
+            let kind = struct_kind(decl).unwrap_or(StructKind::Value);
+            fill_fields_at(decl, *id, kind, env, decl_src, &mut t);
         }
         t
     }
@@ -106,6 +132,185 @@ impl StructTable {
 
     fn dtor_of(&self, id: StructId) -> Option<String> {
         self.dtors[id.0 as usize].clone()
+    }
+}
+
+/// Index top-level/namespace generic type declarations by name, paired with
+/// their owning file's `src` (parameter names + member text are read from it).
+fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDecls<'a>) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => index_generic_decls(body, src, out),
+            Item::Type(td) if struct_kind(td).is_some() && !td.generic_params.is_empty() => {
+                out.entry(td.name.text(src).to_string())
+                    .or_insert((td, src));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Register a monomorphized instantiation as a fresh concrete type and return
+/// its id (fields are filled later via [`fill_fields_at`] with the env).
+fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> StructId {
+    let id = StructId(t.defs.len() as u32);
+    t.defs.push(StructDef {
+        name: mangled.to_string(),
+        fields: Vec::new(),
+    });
+    t.kinds.push(kind);
+    t.prefixes.push(format!("{mangled}."));
+    t.ctors.push(Vec::new());
+    t.dtors.push(None);
+    t.methods.push(HashMap::new());
+    t.field_elems.push(Vec::new());
+    t.by_name.insert(mangled.to_string(), id);
+    id
+}
+
+type MonoList<'a> = Vec<(StructId, &'a TypeDecl, &'a str, Vec<(String, IrType)>)>;
+
+/// Generic type declarations indexed by name, each with its owning file's src.
+type GenericDecls<'a> = HashMap<String, (&'a TypeDecl, &'a str)>;
+
+/// Record the monomorphization a generic type reference demands (`Box<int>` →
+/// register `Box$i64`), then recurse into its arguments and any wrapped type.
+fn use_in_type<'a>(
+    ty: &AstType,
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    if let AstType::Path { segments, .. } = ty
+        && segments.len() == 1
+        && !segments[0].args.is_empty()
+        && let Some(&(decl, decl_src)) = generics.get(segments[0].name.text(src))
+    {
+        // Resolve the concrete arguments (read-only), then register.
+        let argtys: Vec<IrType> = segments[0]
+            .args
+            .iter()
+            .map(|a| lower_ty_env(a, src, t, &[]))
+            .collect();
+        let mangled = mangle_generic(segments[0].name.text(src), &argtys);
+        if !seen.iter().any(|s| s == &mangled) {
+            seen.push(mangled.clone());
+            let kind = struct_kind(decl).unwrap_or(StructKind::Value);
+            let id = register_mono(t, &mangled, kind);
+            let env: Vec<(String, IrType)> = decl
+                .generic_params
+                .iter()
+                .zip(&argtys)
+                .map(|(gp, ty)| (gp.name.text(decl_src).to_string(), *ty))
+                .collect();
+            monos.push((id, decl, decl_src, env));
+        }
+        for a in &segments[0].args {
+            use_in_type(a, src, generics, t, seen, monos);
+        }
+    }
+    if let AstType::Pointer { inner, .. } | AstType::Nullable { inner, .. } = ty {
+        use_in_type(inner, src, generics, t, seen, monos);
+    }
+}
+
+fn collect_insts_items<'a>(
+    items: &'a [Item],
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_insts_items(body, src, generics, t, seen, monos),
+            Item::Type(td) => collect_insts_type(td, src, generics, t, seen, monos),
+            _ => {}
+        }
+    }
+}
+
+fn collect_insts_type<'a>(
+    td: &'a TypeDecl,
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    for m in &td.members {
+        match m {
+            Member::Field { ty, .. } => use_in_type(ty, src, generics, t, seen, monos),
+            Member::Method {
+                params,
+                return_ty,
+                body,
+                ..
+            } => {
+                use_in_type(return_ty, src, generics, t, seen, monos);
+                for p in params {
+                    use_in_type(&p.ty, src, generics, t, seen, monos);
+                }
+                if let MethodBody::Block(s) = body {
+                    collect_insts_stmt(s, src, generics, t, seen, monos);
+                }
+            }
+            Member::Constructor { params, body, .. } => {
+                for p in params {
+                    use_in_type(&p.ty, src, generics, t, seen, monos);
+                }
+                if let MethodBody::Block(s) = body {
+                    collect_insts_stmt(s, src, generics, t, seen, monos);
+                }
+            }
+            Member::Nested(n) => collect_insts_type(n, src, generics, t, seen, monos),
+            _ => {}
+        }
+    }
+}
+
+/// Walk statement bodies for generic instantiations in local-declaration types
+/// (`Box<int> b;`). Expression-position instantiations (`new Box<int>()`) arrive
+/// with the generic *class* slice.
+fn collect_insts_stmt<'a>(
+    stmt: &Stmt,
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    match stmt {
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                collect_insts_stmt(s, src, generics, t, seen, monos);
+            }
+        }
+        Stmt::Local { ty: Some(ty), .. } => use_in_type(ty, src, generics, t, seen, monos),
+        Stmt::If { then, els, .. } => {
+            collect_insts_stmt(then, src, generics, t, seen, monos);
+            if let Some(e) = els {
+                collect_insts_stmt(e, src, generics, t, seen, monos);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_insts_stmt(body, src, generics, t, seen, monos),
+        Stmt::For { init, body, .. } => {
+            if let Some(i) = init {
+                collect_insts_stmt(i, src, generics, t, seen, monos);
+            }
+            collect_insts_stmt(body, src, generics, t, seen, monos);
+        }
+        _ => {}
     }
 }
 
@@ -163,48 +368,61 @@ fn fill_struct_fields(items: &[Item], src: &str, t: &mut StructTable) {
     }
 }
 
+/// Fill `id`'s field layout (and per-field pointer-element types) from `td`'s
+/// instance fields, resolving any generic type-parameters through `env`. Shared
+/// by ordinary types (`env = &[]`) and monomorphized generic instantiations
+/// (where `td` is the generic declaration and `env` maps its params to concrete
+/// types). A class carries a `$header` (ClassVData*) at offset 0; a value struct
+/// has none.
+fn fill_fields_at(
+    td: &TypeDecl,
+    id: StructId,
+    kind: StructKind,
+    env: TyEnv,
+    src: &str,
+    t: &mut StructTable,
+) {
+    let mut fields = Vec::new();
+    let mut elems: Vec<Option<IrType>> = Vec::new();
+    if matches!(kind, StructKind::Ref) {
+        fields.push(FieldDef {
+            name: "$header".into(),
+            ty: IrType::Ptr,
+        });
+        elems.push(None);
+    }
+    for m in &td.members {
+        if let Member::Field {
+            ty,
+            name,
+            modifiers,
+            ..
+        } = m
+        {
+            // Instance fields only — statics/consts aren't in the layout.
+            if modifiers
+                .iter()
+                .any(|(mo, _)| matches!(mo, Modifier::Static | Modifier::Const))
+            {
+                continue;
+            }
+            let fty = lower_ty_env(ty, src, t, env);
+            elems.push(pointer_elem(ty, src, t));
+            fields.push(FieldDef {
+                name: name.text(src).to_string(),
+                ty: fty,
+            });
+        }
+    }
+    t.defs[id.0 as usize].fields = fields;
+    t.field_elems[id.0 as usize] = elems;
+}
+
 fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     let kind = struct_kind(td).filter(|_| td.generic_params.is_empty());
     let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
     if let (Some(kind), Some(id)) = (kind, id) {
-        let mut fields = Vec::new();
-        // `elems[i]` is the pointer element type of `fields[i]` (so `obj.f[i]`
-        // can index a pointer field); kept in lockstep with `fields`.
-        let mut elems: Vec<Option<IrType>> = Vec::new();
-        // A class instance carries an object header (ClassVData*) at offset 0;
-        // a value struct has none. Real fields follow.
-        if matches!(kind, StructKind::Ref) {
-            fields.push(FieldDef {
-                name: "$header".into(),
-                ty: IrType::Ptr,
-            });
-            elems.push(None);
-        }
-        for m in &td.members {
-            if let Member::Field {
-                ty,
-                name,
-                modifiers,
-                ..
-            } = m
-            {
-                // Instance fields only — statics/consts aren't in the layout.
-                if modifiers
-                    .iter()
-                    .any(|(mo, _)| matches!(mo, Modifier::Static | Modifier::Const))
-                {
-                    continue;
-                }
-                let fty = lower_ty(ty, src, t);
-                elems.push(pointer_elem(ty, src, t));
-                fields.push(FieldDef {
-                    name: name.text(src).to_string(),
-                    ty: fty,
-                });
-            }
-        }
-        t.defs[id.0 as usize].fields = fields;
-        t.field_elems[id.0 as usize] = elems;
+        fill_fields_at(td, id, kind, &[], src, t);
 
         // Record constructors (one per distinct arity → `$ctorN`), a destructor,
         // and the method table (this-aware) for call resolution. First of each
@@ -1735,16 +1953,47 @@ fn pointer_elem(ty: &AstType, src: &str, structs: &StructTable) -> Option<IrType
     }
 }
 
+/// A generic type-parameter environment: param name → the concrete IR type it
+/// was monomorphized to. Empty for ordinary (non-generic) lowering.
+type TyEnv<'a> = &'a [(String, IrType)];
+
+/// The monomorphized symbol name of a generic instantiation: `Box<int>` →
+/// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
+fn mangle_generic(name: &str, args: &[IrType]) -> String {
+    format!("{name}${}", type_codes(args))
+}
+
 fn lower_ty(ty: &AstType, src: &str, structs: &StructTable) -> IrType {
+    lower_ty_env(ty, src, structs, &[])
+}
+
+/// Lower a type, resolving generic type-parameters through `env` (so a `T`
+/// field of a monomorphized `Box<int>` becomes `i64`) and generic
+/// instantiations through the monomorphized symbol table (`Box<int>` → the
+/// registered `Box$i64`).
+fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
     match ty {
         AstType::Path { segments, .. } if segments.len() == 1 && segments[0].args.is_empty() => {
-            // A single-segment name that's a registered value `struct` lowers to
-            // its aggregate; otherwise a primitive (or `Ptr` for a reference).
             let name = segments[0].name.text(src);
+            // A bare type-parameter resolves through the monomorphization env.
+            if let Some((_, t)) = env.iter().find(|(n, _)| n.as_str() == name) {
+                return *t;
+            }
             structs.ty_of(name).unwrap_or_else(|| primitive(name))
         }
+        // A generic instantiation `Name<Args>` → its monomorphized type.
+        AstType::Path { segments, .. } if segments.len() == 1 && !segments[0].args.is_empty() => {
+            let name = segments[0].name.text(src);
+            let args: Vec<IrType> = segments[0]
+                .args
+                .iter()
+                .map(|a| lower_ty_env(a, src, structs, env))
+                .collect();
+            let mangled = mangle_generic(name, &args);
+            structs.ty_of(&mangled).unwrap_or(IrType::Ptr)
+        }
         AstType::Pointer { .. } => IrType::Ptr,
-        AstType::Nullable { inner, .. } => lower_ty(inner, src, structs),
+        AstType::Nullable { inner, .. } => lower_ty_env(inner, src, structs, env),
         _ => IrType::Ptr,
     }
 }
