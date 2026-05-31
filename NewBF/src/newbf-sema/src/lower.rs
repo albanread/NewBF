@@ -70,7 +70,14 @@ struct StructTable {
     /// Per-id, per-field pointer element type (parallel to `defs[id].fields`):
     /// `Some` for a `T*` field, so `obj.field[i]` knows the element.
     field_elems: Vec<Vec<Option<IrType>>>,
+    /// Monomorphized generic instantiations to lower: `(mono id, generic type
+    /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
+    /// name and lowers its methods at the mono id/prefix with the env.
+    monos: Vec<MonoRecord>,
 }
+
+/// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
+type MonoRecord = (StructId, String, Vec<(String, IrType)>);
 
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
@@ -99,13 +106,16 @@ impl StructTable {
                 &mut monos,
             );
         }
-        // 4. Fill ordinary types, then each monomorph's fields with its env.
+        // 4. Fill ordinary types, then each monomorph's members with its env,
+        //    and record the monomorphs so lowering can emit their method bodies.
         for f in files {
             fill_struct_fields(&f.unit.items, f.src, &mut t);
         }
         for (id, decl, decl_src, env) in &monos {
             let kind = struct_kind(decl).unwrap_or(StructKind::Value);
-            fill_fields_at(decl, *id, kind, env, decl_src, &mut t);
+            fill_members_at(decl, *id, kind, env, decl_src, &mut t);
+            t.monos
+                .push((*id, decl.name.text(decl_src).to_string(), env.clone()));
         }
         t
     }
@@ -418,99 +428,113 @@ fn fill_fields_at(
     t.field_elems[id.0 as usize] = elems;
 }
 
+/// Register `id`'s layout, constructors, destructor, and method table from
+/// `td`'s members, resolving generic type-parameters through `env`. Shared by
+/// ordinary types (`env = &[]`, `id` from the name table) and monomorphized
+/// instantiations (`td` is the generic decl, `id`/prefix the monomorph's,
+/// `env` its parameter substitutions). `t.prefixes[id]` supplies the mangled
+/// symbol prefix in both cases.
+fn fill_members_at(
+    td: &TypeDecl,
+    id: StructId,
+    kind: StructKind,
+    env: TyEnv,
+    src: &str,
+    t: &mut StructTable,
+) {
+    fill_fields_at(td, id, kind, env, src, t);
+
+    // Constructors (one per distinct arity → `$ctorN`), a destructor, and the
+    // this-aware method table for call resolution. The implicit `this` is a
+    // reference to the instance body.
+    for m in &td.members {
+        match m {
+            Member::Constructor { params, .. } => {
+                let arity = params.len();
+                if t.ctors[id.0 as usize]
+                    .iter()
+                    .all(|c| c.params.len() != arity + 1)
+                {
+                    let mut ps = vec![IrType::Ref(id)];
+                    for p in params {
+                        ps.push(lower_ty_env(&p.ty, src, t, env));
+                    }
+                    let full_name = format!("{}$ctor{arity}", t.prefixes[id.0 as usize]);
+                    t.ctors[id.0 as usize].push(MethodSig {
+                        full_name,
+                        ret: IrType::Void,
+                        params: ps,
+                        is_instance: true,
+                    });
+                }
+            }
+            Member::Destructor { .. } => {
+                t.dtors[id.0 as usize] = Some(format!("{}$dtor", t.prefixes[id.0 as usize]));
+            }
+            Member::Method {
+                return_ty,
+                name,
+                params,
+                body,
+                modifiers,
+                attributes,
+                ..
+            } => {
+                let nm = name.text(src).to_string();
+                let explicit: Vec<IrType> = params
+                    .iter()
+                    .map(|p| lower_ty_env(&p.ty, src, t, env))
+                    .collect();
+                // A body-having method emits `{prefix}{name}` — suffixed by
+                // parameter types when it's a *later* overload of that name (the
+                // first keeps the plain symbol). A body-less `[Intrinsic]`/
+                // `[LinkName]` extern resolves to its symbol; any other body-less
+                // member (abstract/interface) isn't callable and is skipped.
+                let full_name = if matches!(body, MethodBody::None) {
+                    match extern_symbol(attributes, src) {
+                        Some(sym) => sym,
+                        None => continue,
+                    }
+                } else {
+                    let base = format!("{}{}", t.prefixes[id.0 as usize], nm);
+                    if t.methods[id.0 as usize]
+                        .get(&nm)
+                        .is_some_and(|b| !b.is_empty())
+                    {
+                        format!("{base}${}", type_codes(&explicit))
+                    } else {
+                        base
+                    }
+                };
+                let is_instance = !modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static));
+                let mut ps = Vec::new();
+                if is_instance {
+                    ps.push(IrType::Ref(id));
+                }
+                ps.extend(explicit.iter().copied());
+                let sig = MethodSig {
+                    full_name,
+                    ret: lower_ty_env(return_ty, src, t, env),
+                    params: ps,
+                    is_instance,
+                };
+                let bucket = t.methods[id.0 as usize].entry(nm).or_default();
+                if !bucket.iter().any(|s| s.params == sig.params) {
+                    bucket.push(sig);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     let kind = struct_kind(td).filter(|_| td.generic_params.is_empty());
     let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
     if let (Some(kind), Some(id)) = (kind, id) {
-        fill_fields_at(td, id, kind, &[], src, t);
-
-        // Record constructors (one per distinct arity → `$ctorN`), a destructor,
-        // and the method table (this-aware) for call resolution. First of each
-        // wins; the implicit `this` is a reference to the instance body.
-        for m in &td.members {
-            match m {
-                Member::Constructor { params, .. } => {
-                    let arity = params.len();
-                    // Overload by arity; first constructor of each arity wins.
-                    if t.ctors[id.0 as usize]
-                        .iter()
-                        .all(|c| c.params.len() != arity + 1)
-                    {
-                        let mut ps = vec![IrType::Ref(id)];
-                        for p in params {
-                            ps.push(lower_ty(&p.ty, src, t));
-                        }
-                        let full_name = format!("{}$ctor{arity}", t.prefixes[id.0 as usize]);
-                        t.ctors[id.0 as usize].push(MethodSig {
-                            full_name,
-                            ret: IrType::Void,
-                            params: ps,
-                            is_instance: true,
-                        });
-                    }
-                }
-                Member::Destructor { .. } => {
-                    t.dtors[id.0 as usize] = Some(format!("{}$dtor", t.prefixes[id.0 as usize]));
-                }
-                Member::Method {
-                    return_ty,
-                    name,
-                    params,
-                    body,
-                    modifiers,
-                    attributes,
-                    ..
-                } => {
-                    let nm = name.text(src).to_string();
-                    let explicit: Vec<IrType> =
-                        params.iter().map(|p| lower_ty(&p.ty, src, t)).collect();
-                    // A body-having method emits `{prefix}{name}` — suffixed by
-                    // parameter types when it's a *later* overload of that name
-                    // (the first keeps the plain symbol), so each overload's body
-                    // is distinct. A body-less `[Intrinsic]`/`[LinkName]` extern
-                    // resolves to its symbol; any other body-less member
-                    // (abstract/interface) isn't callable and is skipped.
-                    let full_name = if matches!(body, MethodBody::None) {
-                        match extern_symbol(attributes, src) {
-                            Some(sym) => sym,
-                            None => continue,
-                        }
-                    } else {
-                        let base = format!("{}{}", t.prefixes[id.0 as usize], nm);
-                        if t.methods[id.0 as usize]
-                            .get(&nm)
-                            .is_some_and(|b| !b.is_empty())
-                        {
-                            format!("{base}${}", type_codes(&explicit))
-                        } else {
-                            base
-                        }
-                    };
-                    let is_instance = !modifiers
-                        .iter()
-                        .any(|(mo, _)| matches!(mo, Modifier::Static));
-                    let mut ps = Vec::new();
-                    if is_instance {
-                        ps.push(IrType::Ref(id));
-                    }
-                    ps.extend(explicit.iter().copied());
-                    let sig = MethodSig {
-                        full_name,
-                        ret: lower_ty(return_ty, src, t),
-                        params: ps,
-                        is_instance,
-                    };
-                    // Keep all same-name overloads; the call site discriminates
-                    // by argument type. Skip an exact-signature duplicate (e.g.
-                    // a type re-walked) so the bucket stays a true overload set.
-                    let bucket = t.methods[id.0 as usize].entry(nm).or_default();
-                    if !bucket.iter().any(|s| s.params == sig.params) {
-                        bucket.push(sig);
-                    }
-                }
-                _ => {}
-            }
-        }
+        fill_members_at(td, id, kind, &[], src, t);
     }
     for m in &td.members {
         if let Member::Nested(n) = m {
@@ -553,6 +577,18 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     m.structs = structs.defs.clone();
     for f in &all {
         lower_items(&f.unit.items, "", f.src, &structs, &mut m);
+    }
+    // Lower each monomorphized instantiation's methods/ctors at its mono id and
+    // mangled prefix, with its type-parameter env (so a `T` resolves concretely).
+    let mut generics: GenericDecls = HashMap::new();
+    for f in &all {
+        index_generic_decls(&f.unit.items, f.src, &mut generics);
+    }
+    for (id, name, env) in &structs.monos {
+        if let Some(&(decl, decl_src)) = generics.get(name) {
+            let prefix = structs.prefixes[id.0 as usize].clone();
+            lower_type_at(decl, Some(*id), &prefix, env, decl_src, &structs, &mut m);
+        }
     }
     m
 }
@@ -648,11 +684,31 @@ fn type_codes(tys: &[IrType]) -> String {
 }
 
 fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
+    // A generic *template* is never lowered directly — only its monomorphs
+    // (driven from `structs.monos` in `lower_program`) are.
+    if !td.generic_params.is_empty() {
+        return;
+    }
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
-    // The type's own method table (this-aware, built in the pre-pass) resolves
-    // same-type bare calls; an empty map covers unregistered types (generics,
-    // interfaces).
     let owner_id = structs.by_name.get(td.name.text(src)).copied();
+    lower_type_at(td, owner_id, &new_prefix, &[], src, structs, m);
+}
+
+/// Lower `td`'s methods/ctors/dtor at `owner_id` under `prefix`, resolving
+/// generic type-parameters through `env`. Ordinary types pass `env = &[]` and
+/// their own id; monomorphs pass the instantiation's id/prefix/env.
+fn lower_type_at(
+    td: &TypeDecl,
+    owner_id: Option<StructId>,
+    prefix: &str,
+    env: TyEnv,
+    src: &str,
+    structs: &StructTable,
+    m: &mut Module,
+) {
+    let new_prefix = prefix;
+    // The type's own method table (this-aware, built in the pre-pass) resolves
+    // same-type bare calls; an empty map covers unregistered types (interfaces).
     let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
     let sigs: &HashMap<String, Vec<MethodSig>> = match owner_id {
         Some(id) => &structs.methods[id.0 as usize],
@@ -673,7 +729,7 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                 // to the plain name for unregistered types (generics/interfaces).
                 let explicit: Vec<IrType> = params
                     .iter()
-                    .map(|p| lower_ty(&p.ty, src, structs))
+                    .map(|p| lower_ty_env(&p.ty, src, structs, env))
                     .collect();
                 let full_name = sigs
                     .get(name.text(src))
@@ -689,7 +745,7 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                     })
                     .map(|s| s.full_name.clone())
                     .unwrap_or_else(|| format!("{new_prefix}{}", name.text(src)));
-                let ret = lower_ty(return_ty, src, structs);
+                let ret = lower_ty_env(return_ty, src, structs, env);
                 // Instance methods take a leading `this`; static ones don't.
                 let is_static = modifiers
                     .iter()
@@ -698,9 +754,9 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                     Some(id) if !is_static => Some(IrType::Ref(id)),
                     _ => None,
                 };
-                if let Some(func) =
-                    lower_method(full_name, ret, params, body, src, sigs, structs, this_ty)
-                {
+                if let Some(func) = lower_method(
+                    full_name, ret, params, body, src, sigs, structs, this_ty, env,
+                ) {
                     m.add_function(func);
                 }
             }
@@ -708,7 +764,7 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
             // leading `this` (a reference to the body); `new`/`delete` call
             // them by the `$ctor`/`$dtor` mangled names recorded in the table.
             Member::Constructor { params, body, .. } => {
-                if let Some(&id) = structs.by_name.get(td.name.text(src)) {
+                if let Some(id) = owner_id {
                     // Overloaded by arity: `$ctor{N}` matches what `new` calls.
                     let full_name = format!("{new_prefix}$ctor{}", params.len());
                     let this = Some(IrType::Ref(id));
@@ -721,23 +777,32 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
                         sigs,
                         structs,
                         this,
+                        env,
                     ) {
                         m.add_function(func);
                     }
                 }
             }
             Member::Destructor { body, .. } => {
-                if let Some(&id) = structs.by_name.get(td.name.text(src)) {
+                if let Some(id) = owner_id {
                     let full_name = format!("{new_prefix}$dtor");
                     let this = Some(IrType::Ref(id));
-                    if let Some(func) =
-                        lower_method(full_name, IrType::Void, &[], body, src, sigs, structs, this)
-                    {
+                    if let Some(func) = lower_method(
+                        full_name,
+                        IrType::Void,
+                        &[],
+                        body,
+                        src,
+                        sigs,
+                        structs,
+                        this,
+                        env,
+                    ) {
                         m.add_function(func);
                     }
                 }
             }
-            Member::Nested(nested) => lower_type(nested, &new_prefix, src, structs, m),
+            Member::Nested(nested) => lower_type(nested, new_prefix, src, structs, m),
             _ => {} // fields / properties / enum-cases — later
         }
     }
@@ -755,6 +820,7 @@ fn lower_method(
     methods: &HashMap<String, Vec<MethodSig>>,
     structs: &StructTable,
     this_ty: Option<IrType>,
+    env: TyEnv,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -774,11 +840,11 @@ fn lower_method(
     }
     ir_params.extend(params.iter().map(|p| IrParam {
         name: p.name.map(|s| s.text(src).to_string()),
-        ty: lower_ty(&p.ty, src, structs),
+        ty: lower_ty_env(&p.ty, src, structs, env),
     }));
 
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
-    let mut lw = Lowerer::new(fb, ret, methods, structs);
+    let mut lw = Lowerer::new(fb, ret, methods, structs, env);
 
     // Spill `this` into a slot at entry, recorded for `Expr::This`.
     let base = if this_ty.is_some() { 1 } else { 0 };
@@ -792,7 +858,7 @@ fn lower_method(
     // reads are `load`s and assignments just `store` (LLVM mem2reg cleans up).
     for (i, p) in params.iter().enumerate() {
         if let Some(nm) = &p.name {
-            let ty = lower_ty(&p.ty, src, structs);
+            let ty = lower_ty_env(&p.ty, src, structs, env);
             let elem = pointer_elem(&p.ty, src, structs);
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
@@ -842,6 +908,9 @@ struct Lowerer<'a> {
     /// The `this` slot in an instance method / ctor / dtor: a stack slot
     /// holding the `Ref` to the instance body. `None` in static contexts.
     this_slot: Option<(Value, IrType)>,
+    /// Generic type-parameter env when lowering a monomorph's body (so a `T`
+    /// local declaration resolves to its concrete type). Empty otherwise.
+    env: TyEnv<'a>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -850,6 +919,7 @@ impl<'a> Lowerer<'a> {
         ret_ty: IrType,
         methods: &'a HashMap<String, Vec<MethodSig>>,
         structs: &'a StructTable,
+        env: TyEnv<'a>,
     ) -> Self {
         Self {
             fb,
@@ -860,6 +930,7 @@ impl<'a> Lowerer<'a> {
             structs,
             loops: Vec::new(),
             this_slot: None,
+            env,
         }
     }
 
@@ -939,7 +1010,7 @@ impl<'a> Lowerer<'a> {
                     None => (None, None),
                 };
                 let slot_ty = match ty {
-                    Some(t) => lower_ty(t, src, self.structs),
+                    Some(t) => lower_ty_env(t, src, self.structs, self.env),
                     None => init_ty.unwrap_or(IrType::I64), // `var`/`let`: infer from init
                 };
                 let slot = self.fb.alloca(slot_ty);
@@ -1489,10 +1560,28 @@ impl<'a> Lowerer<'a> {
     /// `new C(...)` → `malloc(sizeof C)` + a zeroed object header, yielding a
     /// `Ref(C)`. The constructor call is deferred (a later sprint); fields are
     /// left at their freshly-allocated (indeterminate) values for now.
+    /// The class id a `new` operand constructs: a generic instantiation
+    /// (`new Box<int>()`) resolves to its monomorph, otherwise the plain class.
+    fn new_class_id(&self, operand: &Expr, src: &str) -> Option<StructId> {
+        if let Some((name, args)) = generic_new_parts(operand, src) {
+            let argtys: Vec<IrType> = args
+                .iter()
+                .map(|a| lower_ty_env(a, src, self.structs, self.env))
+                .collect();
+            let mangled = mangle_generic(name, &argtys);
+            if let Some(IrType::Ref(id)) = self.structs.ty_of(&mangled) {
+                return Some(id);
+            }
+        }
+        let name = ctor_class_name(operand, src)?;
+        match self.structs.ty_of(name) {
+            Some(IrType::Ref(id)) => Some(id),
+            _ => None,
+        }
+    }
+
     fn lower_new(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
-        if let Some(name) = ctor_class_name(operand, src)
-            && let Some(IrType::Ref(id)) = self.structs.ty_of(name)
-        {
+        if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
             let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
             // Object header (ClassVData*) at offset 0 — null until vtables.
@@ -1905,6 +1994,21 @@ fn decode_string_literal(raw: &str) -> String {
 /// value structs/tuples until the layout sprint).
 /// The class name a `new`/`scope` operand constructs: `C`, `C(args)`, and
 /// `C<T>(args)` all name `C`.
+/// For a `new Name<Args>(…)` operand, the generic name and its type arguments
+/// (digging through the wrapping `Call`/`Paren`). `None` for a non-generic
+/// `new`. Lets `lower_new` resolve the monomorphized class.
+fn generic_new_parts<'a>(e: &'a Expr, src: &'a str) -> Option<(&'a str, &'a [AstType])> {
+    match e {
+        Expr::Paren { inner, .. } => generic_new_parts(inner, src),
+        Expr::Call { callee, .. } => generic_new_parts(callee, src),
+        Expr::Generic { base, args, .. } => match &**base {
+            Expr::Ident(s) => Some((s.text(src), args.as_slice())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn ctor_class_name<'s>(e: &Expr, src: &'s str) -> Option<&'s str> {
     match e {
         Expr::Ident(s) => Some(s.text(src)),
