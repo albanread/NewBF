@@ -23,6 +23,15 @@ pub fn format_ir(m: &Module) -> String {
         "ir module {:?}: {defs} functions, {externs} externs",
         m.name
     );
+    for (i, s) in m.structs.iter().enumerate() {
+        let fields: Vec<String> = s.fields.iter().map(|f| f.ty.mnemonic()).collect();
+        let _ = writeln!(
+            out,
+            "%s{i} = type {{ {} }}  ; {}",
+            fields.join(", "),
+            s.name
+        );
+    }
     for f in &m.funcs {
         out.push('\n');
         format_function(&mut out, f);
@@ -140,6 +149,11 @@ impl Printer<'_> {
             InstKind::Store { ptr, val } => {
                 format!("store {}, {}", self.value(val), self.value(ptr))
             }
+            InstKind::FieldAddr {
+                base,
+                struct_id,
+                field,
+            } => format!("fieldaddr %s{}, {}, {field}", struct_id.0, self.value(base)),
             InstKind::Call { callee, args } => {
                 let a: Vec<String> = args.iter().map(|v| self.value(v)).collect();
                 format!("call {} @{}({})", ty.mnemonic(), callee.name, a.join(", "))

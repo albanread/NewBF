@@ -26,9 +26,9 @@ pub use func::{Block, Function, FunctionBuilder, Param};
 pub use inst::{
     BinOp, BlockId, Callee, CastKind, CmpPred, Const, InstData, InstId, InstKind, Terminator, Value,
 };
-pub use module::Module;
+pub use module::{FieldDef, Module, StructDef};
 pub use print::format_ir;
-pub use ty::IrType;
+pub use ty::{IrType, StructId};
 
 #[cfg(test)]
 mod tests {
@@ -170,6 +170,45 @@ mod tests {
         assert!(r.contains("    debugtrap\n"), "{r}");
         // 4-space indent before bare `trap` distinguishes it from `debugtrap`.
         assert!(r.contains("    trap\n"), "{r}");
+    }
+
+    #[test]
+    fn struct_layout_alloca_fieldaddr() {
+        // struct Point { i32 x; i32 y; }
+        // int sum_xy() { Point p; p.x = 3; p.y = 4; return p.x + p.y; }
+        let mut m = Module::new("t");
+        let point = m.add_struct(StructDef {
+            name: "Point".into(),
+            fields: vec![
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+                FieldDef {
+                    name: "y".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        let mut f = FunctionBuilder::new("sum_xy", vec![], IrType::I32);
+        let slot = f.alloca(IrType::Struct(point)); // %0 : ptr to Point
+        let xp = f.field_addr(slot.clone(), point, 0); // %1
+        f.store(xp, Value::int(3, IrType::I32));
+        let yp = f.field_addr(slot.clone(), point, 1); // %2
+        f.store(yp, Value::int(4, IrType::I32));
+        let xp2 = f.field_addr(slot.clone(), point, 0); // %3
+        let x = f.load(xp2, IrType::I32); // %4
+        let yp2 = f.field_addr(slot, point, 1); // %5
+        let y = f.load(yp2, IrType::I32); // %6
+        let s = f.bin(BinOp::Add, x, y, IrType::I32); // %7
+        f.ret(Some(s));
+        m.add_function(f.finish());
+        let r = format_ir(&m);
+        assert!(r.contains("%s0 = type { i32, i32 }  ; Point"), "{r}");
+        assert!(r.contains("%0 = alloca %s0"), "{r}");
+        assert!(r.contains("%1 = fieldaddr %s0, %0, 0"), "{r}");
+        assert!(r.contains("store 3, %1"), "{r}");
+        assert!(r.contains("store 4, %2"), "{r}");
     }
 
     #[test]

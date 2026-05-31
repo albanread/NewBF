@@ -17,34 +17,142 @@
 use std::collections::HashMap;
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, Function, FunctionBuilder, IrType, Module,
-    Param as IrParam, Value,
+    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder, IrType,
+    Module, Param as IrParam, StructDef, StructId, Value,
 };
 use newbf_parser::{
-    AssignOp, BinOp as AstBin, Expr, Item, Member, MethodBody, Param as AstParam, Stmt,
-    Type as AstType, TypeDecl, UnOp,
+    AssignOp, BinOp as AstBin, Expr, Item, Member, MethodBody, Modifier, Param as AstParam, Stmt,
+    Type as AstType, TypeDecl, TypeKind, UnOp,
 };
 
 use crate::Program;
 use crate::build::SourceFile;
 
-/// Lower a whole program (the parsed files; the def graph is available for
-/// future resolution) into one IR [`Module`].
-pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
-    let mut m = Module::new("program");
-    for f in files {
-        lower_items(&f.unit.items, "", f.src, &mut m);
-    }
-    m
+/// Value-struct layouts collected before lowering: simple-name → id, plus the
+/// field lists (mirrored into [`Module::structs`] for the backend). Built in
+/// two passes so a struct field whose type is another struct resolves.
+#[derive(Default)]
+struct StructTable {
+    by_name: HashMap<String, StructId>,
+    defs: Vec<StructDef>,
 }
 
-fn lower_items(items: &[Item], prefix: &str, src: &str, m: &mut Module) {
+impl StructTable {
+    fn build(files: &[SourceFile<'_>]) -> Self {
+        let mut t = StructTable::default();
+        for f in files {
+            register_struct_names(&f.unit.items, f.src, &mut t);
+        }
+        for f in files {
+            fill_struct_fields(&f.unit.items, f.src, &mut t);
+        }
+        t
+    }
+}
+
+fn register_struct_names(items: &[Item], src: &str, t: &mut StructTable) {
     for item in items {
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => lower_items(body, prefix, src, m),
-            Item::Type(td) => lower_type(td, prefix, src, m),
+            } => register_struct_names(body, src, t),
+            Item::Type(td) => register_type_struct(td, src, t),
+            _ => {}
+        }
+    }
+}
+
+fn register_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    // Only non-generic value `struct`s become aggregate layouts; a `class` is a
+    // reference (stays `Ptr`), and generics await monomorphization.
+    if td.kind == TypeKind::Struct && td.generic_params.is_empty() {
+        let name = td.name.text(src).to_string();
+        if !t.by_name.contains_key(&name) {
+            let id = StructId(t.defs.len() as u32);
+            t.defs.push(StructDef {
+                name: name.clone(),
+                fields: Vec::new(),
+            });
+            t.by_name.insert(name, id);
+        }
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            register_type_struct(n, src, t);
+        }
+    }
+}
+
+fn fill_struct_fields(items: &[Item], src: &str, t: &mut StructTable) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => fill_struct_fields(body, src, t),
+            Item::Type(td) => fill_type_struct(td, src, t),
+            _ => {}
+        }
+    }
+}
+
+fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    let id = if td.kind == TypeKind::Struct && td.generic_params.is_empty() {
+        t.by_name.get(td.name.text(src)).copied()
+    } else {
+        None
+    };
+    if let Some(id) = id {
+        let mut fields = Vec::new();
+        for m in &td.members {
+            if let Member::Field {
+                ty,
+                name,
+                modifiers,
+                ..
+            } = m
+            {
+                // Instance fields only — statics/consts aren't in the layout.
+                if modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static | Modifier::Const))
+                {
+                    continue;
+                }
+                let fty = lower_ty(ty, src, t);
+                fields.push(FieldDef {
+                    name: name.text(src).to_string(),
+                    ty: fty,
+                });
+            }
+        }
+        t.defs[id.0 as usize].fields = fields;
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            fill_type_struct(n, src, t);
+        }
+    }
+}
+
+/// Lower a whole program (the parsed files; the def graph is available for
+/// future resolution) into one IR [`Module`].
+pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
+    let mut m = Module::new("program");
+    let structs = StructTable::build(files);
+    m.structs = structs.defs.clone();
+    for f in files {
+        lower_items(&f.unit.items, "", f.src, &structs, &mut m);
+    }
+    m
+}
+
+fn lower_items(items: &[Item], prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => lower_items(body, prefix, src, structs, m),
+            Item::Type(td) => lower_type(td, prefix, src, structs, m),
             _ => {} // using / delegate / type-alias / file-scoped ns / error
         }
     }
@@ -60,7 +168,7 @@ struct MethodSig {
     params: Vec<IrType>,
 }
 
-fn lower_type(td: &TypeDecl, prefix: &str, src: &str, m: &mut Module) {
+fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
     // Index this type's methods first so bodies can resolve calls to siblings
     // (incl. recursion). First declaration of a name wins (overloads later).
@@ -83,8 +191,11 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, m: &mut Module) {
             let nm = name.text(src).to_string();
             sigs.entry(nm.clone()).or_insert_with(|| MethodSig {
                 full_name: format!("{new_prefix}{nm}"),
-                ret: lower_ty(return_ty, src),
-                params: params.iter().map(|p| lower_ty(&p.ty, src)).collect(),
+                ret: lower_ty(return_ty, src, structs),
+                params: params
+                    .iter()
+                    .map(|p| lower_ty(&p.ty, src, structs))
+                    .collect(),
             });
         }
     }
@@ -105,16 +216,20 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, m: &mut Module) {
                     body,
                     src,
                     &sigs,
+                    structs,
                 ) {
                     m.add_function(func);
                 }
             }
-            Member::Nested(nested) => lower_type(nested, &new_prefix, src, m),
+            Member::Nested(nested) => lower_type(nested, &new_prefix, src, structs, m),
             _ => {} // fields / properties / ctors / dtors / enum-cases — later
         }
     }
 }
 
+// Threads the per-type method table + program struct table alongside the
+// signature; a context struct is a future cleanup, not worth the churn now.
+#[allow(clippy::too_many_arguments)]
 fn lower_method(
     prefix: &str,
     name: &str,
@@ -123,6 +238,7 @@ fn lower_method(
     body: &MethodBody,
     src: &str,
     methods: &HashMap<String, MethodSig>,
+    structs: &StructTable,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -130,23 +246,23 @@ fn lower_method(
         other => other,
     };
 
-    let ret = lower_ty(return_ty, src);
+    let ret = lower_ty(return_ty, src, structs);
     let ir_params: Vec<IrParam> = params
         .iter()
         .map(|p| IrParam {
             name: p.name.map(|s| s.text(src).to_string()),
-            ty: lower_ty(&p.ty, src),
+            ty: lower_ty(&p.ty, src, structs),
         })
         .collect();
 
     let fb = FunctionBuilder::new(format!("{prefix}{name}"), ir_params, ret);
-    let mut lw = Lowerer::new(fb, ret, methods);
+    let mut lw = Lowerer::new(fb, ret, methods, structs);
 
     // Make parameters addressable: spill each into a stack slot at entry so
     // reads are `load`s and assignments just `store` (LLVM mem2reg cleans up).
     for (i, p) in params.iter().enumerate() {
         if let Some(nm) = &p.name {
-            let ty = lower_ty(&p.ty, src);
+            let ty = lower_ty(&p.ty, src, structs);
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param(i as u32));
             lw.bind(nm.text(src), slot, ty);
@@ -179,6 +295,8 @@ struct Lowerer<'a> {
     terminated: bool,
     /// Sibling methods (same type), for resolving bare-name calls.
     methods: &'a HashMap<String, MethodSig>,
+    /// Value-struct layouts, for resolving `obj.field` and struct-typed locals.
+    structs: &'a StructTable,
     /// Enclosing-loop target stack: `(continue_target, break_target)`. The
     /// innermost loop is last; `break`/`continue` branch to it. (Loop labels
     /// aren't honoured yet — the kernel always targets the innermost loop.)
@@ -186,13 +304,19 @@ struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
-    fn new(fb: FunctionBuilder, ret_ty: IrType, methods: &'a HashMap<String, MethodSig>) -> Self {
+    fn new(
+        fb: FunctionBuilder,
+        ret_ty: IrType,
+        methods: &'a HashMap<String, MethodSig>,
+        structs: &'a StructTable,
+    ) -> Self {
         Self {
             fb,
             ret_ty,
             scopes: vec![HashMap::new()],
             terminated: false,
             methods,
+            structs,
             loops: Vec::new(),
         }
     }
@@ -260,7 +384,7 @@ impl<'a> Lowerer<'a> {
                     None => (None, None),
                 };
                 let slot_ty = match ty {
-                    Some(t) => lower_ty(t, src),
+                    Some(t) => lower_ty(t, src, self.structs),
                     None => init_ty.unwrap_or(IrType::I64), // `var`/`let`: infer from init
                 };
                 let slot = self.fb.alloca(slot_ty);
@@ -545,8 +669,14 @@ impl<'a> Lowerer<'a> {
                     (undef(IrType::I64), IrType::I64)
                 }
             }
-            // this/base, member/index, generic, cast, tuple, lambda,
-            // new/scope prefixes, .Variant, named args — not lowered yet.
+            // Member read (`obj.field`): load the resolved field; degrade if
+            // the base isn't a known value-struct place.
+            Expr::Member { .. } => match self.lvalue(e, src) {
+                Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
+                None => (undef(IrType::I64), IrType::I64),
+            },
+            // this/base, index, generic, cast, tuple, lambda, new/scope
+            // prefixes, .Variant, named args — not lowered yet.
             _ => (undef(IrType::I64), IrType::I64),
         }
     }
@@ -670,13 +800,37 @@ impl<'a> Lowerer<'a> {
         self.fb.bin(irop, l, r, ty)
     }
 
+    /// Resolve an lvalue expression to `(pointer, pointee-type)`: a local's
+    /// stack slot, or a struct field address via `fieldaddr`. `None` for
+    /// anything not (yet) a storable place — callers degrade.
+    fn lvalue(&mut self, e: &Expr, src: &str) -> Option<(Value, IrType)> {
+        match e {
+            Expr::Paren { inner, .. } => self.lvalue(inner, src),
+            Expr::Ident(s) => self.lookup(s.text(src)),
+            Expr::Member { base, name, .. } => {
+                let (base_ptr, base_ty) = self.lvalue(base, src)?;
+                let IrType::Struct(id) = base_ty else {
+                    return None;
+                };
+                let fname = name.text(src);
+                // Copy index + field type out, ending the `defs` borrow before
+                // the `&mut self` field-address emit.
+                let (idx, fty) = {
+                    let def = &self.structs.defs[id.0 as usize];
+                    let i = def.fields.iter().position(|f| f.name == fname)?;
+                    (i as u32, def.fields[i].ty)
+                };
+                Some((self.fb.field_addr(base_ptr, id, idx), fty))
+            }
+            _ => None,
+        }
+    }
+
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, src: &str) -> (Value, IrType) {
         let (rhs, rhs_ty) = self.expr(value, src);
-        if let Expr::Ident(s) = target
-            && let Some((slot, ty)) = self.lookup(s.text(src))
-        {
-            // The stored value must have the slot's type for later loads to be
-            // consistent; coerce the RHS to it.
+        // Resolve the target to a place (local slot or struct field). The
+        // stored value takes the place's type so later loads stay consistent.
+        if let Some((slot, ty)) = self.lvalue(target, src) {
             let rhs = self.coerce(rhs, rhs_ty, ty);
             let stored = match compound_op(op) {
                 Some(astbin) => {
@@ -688,7 +842,7 @@ impl<'a> Lowerer<'a> {
             self.fb.store(slot, stored.clone());
             return (stored, ty);
         }
-        // Non-local lvalue (field/index/etc.) — not lowered yet.
+        // Unsupported lvalue (index/deref/…) — not lowered yet.
         (rhs, rhs_ty)
     }
 
@@ -697,9 +851,7 @@ impl<'a> Lowerer<'a> {
     /// *old* value). On a non-local operand (a field/index — not lowered yet)
     /// it just evaluates the operand for its value, emitting no store.
     fn incdec(&mut self, operand: &Expr, delta: i128, pre: bool, src: &str) -> (Value, IrType) {
-        if let Expr::Ident(s) = operand
-            && let Some((slot, ty)) = self.lookup(s.text(src))
-        {
+        if let Some((slot, ty)) = self.lvalue(operand, src) {
             let cur = self.fb.load(slot.clone(), ty);
             let (op, one) = if ty.is_float() {
                 (IrBin::FAdd, Value::float(delta as f64, ty))
@@ -880,6 +1032,8 @@ fn zero_of(ty: IrType) -> Value {
         IrType::Ptr => Value::Const(Const::Null),
         IrType::Void => Value::Const(Const::Undef(ty)),
         IrType::Int { .. } => Value::int(0, ty),
+        // Aggregates have no scalar zero; an `undef` keeps the IR well-typed.
+        IrType::Struct(_) => Value::Const(Const::Undef(ty)),
     }
 }
 
@@ -927,13 +1081,19 @@ fn decode_string_literal(raw: &str) -> String {
 /// Map an AST type to its concrete IR type. Reference/unknown types collapse
 /// to an opaque pointer (correct for classes; a kernel approximation for
 /// value structs/tuples until the layout sprint).
-fn lower_ty(ty: &AstType, src: &str) -> IrType {
+fn lower_ty(ty: &AstType, src: &str, structs: &StructTable) -> IrType {
     match ty {
         AstType::Path { segments, .. } if segments.len() == 1 && segments[0].args.is_empty() => {
-            primitive(segments[0].name.text(src))
+            // A single-segment name that's a registered value `struct` lowers to
+            // its aggregate; otherwise a primitive (or `Ptr` for a reference).
+            let name = segments[0].name.text(src);
+            match structs.by_name.get(name) {
+                Some(&id) => IrType::Struct(id),
+                None => primitive(name),
+            }
         }
         AstType::Pointer { .. } => IrType::Ptr,
-        AstType::Nullable { inner, .. } => lower_ty(inner, src),
+        AstType::Nullable { inner, .. } => lower_ty(inner, src, structs),
         _ => IrType::Ptr,
     }
 }

@@ -28,7 +28,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module as LlvmModule;
 use inkwell::types::{
-    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType,
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
 };
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue,
@@ -49,11 +49,13 @@ use newbf_ir::{
 pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> {
     let module = ctx.create_module(&ir.name);
     let builder = ctx.create_builder();
-    let cg = Codegen {
+    let mut cg = Codegen {
         ctx,
         module: &module,
         builder: &builder,
+        struct_types: Vec::new(),
     };
+    cg.build_struct_types(ir);
     cg.declare_all(ir);
     for f in &ir.funcs {
         if !f.is_extern {
@@ -86,10 +88,29 @@ struct Codegen<'ctx, 'a> {
     ctx: &'ctx Context,
     module: &'a LlvmModule<'ctx>,
     builder: &'a Builder<'ctx>,
+    /// LLVM struct types indexed by `StructId.0`, built up front so any field
+    /// can reference any struct (incl. forward/self refs).
+    struct_types: Vec<StructType<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx, '_> {
     // ── type mapping ──────────────────────────────────────────────────────
+
+    /// Build the LLVM struct type for every IR struct, up front. Two passes:
+    /// opaque shells (so any field can reference any struct, incl. forward and
+    /// self), then set each body now that all shells exist.
+    fn build_struct_types(&mut self, ir: &IrModule) {
+        for i in 0..ir.structs.len() {
+            let shell = self.ctx.opaque_struct_type(&format!("s{i}"));
+            self.struct_types.push(shell);
+        }
+        for (i, s) in ir.structs.iter().enumerate() {
+            let st = self.struct_types[i];
+            let fields: Vec<BasicTypeEnum<'ctx>> =
+                s.fields.iter().map(|f| self.basic_type_of(f.ty)).collect();
+            st.set_body(&fields, false);
+        }
+    }
 
     fn basic_type_of(&self, ty: IrType) -> BasicTypeEnum<'ctx> {
         match ty {
@@ -100,6 +121,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             IrType::Int { .. } => self.int_type_of(ty).into(),
             IrType::Float { .. } => self.float_type_of(ty).into(),
             IrType::Ptr => self.ctx.ptr_type(AddressSpace::default()).into(),
+            IrType::Struct(id) => self.struct_types[id.0 as usize].into(),
         }
     }
 
@@ -241,6 +263,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                 .ptr_type(AddressSpace::default())
                 .get_undef()
                 .into(),
+            IrType::Struct(id) => self.struct_types[id.0 as usize].get_undef().into(),
         }
     }
 
@@ -386,6 +409,19 @@ impl<'ctx> Codegen<'ctx, '_> {
                 let v = self.value_of(val, results, llvm_fn)?;
                 self.builder.build_store(p, v).unwrap();
                 None
+            }
+            InstKind::FieldAddr {
+                base,
+                struct_id,
+                field,
+            } => {
+                let p = self.as_ptr(self.value_of(base, results, llvm_fn)?);
+                let sty = self.struct_types[struct_id.0 as usize];
+                // Degrade to a skipped value on a bad index rather than panic.
+                self.builder
+                    .build_struct_gep(sty, p, *field, "field")
+                    .ok()
+                    .map(Into::into)
             }
             InstKind::Call { callee, args } => {
                 let argv: Vec<BasicValueEnum<'ctx>> = args
@@ -663,6 +699,46 @@ mod tests {
         assert!(ir.contains("define i64 @add(i64 %0, i64 %1)"), "{ir}");
         assert!(ir.contains("add i64 %0, %1"), "{ir}");
         assert!(ir.contains("ret i64"), "{ir}");
+    }
+
+    #[test]
+    fn struct_alloca_and_field_gep_verifies() {
+        use newbf_ir::{FieldDef, StructDef};
+        // struct Point { i32 x; i32 y; }
+        // i32 sum_xy() { Point p; p.x = 3; p.y = 4; return p.x + p.y; }
+        let mut m = IrModule::new("t");
+        let point = m.add_struct(StructDef {
+            name: "Point".into(),
+            fields: vec![
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+                FieldDef {
+                    name: "y".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        let mut f = FunctionBuilder::new("sum_xy", vec![], IrType::I32);
+        let slot = f.alloca(IrType::Struct(point));
+        let xp = f.field_addr(slot.clone(), point, 0);
+        f.store(xp, Value::int(3, IrType::I32));
+        let yp = f.field_addr(slot.clone(), point, 1);
+        f.store(yp, Value::int(4, IrType::I32));
+        let xp2 = f.field_addr(slot.clone(), point, 0);
+        let x = f.load(xp2, IrType::I32);
+        let yp2 = f.field_addr(slot, point, 1);
+        let y = f.load(yp2, IrType::I32);
+        let s = f.bin(BinOp::Add, x, y, IrType::I32);
+        f.ret(Some(s));
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("struct program verifies");
+        let ir = lower_to_string(&m);
+        assert!(ir.contains("%s0 = type { i32, i32 }"), "{ir}");
+        assert!(ir.contains("alloca %s0"), "{ir}");
+        assert!(ir.contains("getelementptr"), "{ir}");
     }
 
     #[test]

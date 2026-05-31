@@ -3,7 +3,7 @@
 use newbf_lexer::Span;
 
 use crate::inst::*;
-use crate::ty::IrType;
+use crate::ty::{IrType, StructId};
 
 /// A function parameter. `name` is for the report only; operands reference
 /// parameters positionally as [`Value::Param`].
@@ -136,6 +136,20 @@ impl FunctionBuilder {
 
     pub fn store(&mut self, ptr: Value, val: Value) {
         self.emit(InstKind::Store { ptr, val }, IrType::Void, None);
+    }
+
+    /// Address of field `field` of the `Struct(struct_id)` that `ptr` points
+    /// to; result is a `ptr` to that field.
+    pub fn field_addr(&mut self, ptr: Value, struct_id: StructId, field: u32) -> Value {
+        self.emit(
+            InstKind::FieldAddr {
+                base: ptr,
+                struct_id,
+                field,
+            },
+            IrType::Ptr,
+            None,
+        )
     }
 
     pub fn call(&mut self, name: impl Into<String>, args: Vec<Value>, ret: IrType) -> Value {

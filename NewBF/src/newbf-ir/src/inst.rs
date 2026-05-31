@@ -2,7 +2,7 @@
 
 use newbf_lexer::Span;
 
-use crate::ty::IrType;
+use crate::ty::{IrType, StructId};
 
 /// Index of an instruction within a [`crate::Function`]'s instruction arena.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -230,6 +230,14 @@ pub enum InstKind {
     Store {
         ptr: Value,
         val: Value,
+    },
+    /// Address of field `field` within the `Struct(struct_id)` that `base`
+    /// points to. Result is a `ptr` to the field — an LLVM struct GEP
+    /// (`getelementptr %sN, ptr base, 0, field`).
+    FieldAddr {
+        base: Value,
+        struct_id: StructId,
+        field: u32,
     },
     Call {
         callee: Callee,

@@ -3,6 +3,12 @@
 //! (opaque pointers, sized integers/floats) so lowering is mechanical —
 //! aggregate/struct/array types arrive with the layout sprint.
 
+/// Index into a [`crate::Module`]'s struct table (`module.structs`). Kept a
+/// plain `u32` so [`IrType`] stays `Copy`; the field layout lives in the
+/// module's [`crate::StructDef`], not on the type.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct StructId(pub u32);
+
 /// A concrete IR type. Every [`crate::Value`] has one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IrType {
@@ -19,6 +25,10 @@ pub enum IrType {
     /// lives on the instruction that uses it (`alloca` elem, `load` result),
     /// never on the pointer itself.
     Ptr,
+    /// An aggregate (value struct / heap object body) type, indexing the
+    /// module's struct table. Used as an `alloca`'s element type and the base
+    /// type of a `fieldaddr`; the field list lives in [`crate::StructDef`].
+    Struct(StructId),
 }
 
 impl IrType {
@@ -74,6 +84,9 @@ impl IrType {
             IrType::Bool => 1,
             IrType::Int { bits, .. } | IrType::Float { bits } => bits,
             IrType::Ptr => 64,
+            // Aggregates have no single scalar width; scalar coercion never
+            // reaches here for a struct.
+            IrType::Struct(_) => 0,
         }
     }
 
@@ -85,6 +98,7 @@ impl IrType {
             IrType::Int { bits, .. } => format!("i{bits}"),
             IrType::Float { bits } => format!("f{bits}"),
             IrType::Ptr => "ptr".to_string(),
+            IrType::Struct(id) => format!("%s{}", id.0),
         }
     }
 }
