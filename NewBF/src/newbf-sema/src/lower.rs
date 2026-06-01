@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use newbf_ir::{
     BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder, IrType,
-    Module, Param as IrParam, StructDef, StructId, Value,
+    Module, Param as IrParam, StructDef, StructId, Value, VtableDef,
 };
 use newbf_lexer::FileId;
 use newbf_parser::{
@@ -74,6 +74,15 @@ struct StructTable {
     /// inheritance: `apply_inheritance` composes the base's fields/methods into
     /// the derived. `None` for roots and value structs.
     bases: Vec<Option<StructId>>,
+    /// Per-id `virtual`/`override` methods declared *in this type*, as
+    /// `(name, impl symbol)` in declaration order — the input to vtable layout.
+    virtuals: Vec<Vec<(String, String)>>,
+    /// Per-id composed vtable: method name → slot index (consistent across a
+    /// base and its derived). A virtual call indexes the receiver's vtable here.
+    vslots: Vec<HashMap<String, usize>>,
+    /// Per-id composed vtable: slot → implementing symbol. Emitted as the
+    /// class's vtable global; non-empty only for classes with virtual methods.
+    vimpls: Vec<Vec<String>>,
     /// Monomorphized generic instantiations to lower: `(mono id, generic type
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
     /// name and lowers its methods at the mono id/prefix with the env.
@@ -121,8 +130,10 @@ impl StructTable {
             t.monos
                 .push((*id, decl.name.text(decl_src).to_string(), env.clone()));
         }
-        // 5. Compose single inheritance once every type's own layout is filled.
+        // 5. Compose single inheritance once every type's own layout is filled,
+        //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
+        apply_vtables(&mut t);
         t
     }
 
@@ -183,6 +194,9 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     t.methods.push(HashMap::new());
     t.field_elems.push(Vec::new());
     t.bases.push(None);
+    t.virtuals.push(Vec::new());
+    t.vslots.push(HashMap::new());
+    t.vimpls.push(Vec::new());
     t.by_name.insert(mangled.to_string(), id);
     id
 }
@@ -230,6 +244,46 @@ fn compose_inheritance(id: StructId, t: &mut StructTable, composed: &mut [bool])
     if t.dtors[i].is_none() {
         let inherited = t.dtors[b].clone();
         t.dtors[i] = inherited;
+    }
+}
+
+/// The vtable global's symbol for a class prefix (`"Animal."` → `"Animal.$vtable"`).
+fn vtable_name(prefix: &str) -> String {
+    format!("{prefix}$vtable")
+}
+
+/// Compose vtables across the table (recursive, memoized, base-first): inherit
+/// the base's slots, let an `override` replace a slot's implementation, and
+/// append a new slot for each newly-introduced `virtual` method. Slot indices
+/// stay stable from base to derived, so a call site resolves the slot from the
+/// static type and the receiver's vtable supplies the runtime implementation.
+fn apply_vtables(t: &mut StructTable) {
+    let mut done = vec![false; t.vimpls.len()];
+    for i in 0..t.vimpls.len() {
+        compose_vtable(StructId(i as u32), t, &mut done);
+    }
+}
+
+fn compose_vtable(id: StructId, t: &mut StructTable, done: &mut [bool]) {
+    let i = id.0 as usize;
+    if done[i] {
+        return;
+    }
+    done[i] = true;
+    if let Some(base) = t.bases[i] {
+        compose_vtable(base, t, done);
+        let b = base.0 as usize;
+        t.vslots[i] = t.vslots[b].clone();
+        t.vimpls[i] = t.vimpls[b].clone();
+    }
+    for (name, full) in t.virtuals[i].clone() {
+        if let Some(&slot) = t.vslots[i].get(&name) {
+            t.vimpls[i][slot] = full;
+        } else {
+            let slot = t.vimpls[i].len();
+            t.vslots[i].insert(name, slot);
+            t.vimpls[i].push(full);
+        }
     }
 }
 
@@ -514,6 +568,9 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.methods.push(HashMap::new());
             t.field_elems.push(Vec::new());
             t.bases.push(None);
+            t.virtuals.push(Vec::new());
+            t.vslots.push(HashMap::new());
+            t.vimpls.push(Vec::new());
             t.by_name.insert(name, id);
         }
     }
@@ -691,6 +748,14 @@ fn fill_members_at(
                     params: ps,
                     is_instance,
                 };
+                // A `virtual`/`override` instance method with a body occupies a
+                // vtable slot; record it (in declaration order) for layout.
+                let is_virtual = modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Virtual | Modifier::Override));
+                if is_virtual && is_instance && !matches!(body, MethodBody::None) {
+                    t.virtuals[id.0 as usize].push((nm.clone(), sig.full_name.clone()));
+                }
                 let bucket = t.methods[id.0 as usize].entry(nm).or_default();
                 if !bucket.iter().any(|s| s.params == sig.params) {
                     bucket.push(sig);
@@ -746,6 +811,15 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     let mut m = Module::new("program");
     let structs = StructTable::build(&all);
     m.structs = structs.defs.clone();
+    // Emit a vtable global for each class that has virtual methods.
+    for i in 0..structs.vimpls.len() {
+        if !structs.vimpls[i].is_empty() {
+            m.add_vtable(VtableDef {
+                name: vtable_name(&structs.prefixes[i]),
+                entries: structs.vimpls[i].clone(),
+            });
+        }
+    }
     for f in &all {
         lower_items(&f.unit.items, "", f.src, &structs, &mut m);
     }
@@ -1779,9 +1853,16 @@ impl<'a> Lowerer<'a> {
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
             let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
-            // Object header (ClassVData*) at offset 0 — null until vtables.
+            // Object header (ClassVData*) at offset 0: the class vtable when it
+            // has virtual methods, else null.
             let hdr = self.fb.field_addr(p.clone(), id, 0);
-            self.fb.store(hdr, Value::Const(Const::Null));
+            let header = if self.structs.vimpls[id.0 as usize].is_empty() {
+                Value::Const(Const::Null)
+            } else {
+                self.fb
+                    .global_addr(vtable_name(&self.structs.prefixes[id.0 as usize]))
+            };
+            self.fb.store(hdr, header);
             // Run the constructor overload matching the argument count; coercion
             // makes each arg its declared param type.
             let args = ctor_args(operand);
@@ -1879,13 +1960,28 @@ impl<'a> Lowerer<'a> {
             let mut call_args = Vec::new();
             let mut pidx = 0;
             if sig.is_instance {
-                call_args.push(body_ptr);
+                call_args.push(body_ptr.clone());
                 pidx = 1;
             }
             for (v, t) in arg_vals {
                 let pt = sig.params.get(pidx).copied().unwrap_or(t);
                 call_args.push(self.coerce(v, t, pt));
                 pidx += 1;
+            }
+            // Virtual dispatch: if the method occupies a vtable slot on the
+            // receiver's static type, call through the object's `$header` vtable
+            // (the runtime type) so an override runs; else a direct call.
+            if sig.is_instance
+                && let Some(&slot) = self.structs.vslots[owner_id.0 as usize].get(mname)
+            {
+                let hdr = self.fb.field_addr(body_ptr, owner_id, 0);
+                let vtbl = self.fb.load(hdr, IrType::Ptr);
+                let slotp =
+                    self.fb
+                        .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
+                let fnptr = self.fb.load(slotp, IrType::Ptr);
+                let r = self.fb.call_indirect(fnptr, call_args, sig.ret);
+                return (r, sig.ret);
             }
             let r = self.fb.call(sig.full_name, call_args, sig.ret);
             return (r, sig.ret);

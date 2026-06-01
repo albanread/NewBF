@@ -57,6 +57,7 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
     };
     cg.build_struct_types(ir);
     cg.declare_all(ir);
+    cg.emit_vtables(ir);
     for f in &ir.funcs {
         if !f.is_extern {
             cg.lower_function(f);
@@ -208,6 +209,31 @@ impl<'ctx> Codegen<'ctx, '_> {
             self.basic_type_of(ret).fn_type(&[], true)
         };
         self.module.add_function(name, fty, None)
+    }
+
+    /// Emit each class vtable as a constant global array of function pointers.
+    /// Functions are already declared, so each slot resolves to its pointer
+    /// (a missing entry — e.g. an abstract slot — becomes null).
+    fn emit_vtables(&self, ir: &IrModule) {
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        for vt in &ir.vtables {
+            let entries: Vec<PointerValue<'ctx>> = vt
+                .entries
+                .iter()
+                .map(|name| {
+                    self.module
+                        .get_function(name)
+                        .map(|f| f.as_global_value().as_pointer_value())
+                        .unwrap_or_else(|| ptr_ty.const_null())
+                })
+                .collect();
+            let arr = ptr_ty.const_array(&entries);
+            let g = self
+                .module
+                .add_global(ptr_ty.array_type(entries.len() as u32), None, &vt.name);
+            g.set_initializer(&arr);
+            g.set_constant(true);
+        }
     }
 
     // ── constants & operands ──────────────────────────────────────────────
@@ -499,6 +525,37 @@ impl<'ctx> Codegen<'ctx, '_> {
                 let meta: Vec<BasicMetadataValueEnum<'ctx>> =
                     argv.iter().map(|v| (*v).into()).collect();
                 let cs = self.builder.build_call(f, &meta, "call").unwrap();
+                if ty == IrType::Void {
+                    None
+                } else {
+                    cs.try_as_basic_value()
+                        .basic()
+                        .map(|v| self.reconcile_to(v, ty))
+                }
+            }
+            InstKind::GlobalAddr { name } => self
+                .module
+                .get_global(name)
+                .map(|g| g.as_pointer_value().into()),
+            InstKind::CallIndirect { callee, args } => {
+                let fp = self.as_ptr(self.value_of(callee, results, llvm_fn)?);
+                let argv: Vec<BasicValueEnum<'ctx>> = args
+                    .iter()
+                    .filter_map(|a| self.value_of(a, results, llvm_fn))
+                    .collect();
+                let param_tys: Vec<BasicMetadataTypeEnum<'ctx>> =
+                    argv.iter().map(|v| v.get_type().into()).collect();
+                let meta: Vec<BasicMetadataValueEnum<'ctx>> =
+                    argv.iter().map(|v| (*v).into()).collect();
+                let fty = if ty == IrType::Void {
+                    self.ctx.void_type().fn_type(&param_tys, false)
+                } else {
+                    self.basic_type_of(ty).fn_type(&param_tys, false)
+                };
+                let cs = self
+                    .builder
+                    .build_indirect_call(fty, fp, &meta, "vcall")
+                    .unwrap();
                 if ty == IrType::Void {
                     None
                 } else {

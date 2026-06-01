@@ -165,6 +165,16 @@ impl Printer<'_> {
                 let a: Vec<String> = args.iter().map(|v| self.value(v)).collect();
                 format!("call {} @{}({})", ty.mnemonic(), callee.name, a.join(", "))
             }
+            InstKind::GlobalAddr { name } => format!("globaladdr @{name}"),
+            InstKind::CallIndirect { callee, args } => {
+                let a: Vec<String> = args.iter().map(|v| self.value(v)).collect();
+                format!(
+                    "callind {} {}({})",
+                    ty.mnemonic(),
+                    self.value(callee),
+                    a.join(", ")
+                )
+            }
             InstKind::Phi { incomings } => {
                 let arms: Vec<String> = incomings
                     .iter()

@@ -26,11 +26,23 @@ pub struct StructDef {
     pub fields: Vec<FieldDef>,
 }
 
+/// A class vtable: a named global holding an ordered array of function
+/// pointers (one per virtual slot). `new` stores its address into the object's
+/// `$header`; a virtual call loads the slot and calls it indirectly.
+#[derive(Clone, PartialEq, Debug)]
+pub struct VtableDef {
+    /// Global symbol name (e.g. `"Dog$vtable"`), referenced by `GlobalAddr`.
+    pub name: String,
+    /// Slot → implementing function name, in slot order.
+    pub entries: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
     pub name: String,
     pub structs: Vec<StructDef>,
     pub funcs: Vec<Function>,
+    pub vtables: Vec<VtableDef>,
 }
 
 impl Module {
@@ -39,7 +51,13 @@ impl Module {
             name: name.into(),
             structs: Vec::new(),
             funcs: Vec::new(),
+            vtables: Vec::new(),
         }
+    }
+
+    /// Register a class vtable global.
+    pub fn add_vtable(&mut self, def: VtableDef) {
+        self.vtables.push(def);
     }
 
     /// Register an aggregate layout, returning its [`StructId`] handle.

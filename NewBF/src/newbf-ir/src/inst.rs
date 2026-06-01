@@ -256,6 +256,17 @@ pub enum InstKind {
         callee: Callee,
         args: Vec<Value>,
     },
+    /// Address of a named module global — a class vtable (an array of function
+    /// pointers). Result is a `ptr` to the global.
+    GlobalAddr {
+        name: String,
+    },
+    /// Call a function-pointer value (a vtable slot), not a symbol. The
+    /// result type is on [`InstData::ty`]; `args[0]` is typically the receiver.
+    CallIndirect {
+        callee: Value,
+        args: Vec<Value>,
+    },
     /// SSA merge: `[ (predecessor, value), … ]`.
     Phi {
         incomings: Vec<(BlockId, Value)>,

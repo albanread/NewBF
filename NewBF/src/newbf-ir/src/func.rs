@@ -174,6 +174,20 @@ impl FunctionBuilder {
         )
     }
 
+    /// Address of a named module global (e.g. a class vtable); result `ptr`.
+    pub fn global_addr(&mut self, name: impl Into<String>) -> Value {
+        self.emit(
+            InstKind::GlobalAddr { name: name.into() },
+            IrType::Ptr,
+            None,
+        )
+    }
+
+    /// Call a function-pointer value (a vtable slot) with `args`.
+    pub fn call_indirect(&mut self, callee: Value, args: Vec<Value>, ret: IrType) -> Value {
+        self.emit(InstKind::CallIndirect { callee, args }, ret, None)
+    }
+
     pub fn phi(&mut self, incomings: Vec<(BlockId, Value)>, ty: IrType) -> Value {
         self.emit(InstKind::Phi { incomings }, ty, None)
     }
