@@ -1534,6 +1534,9 @@ impl<'a> Lowerer<'a> {
             Expr::PostInc { operand, .. } => self.incdec(operand, 1, false, src),
             Expr::PostDec { operand, .. } => self.incdec(operand, -1, false, src),
             Expr::Binary { op, lhs, rhs, .. } => self.binary(*op, lhs, rhs, src),
+            Expr::Ternary {
+                cond, then, els, ..
+            } => self.ternary(cond, then, els, src),
             Expr::Assign {
                 op, target, value, ..
             } => self.assign(*op, target, value, src),
@@ -1630,6 +1633,40 @@ impl<'a> Lowerer<'a> {
             // PreDec are handled above; PostInc/PostDec are separate exprs.)
             _ => (undef(t), t),
         }
+    }
+
+    /// `cond ? then : els` — short-circuiting (only the taken branch runs).
+    /// Lowers like an `if`/`else` joined by a phi of the two results, each
+    /// coerced (in its own predecessor block) to the common result type.
+    fn ternary(&mut self, cond: &Expr, then: &Expr, els: &Expr, src: &str) -> (Value, IrType) {
+        let (cv, cvt) = self.expr(cond, src);
+        let cond_v = self.coerce_bool(cv, cvt);
+        let then_b = self.fb.create_block("tern.then");
+        let else_b = self.fb.create_block("tern.else");
+        let join_b = self.fb.create_block("tern.join");
+        self.fb.cond_br(cond_v, then_b, else_b);
+
+        // Evaluate each arm in its block (an arm may itself branch, so the phi
+        // predecessor is the block the arm *ends* in).
+        self.switch(then_b);
+        let (av, at) = self.expr(then, src);
+        let then_end = self.fb.current_block();
+        self.switch(else_b);
+        let (bv, bt) = self.expr(els, src);
+        let else_end = self.fb.current_block();
+
+        // Coerce each result to the common type in its own block, then branch.
+        let ty = common_type(at, bt);
+        self.fb.switch_to(then_end);
+        let a2 = self.coerce(av, at, ty);
+        self.fb.br(join_b);
+        self.fb.switch_to(else_end);
+        let b2 = self.coerce(bv, bt, ty);
+        self.fb.br(join_b);
+
+        self.switch(join_b);
+        let r = self.fb.phi(vec![(then_end, a2), (else_end, b2)], ty);
+        (r, ty)
     }
 
     fn binary(&mut self, op: AstBin, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
