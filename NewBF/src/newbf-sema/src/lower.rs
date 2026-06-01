@@ -198,33 +198,55 @@ fn use_in_type<'a>(
     if let AstType::Path { segments, .. } = ty
         && segments.len() == 1
         && !segments[0].args.is_empty()
-        && let Some(&(decl, decl_src)) = generics.get(segments[0].name.text(src))
     {
-        // Resolve the concrete arguments (read-only), then register.
-        let argtys: Vec<IrType> = segments[0]
-            .args
-            .iter()
-            .map(|a| lower_ty_env(a, src, t, &[]))
-            .collect();
-        let mangled = mangle_generic(segments[0].name.text(src), &argtys);
-        if !seen.iter().any(|s| s == &mangled) {
-            seen.push(mangled.clone());
-            let kind = struct_kind(decl).unwrap_or(StructKind::Value);
-            let id = register_mono(t, &mangled, kind);
-            let env: Vec<(String, IrType)> = decl
-                .generic_params
-                .iter()
-                .zip(&argtys)
-                .map(|(gp, ty)| (gp.name.text(decl_src).to_string(), *ty))
-                .collect();
-            monos.push((id, decl, decl_src, env));
-        }
-        for a in &segments[0].args {
-            use_in_type(a, src, generics, t, seen, monos);
-        }
+        record_inst(
+            segments[0].name.text(src),
+            &segments[0].args,
+            src,
+            generics,
+            t,
+            seen,
+            monos,
+        );
     }
     if let AstType::Pointer { inner, .. } | AstType::Nullable { inner, .. } = ty {
         use_in_type(inner, src, generics, t, seen, monos);
+    }
+}
+
+/// Register the monomorph a `Name<Args>` reference demands (`Box<int>` →
+/// `Box$i64`) when `Name` is a known generic and it isn't already recorded,
+/// then recurse into the type arguments for nested instantiations. Shared by
+/// type-position (`use_in_type`) and expression-position (`collect_insts_expr`)
+/// collection.
+fn record_inst<'a>(
+    name: &str,
+    args: &[AstType],
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    let Some(&(decl, decl_src)) = generics.get(name) else {
+        return;
+    };
+    let argtys: Vec<IrType> = args.iter().map(|a| lower_ty_env(a, src, t, &[])).collect();
+    let mangled = mangle_generic(name, &argtys);
+    if !seen.iter().any(|s| s == &mangled) {
+        seen.push(mangled.clone());
+        let kind = struct_kind(decl).unwrap_or(StructKind::Value);
+        let id = register_mono(t, &mangled, kind);
+        let env: Vec<(String, IrType)> = decl
+            .generic_params
+            .iter()
+            .zip(&argtys)
+            .map(|(gp, ty)| (gp.name.text(decl_src).to_string(), *ty))
+            .collect();
+        monos.push((id, decl, decl_src, env));
+    }
+    for a in args {
+        use_in_type(a, src, generics, t, seen, monos);
     }
 }
 
@@ -303,22 +325,104 @@ fn collect_insts_stmt<'a>(
                 collect_insts_stmt(s, src, generics, t, seen, monos);
             }
         }
-        Stmt::Local { ty: Some(ty), .. } => use_in_type(ty, src, generics, t, seen, monos),
-        Stmt::If { then, els, .. } => {
+        Stmt::Local { ty, init, .. } => {
+            if let Some(ty) = ty {
+                use_in_type(ty, src, generics, t, seen, monos);
+            }
+            if let Some(e) = init {
+                collect_insts_expr(e, src, generics, t, seen, monos);
+            }
+        }
+        Stmt::Expr { expr, .. } => collect_insts_expr(expr, src, generics, t, seen, monos),
+        Stmt::Return { value: Some(e), .. } => collect_insts_expr(e, src, generics, t, seen, monos),
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            collect_insts_expr(cond, src, generics, t, seen, monos);
             collect_insts_stmt(then, src, generics, t, seen, monos);
             if let Some(e) = els {
                 collect_insts_stmt(e, src, generics, t, seen, monos);
             }
         }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::Defer { body, .. } => collect_insts_stmt(body, src, generics, t, seen, monos),
-        Stmt::For { init, body, .. } => {
+        Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
+            collect_insts_expr(cond, src, generics, t, seen, monos);
+            collect_insts_stmt(body, src, generics, t, seen, monos);
+        }
+        Stmt::ForEach { iter, body, .. } => {
+            collect_insts_expr(iter, src, generics, t, seen, monos);
+            collect_insts_stmt(body, src, generics, t, seen, monos);
+        }
+        Stmt::Defer { body, .. } => collect_insts_stmt(body, src, generics, t, seen, monos),
+        Stmt::For {
+            init,
+            cond,
+            update,
+            body,
+            ..
+        } => {
             if let Some(i) = init {
                 collect_insts_stmt(i, src, generics, t, seen, monos);
             }
+            if let Some(c) = cond {
+                collect_insts_expr(c, src, generics, t, seen, monos);
+            }
+            if let Some(u) = update {
+                collect_insts_expr(u, src, generics, t, seen, monos);
+            }
             collect_insts_stmt(body, src, generics, t, seen, monos);
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression for generic instantiations in expression position —
+/// chiefly `new Name<Args>(…)` (where the `Name<Args>` is an `Expr::Generic`),
+/// so an instantiation reaches monomorphization even without a typed local.
+fn collect_insts_expr<'a>(
+    e: &Expr,
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+) {
+    match e {
+        Expr::Generic { base, args, .. } => {
+            if let Expr::Ident(s) = &**base {
+                record_inst(s.text(src), args, src, generics, t, seen, monos);
+            }
+        }
+        Expr::Paren { inner, .. } => collect_insts_expr(inner, src, generics, t, seen, monos),
+        Expr::Unary { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. }
+        | Expr::Prefix { operand, .. } => {
+            collect_insts_expr(operand, src, generics, t, seen, monos)
+        }
+        Expr::Member { base, .. } => collect_insts_expr(base, src, generics, t, seen, monos),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_insts_expr(lhs, src, generics, t, seen, monos);
+            collect_insts_expr(rhs, src, generics, t, seen, monos);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_insts_expr(target, src, generics, t, seen, monos);
+            collect_insts_expr(value, src, generics, t, seen, monos);
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            collect_insts_expr(cond, src, generics, t, seen, monos);
+            collect_insts_expr(then, src, generics, t, seen, monos);
+            collect_insts_expr(els, src, generics, t, seen, monos);
+        }
+        Expr::Call { callee, args, .. }
+        | Expr::Index {
+            base: callee, args, ..
+        } => {
+            collect_insts_expr(callee, src, generics, t, seen, monos);
+            for a in args {
+                collect_insts_expr(a, src, generics, t, seen, monos);
+            }
         }
         _ => {}
     }
