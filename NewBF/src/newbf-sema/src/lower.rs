@@ -417,7 +417,7 @@ fn fill_fields_at(
                 continue;
             }
             let fty = lower_ty_env(ty, src, t, env);
-            elems.push(pointer_elem(ty, src, t));
+            elems.push(pointer_elem_env(ty, src, t, env));
             fields.push(FieldDef {
                 name: name.text(src).to_string(),
                 ty: fty,
@@ -880,7 +880,7 @@ fn lower_method(
     for (i, p) in params.iter().enumerate() {
         if let Some(nm) = &p.name {
             let ty = lower_ty_env(&p.ty, src, structs, env);
-            let elem = pointer_elem(&p.ty, src, structs);
+            let elem = pointer_elem_env(&p.ty, src, structs, env);
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty, elem);
@@ -1043,8 +1043,11 @@ impl<'a> Lowerer<'a> {
                     let v = self.coerce(v, t, slot_ty);
                     self.fb.store(slot.clone(), v);
                 }
-                // Record the element type for a typed-pointer local (`T* p`).
-                let elem = ty.as_ref().and_then(|t| pointer_elem(t, src, self.structs));
+                // Record the element type for a typed-pointer local (`T* p`),
+                // resolving `T` through the monomorph env.
+                let elem = ty
+                    .as_ref()
+                    .and_then(|t| pointer_elem_env(t, src, self.structs, self.env));
                 self.bind(name.text(src), slot, slot_ty, elem);
             }
             Stmt::Return { value, .. } => {
@@ -2068,12 +2071,14 @@ fn ctor_args(e: &Expr) -> &[Expr] {
     }
 }
 
-/// The element type of an AST pointer type (`T*` → `T`), for typed indexing.
-/// `None` for non-pointer types.
-fn pointer_elem(ty: &AstType, src: &str, structs: &StructTable) -> Option<IrType> {
+/// The element type of an AST pointer type (`T*` → `T`) for typed indexing,
+/// resolving generic type-parameters through `env` so a `T*` field/local in a
+/// monomorph strides by `T`'s concrete size (`List<int32>`'s buffer steps by 4,
+/// not 8). `None` for non-pointer types.
+fn pointer_elem_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> Option<IrType> {
     match ty {
-        AstType::Pointer { inner, .. } => Some(lower_ty(inner, src, structs)),
-        AstType::Nullable { inner, .. } => pointer_elem(inner, src, structs),
+        AstType::Pointer { inner, .. } => Some(lower_ty_env(inner, src, structs, env)),
+        AstType::Nullable { inner, .. } => pointer_elem_env(inner, src, structs, env),
         _ => None,
     }
 }
@@ -2086,10 +2091,6 @@ type TyEnv<'a> = &'a [(String, IrType)];
 /// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
 fn mangle_generic(name: &str, args: &[IrType]) -> String {
     format!("{name}${}", type_codes(args))
-}
-
-fn lower_ty(ty: &AstType, src: &str, structs: &StructTable) -> IrType {
-    lower_ty_env(ty, src, structs, &[])
 }
 
 /// Lower a type, resolving generic type-parameters through `env` (so a `T`
