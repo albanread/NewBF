@@ -22,8 +22,9 @@ use newbf_ir::{
 };
 use newbf_lexer::FileId;
 use newbf_parser::{
-    AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody, Modifier,
-    Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp, parse_file,
+    AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody,
+    Modifier, Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp,
+    parse_file,
 };
 
 use crate::Program;
@@ -775,6 +776,45 @@ fn fill_members_at(
                     bucket.push(sig);
                 }
             }
+            Member::Property {
+                ty,
+                name,
+                accessors,
+                modifiers,
+                ..
+            } => {
+                // A computed (body-having) `get` accessor registers as a
+                // `get_{Name}` instance method; reading `obj.Name` calls it.
+                // Auto accessors (body-less, needing a backing field) and
+                // setters are a later slice.
+                let nm = name.text(src).to_string();
+                let is_instance = !modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static));
+                let pty = lower_ty_env(ty, src, t, env);
+                for acc in accessors {
+                    if matches!(acc.kind, AccessorKind::Get)
+                        && !matches!(acc.body, MethodBody::None)
+                    {
+                        let mut ps = Vec::new();
+                        if is_instance {
+                            ps.push(IrType::Ref(id));
+                        }
+                        let sig = MethodSig {
+                            full_name: format!("{}get_{}", t.prefixes[id.0 as usize], nm),
+                            ret: pty,
+                            params: ps,
+                            is_instance,
+                        };
+                        let bucket = t.methods[id.0 as usize]
+                            .entry(format!("get_{nm}"))
+                            .or_default();
+                        if !bucket.iter().any(|s| s.params == sig.params) {
+                            bucket.push(sig);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1083,7 +1123,47 @@ fn lower_type_at(
                 }
             }
             Member::Nested(nested) => lower_type(nested, new_prefix, src, structs, m),
-            _ => {} // fields / properties / enum-cases — later
+            Member::Property {
+                ty,
+                name,
+                accessors,
+                modifiers,
+                ..
+            } => {
+                // Lower each computed `get` accessor as the `get_{Name}` method
+                // the pre-pass registered; its body sees `this` like any
+                // instance method.
+                let nm = name.text(src);
+                let is_static = modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static));
+                let this_ty = match owner_id {
+                    Some(id) if !is_static => Some(IrType::Ref(id)),
+                    _ => None,
+                };
+                let ret = lower_ty_env(ty, src, structs, env);
+                for acc in accessors {
+                    if matches!(acc.kind, AccessorKind::Get)
+                        && !matches!(acc.body, MethodBody::None)
+                    {
+                        let full_name = format!("{new_prefix}get_{nm}");
+                        if let Some(func) = lower_method(
+                            full_name,
+                            ret,
+                            &[],
+                            &acc.body,
+                            src,
+                            sigs,
+                            structs,
+                            this_ty,
+                            env,
+                        ) {
+                            m.add_function(func);
+                        }
+                    }
+                }
+            }
+            _ => {} // fields / auto-properties / setters / enum-cases — later
         }
     }
 }
@@ -1607,9 +1687,12 @@ impl<'a> Lowerer<'a> {
             } => self.lower_delete(operand, src),
             // Member read (`obj.field` / `ref.field`): load the resolved field;
             // degrade if the base isn't a known struct/reference place.
-            Expr::Member { .. } => match self.lvalue(e, src) {
+            Expr::Member { base, name, .. } => match self.lvalue(e, src) {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
-                None => (undef(IrType::I64), IrType::I64),
+                // Not a storable field — try a computed property getter.
+                None => self
+                    .try_property_get(base, name.text(src), src)
+                    .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
             },
             // Index read (`p[i]`): load the element at the computed address.
             Expr::Index { .. } => match self.lvalue(e, src) {
@@ -1834,6 +1917,27 @@ impl<'a> Lowerer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `obj.Name` where `Name` is not a field but the receiver's type defines a
+    /// `get_Name` instance method (a computed property): emit the getter call.
+    /// Uses `struct_base` for the receiver (a *pointer* to the body) — exactly
+    /// as `lower_method_call` does — so value-struct receivers pass an address,
+    /// not an aggregate value.
+    fn try_property_get(&mut self, base: &Expr, name: &str, src: &str) -> Option<(Value, IrType)> {
+        let (body_ptr, owner) = self.struct_base(base, src)?;
+        let getter = self.structs.methods[owner.0 as usize]
+            .get(&format!("get_{name}"))
+            .and_then(|c| pick_overload(c, &[], true))?
+            .clone();
+        let mut call_args = Vec::new();
+        if getter.is_instance {
+            call_args.push(body_ptr);
+        }
+        Some((
+            self.fb.call(getter.full_name, call_args, getter.ret),
+            getter.ret,
+        ))
     }
 
     /// The element type of a typed-pointer base expression (`T* p` → `T`), for
