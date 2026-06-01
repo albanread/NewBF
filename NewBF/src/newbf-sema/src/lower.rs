@@ -640,6 +640,36 @@ fn fill_fields_at(
             });
         }
     }
+    // An instance auto-property (at least one body-less accessor) gets a
+    // compiler-synthesized backing field `{Name}$prop`; the `$` keeps it out
+    // of the user namespace. An all-computed property (every accessor has a
+    // body) needs no storage and is skipped. Statics aren't in the layout.
+    for m in &td.members {
+        if let Member::Property {
+            ty,
+            name,
+            accessors,
+            modifiers,
+            ..
+        } = m
+        {
+            if modifiers
+                .iter()
+                .any(|(mo, _)| matches!(mo, Modifier::Static))
+            {
+                continue;
+            }
+            if !accessors.iter().any(|a| matches!(a.body, MethodBody::None)) {
+                continue;
+            }
+            let pty = lower_ty_env(ty, src, t, env);
+            elems.push(pointer_elem_env(ty, src, t, env));
+            fields.push(FieldDef {
+                name: format!("{}$prop", name.text(src)),
+                ty: pty,
+            });
+        }
+    }
     t.defs[id.0 as usize].fields = fields;
     t.field_elems[id.0 as usize] = elems;
 }
@@ -783,19 +813,17 @@ fn fill_members_at(
                 modifiers,
                 ..
             } => {
-                // A computed (body-having) `get` accessor registers as a
-                // `get_{Name}` instance method; reading `obj.Name` calls it.
-                // Auto accessors (body-less, needing a backing field) and
-                // setters are a later slice.
+                // A `get` accessor registers as a `get_{Name}` instance method;
+                // reading `obj.Name` calls it. Both computed (body-having) and
+                // auto (body-less, backed by the synthesized `{Name}$prop`
+                // field) accessors register here — lowering picks the body.
                 let nm = name.text(src).to_string();
                 let is_instance = !modifiers
                     .iter()
                     .any(|(mo, _)| matches!(mo, Modifier::Static));
                 let pty = lower_ty_env(ty, src, t, env);
                 for acc in accessors {
-                    if matches!(acc.kind, AccessorKind::Get)
-                        && !matches!(acc.body, MethodBody::None)
-                    {
+                    if matches!(acc.kind, AccessorKind::Get) {
                         let mut ps = Vec::new();
                         if is_instance {
                             ps.push(IrType::Ref(id));
@@ -813,12 +841,10 @@ fn fill_members_at(
                             bucket.push(sig);
                         }
                     }
-                    // A computed (body-having) `set` accessor registers as a
-                    // `set_{Name}` instance method returning void, taking the
-                    // property type as its (implicit `value`) parameter.
-                    if matches!(acc.kind, AccessorKind::Set)
-                        && !matches!(acc.body, MethodBody::None)
-                    {
+                    // A `set` accessor registers as a `set_{Name}` instance
+                    // method returning void, taking the property type as its
+                    // (implicit `value`) parameter. Computed and auto alike.
+                    if matches!(acc.kind, AccessorKind::Set) {
                         let mut ps = Vec::new();
                         if is_instance {
                             ps.push(IrType::Ref(id));
@@ -1165,9 +1191,11 @@ fn lower_type_at(
                 modifiers,
                 ..
             } => {
-                // Lower each computed `get` accessor as the `get_{Name}` method
-                // the pre-pass registered; its body sees `this` like any
-                // instance method.
+                // Lower each `get`/`set` accessor as the `get_{Name}`/`set_{Name}`
+                // method the pre-pass registered. A computed accessor lowers its
+                // AST body via `lower_method` (sees `this` like any instance
+                // method); an auto accessor has no body, so we synthesize a
+                // trivial read/write of the backing field `{Name}$prop`.
                 let nm = name.text(src);
                 let is_static = modifiers
                     .iter()
@@ -1177,6 +1205,17 @@ fn lower_type_at(
                     _ => None,
                 };
                 let ret = lower_ty_env(ty, src, structs, env);
+                // Index of the synthesized backing field (instance auto-props
+                // only); `None` for computed or static properties.
+                let backing = format!("{}$prop", nm);
+                let bidx = owner_id
+                    .and_then(|oid| {
+                        structs.defs[oid.0 as usize]
+                            .fields
+                            .iter()
+                            .position(|f| f.name == backing)
+                    })
+                    .map(|p| p as u32);
                 for acc in accessors {
                     if matches!(acc.kind, AccessorKind::Get)
                         && !matches!(acc.body, MethodBody::None)
@@ -1196,6 +1235,25 @@ fn lower_type_at(
                         ) {
                             m.add_function(func);
                         }
+                    }
+                    // Auto getter: synthesize `get_{Name}(this) = this.{Name}$prop`.
+                    if matches!(acc.kind, AccessorKind::Get)
+                        && matches!(acc.body, MethodBody::None)
+                        && let (Some(oid), Some(idx)) = (owner_id, bidx)
+                    {
+                        let pty = lower_ty_env(ty, src, structs, env);
+                        let mut fb = FunctionBuilder::new(
+                            format!("{new_prefix}get_{nm}"),
+                            vec![IrParam {
+                                name: Some("this".to_string()),
+                                ty: IrType::Ref(oid),
+                            }],
+                            pty,
+                        );
+                        let p = fb.field_addr(Value::Param(0), oid, idx);
+                        let v = fb.load(p, pty);
+                        fb.ret(Some(v));
+                        m.add_function(fb.finish());
                     }
                     // A computed `set` accessor lowers as `set_{Name}`, whose
                     // body sees an implicit `value` param of the property type
@@ -1220,9 +1278,36 @@ fn lower_type_at(
                             m.add_function(func);
                         }
                     }
+                    // Auto setter: synthesize `set_{Name}(this, value)` writing
+                    // `value` into the backing field. `this` is Param(0), the
+                    // implicit `value` is Param(1).
+                    if matches!(acc.kind, AccessorKind::Set)
+                        && matches!(acc.body, MethodBody::None)
+                        && let (Some(oid), Some(idx)) = (owner_id, bidx)
+                    {
+                        let pty = lower_ty_env(ty, src, structs, env);
+                        let mut fb = FunctionBuilder::new(
+                            format!("{new_prefix}set_{nm}"),
+                            vec![
+                                IrParam {
+                                    name: Some("this".to_string()),
+                                    ty: IrType::Ref(oid),
+                                },
+                                IrParam {
+                                    name: Some("value".to_string()),
+                                    ty: pty,
+                                },
+                            ],
+                            IrType::Void,
+                        );
+                        let p = fb.field_addr(Value::Param(0), oid, idx);
+                        fb.store(p, Value::Param(1));
+                        fb.ret(None);
+                        m.add_function(fb.finish());
+                    }
                 }
             }
-            _ => {} // fields / auto-properties / enum-cases — later
+            _ => {} // fields / enum-cases — later
         }
     }
 }
