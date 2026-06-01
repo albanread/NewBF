@@ -70,6 +70,10 @@ struct StructTable {
     /// Per-id, per-field pointer element type (parallel to `defs[id].fields`):
     /// `Some` for a `T*` field, so `obj.field[i]` knows the element.
     field_elems: Vec<Vec<Option<IrType>>>,
+    /// Per-id base class (the first class in a type's base list), for single
+    /// inheritance: `apply_inheritance` composes the base's fields/methods into
+    /// the derived. `None` for roots and value structs.
+    bases: Vec<Option<StructId>>,
     /// Monomorphized generic instantiations to lower: `(mono id, generic type
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
     /// name and lowers its methods at the mono id/prefix with the env.
@@ -117,6 +121,8 @@ impl StructTable {
             t.monos
                 .push((*id, decl.name.text(decl_src).to_string(), env.clone()));
         }
+        // 5. Compose single inheritance once every type's own layout is filled.
+        apply_inheritance(&mut t);
         t
     }
 
@@ -176,8 +182,55 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     t.dtors.push(None);
     t.methods.push(HashMap::new());
     t.field_elems.push(Vec::new());
+    t.bases.push(None);
     t.by_name.insert(mangled.to_string(), id);
     id
+}
+
+/// Compose single inheritance across the table: each class with a base gains
+/// the base's fields (right after its own `$header`), the matching field-element
+/// types, and any base methods/destructor it doesn't itself declare. Recursive +
+/// memoized, so a chain (`Cat : Dog : Animal`) composes base-first.
+fn apply_inheritance(t: &mut StructTable) {
+    let mut composed = vec![false; t.defs.len()];
+    for i in 0..t.defs.len() {
+        compose_inheritance(StructId(i as u32), t, &mut composed);
+    }
+}
+
+fn compose_inheritance(id: StructId, t: &mut StructTable, composed: &mut [bool]) {
+    let i = id.0 as usize;
+    if composed[i] {
+        return;
+    }
+    composed[i] = true;
+    let Some(base) = t.bases[i] else {
+        return;
+    };
+    compose_inheritance(base, t, composed);
+    let b = base.0 as usize;
+    // Layout: own `$header`, then the base's (already-composed) non-header
+    // fields, then this type's own fields — so a derived pointer is
+    // prefix-compatible with the base (a base method reads inherited fields at
+    // the same offsets).
+    let base_fields: Vec<FieldDef> = t.defs[b].fields.iter().skip(1).cloned().collect();
+    let base_elems: Vec<Option<IrType>> = t.field_elems[b].iter().skip(1).cloned().collect();
+    let own_fields = t.defs[i].fields.split_off(1);
+    t.defs[i].fields.extend(base_fields);
+    t.defs[i].fields.extend(own_fields);
+    let own_elems = t.field_elems[i].split_off(1);
+    t.field_elems[i].extend(base_elems);
+    t.field_elems[i].extend(own_elems);
+    // Inherit methods (name-level) the derived doesn't override; an inherited
+    // sig keeps the base's symbol + `this` type, called on a prefix-compatible
+    // derived pointer.
+    for (name, sigs) in t.methods[b].clone() {
+        t.methods[i].entry(name).or_insert(sigs);
+    }
+    if t.dtors[i].is_none() {
+        let inherited = t.dtors[b].clone();
+        t.dtors[i] = inherited;
+    }
 }
 
 type MonoList<'a> = Vec<(StructId, &'a TypeDecl, &'a str, Vec<(String, IrType)>)>;
@@ -460,6 +513,7 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.dtors.push(None);
             t.methods.push(HashMap::new());
             t.field_elems.push(Vec::new());
+            t.bases.push(None);
             t.by_name.insert(name, id);
         }
     }
@@ -547,6 +601,19 @@ fn fill_members_at(
     t: &mut StructTable,
 ) {
     fill_fields_at(td, id, kind, env, src, t);
+
+    // Single inheritance: record the first base that resolves to a class.
+    // `apply_inheritance` later composes its fields/methods into this type.
+    if matches!(kind, StructKind::Ref) {
+        for b in &td.bases {
+            if let IrType::Ref(bid) = lower_ty_env(b, src, t, env)
+                && bid != id
+            {
+                t.bases[id.0 as usize] = Some(bid);
+                break;
+            }
+        }
+    }
 
     // Constructors (one per distinct arity → `$ctorN`), a destructor, and the
     // this-aware method table for call resolution. The implicit `this` is a
