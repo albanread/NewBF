@@ -27,6 +27,18 @@ class List<T> {
 		this.mCount = this.mCount + 1;
 	}
 
+	// Index of the first element equal to `value` (by ==), or -1 if absent.
+	public int32 IndexOf(T value) {
+		for (int32 i = 0; i < this.mCount; i++) {
+			if (this.mItems[i] == value) { return i; }
+		}
+		return -1;
+	}
+	// Whether `value` occurs anywhere in the list.
+	public bool Contains(T value) {
+		return this.IndexOf(value) >= 0;
+	}
+
 	void Grow() {
 		int nc = this.mCap * 2;
 		T* nb = Internal.Malloc(nc * 8);

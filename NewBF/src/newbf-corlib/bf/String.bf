@@ -35,6 +35,18 @@ class String {
 		return true;
 	}
 
+	// Index of the first occurrence of `c`, or -1 if not present.
+	public int32 IndexOf(char8 c) {
+		for (int32 i = 0; i < this.mLength; i++) {
+			if (this.mPtr[i] == c) { return i; }
+		}
+		return -1;
+	}
+	// Whether `c` occurs anywhere in the string.
+	public bool Contains(char8 c) {
+		return this.IndexOf(c) >= 0;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
