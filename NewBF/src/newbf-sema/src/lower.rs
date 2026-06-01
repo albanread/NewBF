@@ -1708,6 +1708,34 @@ impl<'a> Lowerer<'a> {
                 let r = self.coerce_bool(r, rt);
                 (self.fb.bin(IrBin::Or, l, r, IrType::Bool), IrType::Bool)
             }
+            AstBin::Eq | AstBin::Ne
+                if matches!(lt, IrType::Ref(_)) && matches!(rt, IrType::Ref(_)) =>
+            {
+                // Value equality for class references that define `Equals(Self)`
+                // (e.g. String): `a == b` → `a.Equals(b)`, `a != b` → its
+                // negation. Reference identity (and null comparison, where one
+                // side isn't a `Ref`) falls through to the scalar compare below.
+                let IrType::Ref(id) = lt else { unreachable!() };
+                let eq = self.structs.methods[id.0 as usize]
+                    .get("Equals")
+                    .and_then(|c| pick_overload(c, &[rt], true))
+                    .cloned();
+                if let Some(eq) = eq {
+                    let other = self.coerce(r, rt, eq.params[1]);
+                    let res = self.fb.call(eq.full_name, vec![l, other], IrType::Bool);
+                    let res = if matches!(op, AstBin::Ne) {
+                        self.fb.cmp(CmpPred::Eq, res, Value::bool(false))
+                    } else {
+                        res
+                    };
+                    (res, IrType::Bool)
+                } else {
+                    let ct = common_type(lt, rt);
+                    let l = self.coerce(l, lt, ct);
+                    let r = self.coerce(r, rt, ct);
+                    (self.fb.cmp(cmp_pred(op, ct), l, r), IrType::Bool)
+                }
+            }
             AstBin::Lt | AstBin::Le | AstBin::Gt | AstBin::Ge | AstBin::Eq | AstBin::Ne => {
                 let ct = common_type(lt, rt);
                 let l = self.coerce(l, lt, ct);
