@@ -713,12 +713,21 @@ fn fill_members_at(
                     .iter()
                     .map(|p| lower_ty_env(&p.ty, src, t, env))
                     .collect();
-                // A body-having method emits `{prefix}{name}` — suffixed by
-                // parameter types when it's a *later* overload of that name (the
-                // first keeps the plain symbol). A body-less `[Intrinsic]`/
-                // `[LinkName]` extern resolves to its symbol; any other body-less
-                // member (abstract/interface) isn't callable and is skipped.
-                let full_name = if matches!(body, MethodBody::None) {
+                // An `abstract` instance method is body-less but reserves a
+                // vtable slot a derived `override` fills; it mangles like a real
+                // method (below) so the base vtable entry references a symbol
+                // that's never defined → emitted as a null slot.
+                let is_abstract = matches!(body, MethodBody::None)
+                    && modifiers
+                        .iter()
+                        .any(|(mo, _)| matches!(mo, Modifier::Abstract));
+                // A body-having (or `abstract`) method emits `{prefix}{name}` —
+                // suffixed by parameter types when it's a *later* overload of
+                // that name (the first keeps the plain symbol). A body-less
+                // `[Intrinsic]`/`[LinkName]` extern resolves to its symbol; any
+                // other body-less member (interface signature) isn't callable
+                // and is skipped.
+                let full_name = if matches!(body, MethodBody::None) && !is_abstract {
                     match extern_symbol(attributes, src) {
                         Some(sym) => sym,
                         None => continue,
@@ -748,12 +757,17 @@ fn fill_members_at(
                     params: ps,
                     is_instance,
                 };
-                // A `virtual`/`override` instance method with a body occupies a
-                // vtable slot; record it (in declaration order) for layout.
-                let is_virtual = modifiers
-                    .iter()
-                    .any(|(mo, _)| matches!(mo, Modifier::Virtual | Modifier::Override));
-                if is_virtual && is_instance && !matches!(body, MethodBody::None) {
+                // A `virtual`/`override`/`abstract` instance method occupies a
+                // vtable slot; record it (in declaration order) for layout. A
+                // body-having one supplies the impl; an `abstract` one reserves
+                // the slot with a null impl for a derived `override` to fill.
+                let is_virtual = modifiers.iter().any(|(mo, _)| {
+                    matches!(
+                        mo,
+                        Modifier::Virtual | Modifier::Override | Modifier::Abstract
+                    )
+                });
+                if is_virtual && is_instance && (is_abstract || !matches!(body, MethodBody::None)) {
                     t.virtuals[id.0 as usize].push((nm.clone(), sig.full_name.clone()));
                 }
                 let bucket = t.methods[id.0 as usize].entry(nm).or_default();
