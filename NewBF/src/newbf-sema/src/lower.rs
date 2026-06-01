@@ -813,6 +813,30 @@ fn fill_members_at(
                             bucket.push(sig);
                         }
                     }
+                    // A computed (body-having) `set` accessor registers as a
+                    // `set_{Name}` instance method returning void, taking the
+                    // property type as its (implicit `value`) parameter.
+                    if matches!(acc.kind, AccessorKind::Set)
+                        && !matches!(acc.body, MethodBody::None)
+                    {
+                        let mut ps = Vec::new();
+                        if is_instance {
+                            ps.push(IrType::Ref(id));
+                        }
+                        ps.push(pty);
+                        let sig = MethodSig {
+                            full_name: format!("{}set_{}", t.prefixes[id.0 as usize], nm),
+                            ret: IrType::Void,
+                            params: ps,
+                            is_instance,
+                        };
+                        let bucket = t.methods[id.0 as usize]
+                            .entry(format!("set_{nm}"))
+                            .or_default();
+                        if !bucket.iter().any(|s| s.params == sig.params) {
+                            bucket.push(sig);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1075,7 +1099,16 @@ fn lower_type_at(
                     _ => None,
                 };
                 if let Some(func) = lower_method(
-                    full_name, ret, params, body, src, sigs, structs, this_ty, env,
+                    full_name,
+                    ret,
+                    params,
+                    body,
+                    src,
+                    sigs,
+                    structs,
+                    this_ty,
+                    env,
+                    &[],
                 ) {
                     m.add_function(func);
                 }
@@ -1098,6 +1131,7 @@ fn lower_type_at(
                         structs,
                         this,
                         env,
+                        &[],
                     ) {
                         m.add_function(func);
                     }
@@ -1117,6 +1151,7 @@ fn lower_type_at(
                         structs,
                         this,
                         env,
+                        &[],
                     ) {
                         m.add_function(func);
                     }
@@ -1157,13 +1192,37 @@ fn lower_type_at(
                             structs,
                             this_ty,
                             env,
+                            &[],
+                        ) {
+                            m.add_function(func);
+                        }
+                    }
+                    // A computed `set` accessor lowers as `set_{Name}`, whose
+                    // body sees an implicit `value` param of the property type
+                    // (plus `this` like any instance method).
+                    if matches!(acc.kind, AccessorKind::Set)
+                        && !matches!(acc.body, MethodBody::None)
+                    {
+                        let pty = lower_ty_env(ty, src, structs, env);
+                        let full_name = format!("{new_prefix}set_{nm}");
+                        if let Some(func) = lower_method(
+                            full_name,
+                            IrType::Void,
+                            &[],
+                            &acc.body,
+                            src,
+                            sigs,
+                            structs,
+                            this_ty,
+                            env,
+                            &[("value", pty)],
                         ) {
                             m.add_function(func);
                         }
                     }
                 }
             }
-            _ => {} // fields / auto-properties / setters / enum-cases — later
+            _ => {} // fields / auto-properties / enum-cases — later
         }
     }
 }
@@ -1181,6 +1240,7 @@ fn lower_method(
     structs: &StructTable,
     this_ty: Option<IrType>,
     env: TyEnv,
+    extra: &[(&str, IrType)],
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -1201,6 +1261,11 @@ fn lower_method(
     ir_params.extend(params.iter().map(|p| IrParam {
         name: p.name.map(|s| s.text(src).to_string()),
         ty: lower_ty_env(&p.ty, src, structs, env),
+    }));
+    // Pre-named params with no source span (e.g. a setter's implicit `value`).
+    ir_params.extend(extra.iter().map(|(n, t)| IrParam {
+        name: Some(n.to_string()),
+        ty: *t,
     }));
 
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
@@ -1224,6 +1289,14 @@ fn lower_method(
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty, elem);
         }
+    }
+    // Bind pre-named extra params (no source span): their `Param` index follows
+    // `this` and the explicit AstParams.
+    for (j, (name, ty)) in extra.iter().enumerate() {
+        let slot = lw.fb.alloca(*ty);
+        lw.fb
+            .store(slot.clone(), Value::Param((base + params.len() + j) as u32));
+        lw.bind(name, slot, *ty, None);
     }
 
     match body_stmt {
@@ -2188,6 +2261,23 @@ impl<'a> Lowerer<'a> {
             };
             self.fb.store(slot, stored.clone());
             return (stored, ty);
+        }
+        // Plain `obj.X = v` where `X` is not a field but a computed property
+        // with a `set_X` accessor: lower to `set_X(receiver, v)`. Compound
+        // assignments (`+=` etc.) don't take this path (no read-back yet).
+        if matches!(op, AssignOp::Assign)
+            && let Expr::Member { base, name, .. } = target
+            && let Some((body_ptr, owner)) = self.struct_base(base, src)
+            && let Some(setter) = self.structs.methods[owner.0 as usize]
+                .get(&format!("set_{}", name.text(src)))
+                .and_then(|cands| pick_overload(cands, &[rhs_ty], true))
+                .cloned()
+        {
+            let pty = *setter.params.last().unwrap();
+            let val = self.coerce(rhs, rhs_ty, pty);
+            self.fb
+                .call(setter.full_name, vec![body_ptr, val.clone()], IrType::Void);
+            return (val, pty);
         }
         // Unsupported lvalue (index/deref/…) — not lowered yet.
         (rhs, rhs_ty)
