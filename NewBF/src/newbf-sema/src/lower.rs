@@ -1766,6 +1766,31 @@ fn type_affinity(f: IrType, a: IrType) -> u32 {
     }
 }
 
+/// The source symbol of a binary operator, for matching a user-defined
+/// `operator <sym>` overload. `None` for operators that don't overload this way
+/// in the kernel (`&&`/`||`, ranges, `case`, `<=>`, `??`).
+fn operator_symbol(op: AstBin) -> Option<&'static str> {
+    Some(match op {
+        AstBin::Add => "+",
+        AstBin::Sub => "-",
+        AstBin::Mul => "*",
+        AstBin::Div => "/",
+        AstBin::Mod => "%",
+        AstBin::BitAnd => "&",
+        AstBin::BitOr => "|",
+        AstBin::BitXor => "^",
+        AstBin::Shl => "<<",
+        AstBin::Shr => ">>",
+        AstBin::Eq => "==",
+        AstBin::Ne => "!=",
+        AstBin::Lt => "<",
+        AstBin::Le => "<=",
+        AstBin::Gt => ">",
+        AstBin::Ge => ">=",
+        _ => return None,
+    })
+}
+
 /// A compact, deterministic encoding of a parameter-type list, used to suffix
 /// the mangled symbol of an overloaded method so each overload is distinct
 /// (e.g. `Append(char8)` vs `Append(String)` → `…$i8` vs `…$R3`).
@@ -3247,6 +3272,18 @@ impl<'a> Lowerer<'a> {
     fn binary(&mut self, op: AstBin, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
         let (l, lt) = self.expr(lhs, src);
         let (r, rt) = self.expr(rhs, src);
+        // Operator overloading: when an operand is a user type (`struct`/`class`)
+        // and it (or the other operand's type) defines a static `operator <sym>`
+        // taking both operands, call it. Scalars skip this and take the kernel
+        // paths below; a `Ref==Ref` with no `operator==` still falls to the
+        // String-`Equals` / identity path.
+        if (matches!(lt, IrType::Struct(_) | IrType::Ref(_))
+            || matches!(rt, IrType::Struct(_) | IrType::Ref(_)))
+            && let Some(sym) = operator_symbol(op)
+            && let Some(res) = self.try_operator_overload(sym, l.clone(), lt, r.clone(), rt)
+        {
+            return res;
+        }
         match op {
             AstBin::Add
             | AstBin::Sub
@@ -3522,6 +3559,48 @@ impl<'a> Lowerer<'a> {
             (*disc, ptys.clone())
         };
         Some(self.build_enum_value(id, disc, &ptys, args, src))
+    }
+
+    /// Resolve `l <sym> r` to a user-defined `operator <sym>`: scan both operand
+    /// types for a static two-argument operator method whose name matches (with
+    /// whitespace ignored — `operator +` and `operator+` are the same), coerce
+    /// each operand to the method's declared parameter type, and emit the call.
+    /// `None` if neither type defines it (the caller then tries the kernel paths).
+    fn try_operator_overload(
+        &mut self,
+        sym: &str,
+        l: Value,
+        lt: IrType,
+        r: Value,
+        rt: IrType,
+    ) -> Option<(Value, IrType)> {
+        let want = format!("operator{sym}");
+        let mut found: Option<MethodSig> = None;
+        for ty in [lt, rt] {
+            let id = match ty {
+                IrType::Struct(id) | IrType::Ref(id) => id,
+                _ => continue,
+            };
+            for (key, sigs) in &self.structs.methods[id.0 as usize] {
+                if key.split_whitespace().collect::<String>() != want {
+                    continue;
+                }
+                if let Some(sig) = sigs.iter().find(|s| !s.is_instance && s.params.len() == 2) {
+                    found = Some(sig.clone());
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let sig = found?;
+        let a = self.coerce(l, lt, sig.params[0]);
+        let b = self.coerce(r, rt, sig.params[1]);
+        Some((
+            self.fb.call(sig.full_name.clone(), vec![a, b], sig.ret),
+            sig.ret,
+        ))
     }
 
     /// Construct a `.Case(args)` / bare `.Case` initializer against a *known
