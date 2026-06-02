@@ -2738,7 +2738,18 @@ impl<'a> Lowerer<'a> {
                     } else {
                         self.fb.create_block("switch.test")
                     };
-                    self.fb.cond_br(eq, body_blocks[arm_i], next);
+                    if let Some(g) = arms[arm_i].guard.as_ref() {
+                        // `case v when guard:` — the value must match *and* the
+                        // guard hold. Evaluate the guard only on a value match.
+                        let guard_b = self.fb.create_block("switch.guard");
+                        self.fb.cond_br(eq, guard_b, next);
+                        self.switch(guard_b);
+                        let (gv, gt) = self.expr(g, src);
+                        let gb = self.coerce_bool(gv, gt);
+                        self.fb.cond_br(gb, body_blocks[arm_i], next);
+                    } else {
+                        self.fb.cond_br(eq, body_blocks[arm_i], next);
+                    }
                     self.terminated = true;
                     if !last {
                         self.switch(next);
@@ -3567,13 +3578,33 @@ impl<'a> Lowerer<'a> {
             } else {
                 self.fb.create_block("match.test")
             };
-            if let Some(d) = want {
-                let eq = self
-                    .fb
-                    .cmp(CmpPred::Eq, disc.clone(), Value::int(d as i128, i32t));
-                self.fb.cond_br(eq, body_blocks[arm_i], next);
-            } else {
-                self.fb.br(next);
+            match want {
+                Some(d) if arms[arm_i].guard.is_some() => {
+                    // Guarded arm: the discriminant must match *and* the `when`
+                    // guard must hold. On a disc match, jump to a guard block that
+                    // binds the payload (so the guard can read it), evaluates the
+                    // guard, and branches to the body or on to the next test.
+                    let eq = self
+                        .fb
+                        .cmp(CmpPred::Eq, disc.clone(), Value::int(d as i128, i32t));
+                    let guard_b = self.fb.create_block("match.guard");
+                    self.fb.cond_br(eq, guard_b, next);
+                    self.switch(guard_b);
+                    self.scopes.push(HashMap::new());
+                    self.bind_enum_payload(&slot, id, pat, src);
+                    let g = arms[arm_i].guard.as_ref().unwrap();
+                    let (gv, gt) = self.expr(g, src);
+                    let gb = self.coerce_bool(gv, gt);
+                    self.scopes.pop();
+                    self.fb.cond_br(gb, body_blocks[arm_i], next);
+                }
+                Some(d) => {
+                    let eq = self
+                        .fb
+                        .cmp(CmpPred::Eq, disc.clone(), Value::int(d as i128, i32t));
+                    self.fb.cond_br(eq, body_blocks[arm_i], next);
+                }
+                None => self.fb.br(next),
             }
             self.terminated = true;
             if !last {
@@ -3586,25 +3617,8 @@ impl<'a> Lowerer<'a> {
             self.switch(body_blocks[i]);
             // A fresh scope so a payload binding doesn't leak across arms.
             self.scopes.push(HashMap::new());
-            if let Some(pat) = arms[i].pattern.as_ref()
-                && let Some((case, binds)) = enum_pattern(pat, src)
-            {
-                let ptys: Vec<IrType> = self
-                    .structs
-                    .enum_cases
-                    .get(&id)
-                    .and_then(|cs| {
-                        cs.iter()
-                            .find(|(n, _, _)| *n == case)
-                            .map(|(_, _, p)| p.clone())
-                    })
-                    .unwrap_or_default();
-                for (j, bspan) in binds.iter().enumerate() {
-                    if let Some(&fty) = ptys.get(j) {
-                        let fa = self.fb.field_addr(slot.clone(), id, (1 + j) as u32);
-                        self.bind(bspan.text(src), fa, fty, None);
-                    }
-                }
+            if let Some(pat) = arms[i].pattern.as_ref() {
+                self.bind_enum_payload(&slot, id, pat, src);
             }
             for s in &arms[i].body {
                 self.stmt(s, src);
@@ -3619,6 +3633,32 @@ impl<'a> Lowerer<'a> {
         }
         self.loops.pop();
         self.switch(exit);
+    }
+
+    /// Bind an enum-`match`/`case` pattern's payload `let`-names to their fields
+    /// in the scrutinee `slot` (the current scope). Shared by `match` arm bodies
+    /// and `when`-guard evaluation. A pattern that isn't an enum-case shape (or
+    /// whose case is unknown) binds nothing.
+    fn bind_enum_payload(&mut self, slot: &Value, id: StructId, pat: &Expr, src: &str) {
+        let Some((case, binds)) = enum_pattern(pat, src) else {
+            return;
+        };
+        let ptys: Vec<IrType> = self
+            .structs
+            .enum_cases
+            .get(&id)
+            .and_then(|cs| {
+                cs.iter()
+                    .find(|(n, _, _)| *n == case)
+                    .map(|(_, _, p)| p.clone())
+            })
+            .unwrap_or_default();
+        for (j, bspan) in binds.iter().enumerate() {
+            if let Some(&fty) = ptys.get(j) {
+                let fa = self.fb.field_addr(slot.clone(), id, (1 + j) as u32);
+                self.bind(bspan.text(src), fa, fty, None);
+            }
+        }
     }
 
     /// `x case .Some(let v)` — a boolean case-test that *also* binds any payload

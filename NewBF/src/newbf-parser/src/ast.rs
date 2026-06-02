@@ -452,11 +452,14 @@ pub enum Stmt {
 
 /// One arm of a `switch` statement. `pattern` is `None` for `default:`,
 /// `Some(expr)` for `case <expr>:` (full pattern syntax is incremental;
-/// for now we accept any expression as the pattern).
+/// for now we accept any expression as the pattern). `guard` is the optional
+/// `when <expr>` clause — the arm matches only if both the pattern and the
+/// guard hold (the guard may reference the pattern's payload bindings).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SwitchArm {
     pub span: Span,
     pub pattern: Option<Expr>,
+    pub guard: Option<Expr>,
     pub body: Vec<Stmt>,
 }
 

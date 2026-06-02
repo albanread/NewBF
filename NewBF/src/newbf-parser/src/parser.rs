@@ -1589,6 +1589,7 @@ impl<'a> Parser<'a> {
         let mut arms = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let arm_lo = self.start();
+            let mut guard = None;
             let pattern = if self.eat_kw(Keyword::Case) {
                 let first = self.expr();
                 // Multiple values per case: `case a, b, c:` — keep the
@@ -1603,10 +1604,10 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
-                // Optional `when <guard>` clause (consumed/dropped for now):
-                // `case .Circle(let x, let y) when x == 10:`.
+                // Optional `when <guard>` clause: `case .Circle(let x, let y)
+                // when x == 10:`. Captured so lowering can gate the arm on it.
                 if self.eat_kw(Keyword::When) {
-                    let _ = self.expr();
+                    guard = Some(self.expr());
                 }
                 Some(first)
             } else if self.eat_kw(Keyword::Default) {
@@ -1632,6 +1633,7 @@ impl<'a> Parser<'a> {
             arms.push(SwitchArm {
                 span: self.finish(arm_lo),
                 pattern,
+                guard,
                 body,
             });
         }
