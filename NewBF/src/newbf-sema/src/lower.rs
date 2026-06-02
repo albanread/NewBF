@@ -88,23 +88,41 @@ struct StructTable {
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
     /// name and lowers its methods at the mono id/prefix with the env.
     monos: Vec<MonoRecord>,
+    /// Generic-method monomorphs: mangled symbol -> lowered signature, so a call
+    /// site `Identity<int>(x)` resolves to a direct call.
+    gen_method_sigs: HashMap<String, MethodSig>,
+    /// (mangled symbol, method name, type-param env) per generic-method
+    /// instantiation, so lowering re-finds the decl and emits its body.
+    gen_method_monos: Vec<GenMethodMono>,
+    /// Int-backed enums: enum name -> (case name -> value). An enum type lowers to
+    /// `int32`; `Enum.Case` is the constant.
+    enums: HashMap<String, HashMap<String, i64>>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
 type MonoRecord = (StructId, String, Vec<(String, IrType)>);
 
+/// A generic-method monomorph to lower: `(mangled symbol, method name,
+/// type-param env)`. `lower_program` re-finds the decl by name and emits it.
+type GenMethodMono = (String, String, Vec<(String, IrType)>);
+
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
         let mut t = StructTable::default();
-        // 1. Register every non-generic type's name/id.
+        // 1. Register every non-generic type's name/id, and int-backed enums.
         for f in files {
             register_struct_names(&f.unit.items, "", f.src, &mut t);
+            register_enums(&f.unit.items, f.src, &mut t);
         }
         // 2. Index generic declarations by name (with their owning file's src),
         //    so an instantiation can find the template and its parameter names.
         let mut generics: GenericDecls = HashMap::new();
         for f in files {
             index_generic_decls(&f.unit.items, f.src, &mut generics);
+        }
+        let mut gmethods: GenMethodDecls = HashMap::new();
+        for f in files {
+            index_generic_methods(&f.unit.items, f.src, &mut gmethods);
         }
         // 3. Collect generic instantiations across the program; register one
         //    monomorphized type per distinct (generic, concrete-args) pair.
@@ -115,6 +133,7 @@ impl StructTable {
                 &f.unit.items,
                 f.src,
                 &generics,
+                &gmethods,
                 &mut t,
                 &mut seen,
                 &mut monos,
@@ -174,6 +193,34 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
             Item::Type(td) if struct_kind(td).is_some() && !td.generic_params.is_empty() => {
                 out.entry(td.name.text(src).to_string())
                     .or_insert((td, src));
+            }
+            _ => {}
+        }
+    }
+}
+
+type GenMethodDecls<'a> = HashMap<String, (&'a Member, &'a str)>;
+
+/// Index generic methods (those with type parameters) by name, paired with the
+/// owning file's `src`.
+fn index_generic_methods<'a>(items: &'a [Item], src: &'a str, out: &mut GenMethodDecls<'a>) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => index_generic_methods(body, src, out),
+            Item::Type(td) => {
+                for m in &td.members {
+                    if let Member::Method {
+                        name,
+                        generic_params,
+                        ..
+                    } = m
+                        && !generic_params.is_empty()
+                    {
+                        out.entry(name.text(src).to_string()).or_insert((m, src));
+                    }
+                }
             }
             _ => {}
         }
@@ -358,10 +405,62 @@ fn record_inst<'a>(
     }
 }
 
+/// Record the monomorph a generic-method call `Name<Args>(...)` demands. Dedup
+/// is by presence in `gen_method_sigs` (no separate seen-set needed).
+fn record_method_inst(
+    name: &str,
+    targs: &[AstType],
+    src: &str,
+    gmethods: &GenMethodDecls,
+    t: &mut StructTable,
+) {
+    let Some(&(member, mdecl_src)) = gmethods.get(name) else {
+        return;
+    };
+    let Member::Method {
+        generic_params,
+        params,
+        return_ty,
+        ..
+    } = member
+    else {
+        return;
+    };
+    let argtys: Vec<IrType> = targs.iter().map(|a| lower_ty_env(a, src, t, &[])).collect();
+    if argtys.len() != generic_params.len() {
+        return;
+    }
+    let mangled = mangle_generic(name, &argtys);
+    if t.gen_method_sigs.contains_key(&mangled) {
+        return;
+    }
+    let env: Vec<(String, IrType)> = generic_params
+        .iter()
+        .zip(&argtys)
+        .map(|(gp, ty)| (gp.name.text(mdecl_src).to_string(), *ty))
+        .collect();
+    let psig: Vec<IrType> = params
+        .iter()
+        .map(|p| lower_ty_env(&p.ty, mdecl_src, t, &env))
+        .collect();
+    let ret = lower_ty_env(return_ty, mdecl_src, t, &env);
+    t.gen_method_sigs.insert(
+        mangled.clone(),
+        MethodSig {
+            full_name: mangled.clone(),
+            ret,
+            params: psig,
+            is_instance: false,
+        },
+    );
+    t.gen_method_monos.push((mangled, name.to_string(), env));
+}
+
 fn collect_insts_items<'a>(
     items: &'a [Item],
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
@@ -370,8 +469,8 @@ fn collect_insts_items<'a>(
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => collect_insts_items(body, src, generics, t, seen, monos),
-            Item::Type(td) => collect_insts_type(td, src, generics, t, seen, monos),
+            } => collect_insts_items(body, src, generics, gmethods, t, seen, monos),
+            Item::Type(td) => collect_insts_type(td, src, generics, gmethods, t, seen, monos),
             _ => {}
         }
     }
@@ -381,6 +480,7 @@ fn collect_insts_type<'a>(
     td: &'a TypeDecl,
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
@@ -399,7 +499,7 @@ fn collect_insts_type<'a>(
                     use_in_type(&p.ty, src, generics, t, seen, monos);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, t, seen, monos);
+                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
                 }
             }
             Member::Constructor { params, body, .. } => {
@@ -407,10 +507,10 @@ fn collect_insts_type<'a>(
                     use_in_type(&p.ty, src, generics, t, seen, monos);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, t, seen, monos);
+                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
                 }
             }
-            Member::Nested(n) => collect_insts_type(n, src, generics, t, seen, monos),
+            Member::Nested(n) => collect_insts_type(n, src, generics, gmethods, t, seen, monos),
             _ => {}
         }
     }
@@ -423,6 +523,7 @@ fn collect_insts_stmt<'a>(
     stmt: &Stmt,
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
@@ -430,7 +531,7 @@ fn collect_insts_stmt<'a>(
     match stmt {
         Stmt::Block { stmts, .. } => {
             for s in stmts {
-                collect_insts_stmt(s, src, generics, t, seen, monos);
+                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
             }
         }
         Stmt::Local { ty, init, .. } => {
@@ -438,29 +539,35 @@ fn collect_insts_stmt<'a>(
                 use_in_type(ty, src, generics, t, seen, monos);
             }
             if let Some(e) = init {
-                collect_insts_expr(e, src, generics, t, seen, monos);
+                collect_insts_expr(e, src, generics, gmethods, t, seen, monos);
             }
         }
-        Stmt::Expr { expr, .. } => collect_insts_expr(expr, src, generics, t, seen, monos),
-        Stmt::Return { value: Some(e), .. } => collect_insts_expr(e, src, generics, t, seen, monos),
+        Stmt::Expr { expr, .. } => {
+            collect_insts_expr(expr, src, generics, gmethods, t, seen, monos)
+        }
+        Stmt::Return { value: Some(e), .. } => {
+            collect_insts_expr(e, src, generics, gmethods, t, seen, monos)
+        }
         Stmt::If {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, t, seen, monos);
-            collect_insts_stmt(then, src, generics, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
+            collect_insts_stmt(then, src, generics, gmethods, t, seen, monos);
             if let Some(e) = els {
-                collect_insts_stmt(e, src, generics, t, seen, monos);
+                collect_insts_stmt(e, src, generics, gmethods, t, seen, monos);
             }
         }
         Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
-            collect_insts_expr(cond, src, generics, t, seen, monos);
-            collect_insts_stmt(body, src, generics, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
         }
         Stmt::ForEach { iter, body, .. } => {
-            collect_insts_expr(iter, src, generics, t, seen, monos);
-            collect_insts_stmt(body, src, generics, t, seen, monos);
+            collect_insts_expr(iter, src, generics, gmethods, t, seen, monos);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
         }
-        Stmt::Defer { body, .. } => collect_insts_stmt(body, src, generics, t, seen, monos),
+        Stmt::Defer { body, .. } => {
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos)
+        }
         Stmt::For {
             init,
             cond,
@@ -469,15 +576,15 @@ fn collect_insts_stmt<'a>(
             ..
         } => {
             if let Some(i) = init {
-                collect_insts_stmt(i, src, generics, t, seen, monos);
+                collect_insts_stmt(i, src, generics, gmethods, t, seen, monos);
             }
             if let Some(c) = cond {
-                collect_insts_expr(c, src, generics, t, seen, monos);
+                collect_insts_expr(c, src, generics, gmethods, t, seen, monos);
             }
             if let Some(u) = update {
-                collect_insts_expr(u, src, generics, t, seen, monos);
+                collect_insts_expr(u, src, generics, gmethods, t, seen, monos);
             }
-            collect_insts_stmt(body, src, generics, t, seen, monos);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
         }
         _ => {}
     }
@@ -490,6 +597,7 @@ fn collect_insts_expr<'a>(
     e: &Expr,
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
@@ -498,38 +606,43 @@ fn collect_insts_expr<'a>(
         Expr::Generic { base, args, .. } => {
             if let Expr::Ident(s) = &**base {
                 record_inst(s.text(src), args, src, generics, t, seen, monos);
+                record_method_inst(s.text(src), args, src, gmethods, t);
             }
         }
-        Expr::Paren { inner, .. } => collect_insts_expr(inner, src, generics, t, seen, monos),
+        Expr::Paren { inner, .. } => {
+            collect_insts_expr(inner, src, generics, gmethods, t, seen, monos)
+        }
         Expr::Unary { operand, .. }
         | Expr::PostInc { operand, .. }
         | Expr::PostDec { operand, .. }
         | Expr::Prefix { operand, .. } => {
-            collect_insts_expr(operand, src, generics, t, seen, monos)
+            collect_insts_expr(operand, src, generics, gmethods, t, seen, monos)
         }
-        Expr::Member { base, .. } => collect_insts_expr(base, src, generics, t, seen, monos),
+        Expr::Member { base, .. } => {
+            collect_insts_expr(base, src, generics, gmethods, t, seen, monos)
+        }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_insts_expr(lhs, src, generics, t, seen, monos);
-            collect_insts_expr(rhs, src, generics, t, seen, monos);
+            collect_insts_expr(lhs, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(rhs, src, generics, gmethods, t, seen, monos);
         }
         Expr::Assign { target, value, .. } => {
-            collect_insts_expr(target, src, generics, t, seen, monos);
-            collect_insts_expr(value, src, generics, t, seen, monos);
+            collect_insts_expr(target, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(value, src, generics, gmethods, t, seen, monos);
         }
         Expr::Ternary {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, t, seen, monos);
-            collect_insts_expr(then, src, generics, t, seen, monos);
-            collect_insts_expr(els, src, generics, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(then, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(els, src, generics, gmethods, t, seen, monos);
         }
         Expr::Call { callee, args, .. }
         | Expr::Index {
             base: callee, args, ..
         } => {
-            collect_insts_expr(callee, src, generics, t, seen, monos);
+            collect_insts_expr(callee, src, generics, gmethods, t, seen, monos);
             for a in args {
-                collect_insts_expr(a, src, generics, t, seen, monos);
+                collect_insts_expr(a, src, generics, gmethods, t, seen, monos);
             }
         }
         _ => {}
@@ -578,6 +691,61 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
     for m in &td.members {
         if let Member::Nested(n) = m {
             register_type_struct(n, &new_prefix, src, t);
+        }
+    }
+}
+
+/// Record every int-backed `enum` and the integer value of each of its cases.
+/// Cases number sequentially from `0`; an explicit `= N` (integer literal) sets
+/// the running counter, so the next unannotated case is `N + 1`. A case whose
+/// `value` is a non-integer-literal expression (can't be evaluated here) falls
+/// back to the sequential counter rather than failing. Recurses into namespaces
+/// and nested types so enums declared anywhere are registered.
+fn register_enums(items: &[Item], src: &str, t: &mut StructTable) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => register_enums(body, src, t),
+            Item::Type(td) => register_enum_type(td, src, t),
+            _ => {}
+        }
+    }
+}
+
+fn register_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    if td.kind == TypeKind::Enum {
+        let enum_name = td.name.text(src).to_string();
+        let mut next: i64 = 0;
+        for m in &td.members {
+            if let Member::EnumCase { name, value, .. } = m {
+                // An explicit `= <int literal>` sets the value and reseeds the
+                // counter; anything else (or no value) takes the sequential one.
+                // `wrapping_add` so a case pinned at `i64::MAX` (real-beef
+                // flag/sentinel enums do this) doesn't overflow the counter.
+                let val = match value {
+                    Some(Expr::Int(s)) => {
+                        let v = parse_int(s.text(src)) as i64;
+                        next = v.wrapping_add(1);
+                        v
+                    }
+                    _ => {
+                        let v = next;
+                        next = next.wrapping_add(1);
+                        v
+                    }
+                };
+                t.enums
+                    .entry(enum_name.clone())
+                    .or_default()
+                    .insert(name.text(src).to_string(), val);
+            }
+        }
+    }
+    // Enums can be declared as nested types too.
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            register_enum_type(n, src, t);
         }
     }
 }
@@ -737,8 +905,14 @@ fn fill_members_at(
                 body,
                 modifiers,
                 attributes,
+                generic_params,
                 ..
             } => {
+                // A generic method is emitted only as monomorphs (its `T` is
+                // unresolved here); skip it in the ordinary method table.
+                if !generic_params.is_empty() {
+                    continue;
+                }
                 let nm = name.text(src).to_string();
                 let explicit: Vec<IrType> = params
                     .iter()
@@ -939,6 +1113,40 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             lower_type_at(decl, Some(*id), &prefix, env, decl_src, &structs, &mut m);
         }
     }
+    // Emit each generic-*method* monomorph as a static free function: re-find the
+    // decl by name and lower its body with the instantiation's type-param env, so
+    // a `T` resolves concretely. (`None` this_ty = static; `&[]` extra params.)
+    let mut gmethods: GenMethodDecls = HashMap::new();
+    for f in &all {
+        index_generic_methods(&f.unit.items, f.src, &mut gmethods);
+    }
+    for (mangled, name, env) in &structs.gen_method_monos {
+        if let Some(&(member, mdecl_src)) = gmethods.get(name)
+            && let Member::Method {
+                return_ty,
+                params,
+                body,
+                ..
+            } = member
+        {
+            let ret = lower_ty_env(return_ty, mdecl_src, &structs, env);
+            let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+            if let Some(func) = lower_method(
+                mangled.clone(),
+                ret,
+                params,
+                body,
+                mdecl_src,
+                &empty,
+                &structs,
+                None,
+                env,
+                &[],
+            ) {
+                m.add_function(func);
+            }
+        }
+    }
     m
 }
 
@@ -1092,8 +1300,14 @@ fn lower_type_at(
                 params,
                 body,
                 modifiers,
+                generic_params,
                 ..
             } => {
+                // A generic method is emitted only as monomorphs (step 7); its
+                // `T` is unresolved in the ordinary lowering env, so skip it.
+                if !generic_params.is_empty() {
+                    continue;
+                }
                 // Reuse the table's mangled symbol (it disambiguates overloads)
                 // by matching this overload's explicit parameter types; fall back
                 // to the plain name for unregistered types (generics/interfaces).
@@ -1793,6 +2007,33 @@ impl<'a> Lowerer<'a> {
                 op, target, value, ..
             } => self.assign(*op, target, value, src),
             Expr::Call { callee, args, .. } => {
+                // Generic-method call `Name<Args>(args)`: resolve to the mangled
+                // monomorph emitted during lowering and call it directly.
+                if let Expr::Generic {
+                    base, args: targs, ..
+                } = &**callee
+                    && let Expr::Ident(s) = &**base
+                {
+                    let argtys: Vec<IrType> = targs
+                        .iter()
+                        .map(|a| lower_ty_env(a, src, self.structs, self.env))
+                        .collect();
+                    let mangled = mangle_generic(s.text(src), &argtys);
+                    if let Some(sig) = self.structs.gen_method_sigs.get(&mangled).cloned()
+                        && sig.params.len() == args.len()
+                    {
+                        let call_args: Vec<Value> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                let (v, ty) = self.expr(a, src);
+                                self.coerce(v, ty, sig.params[i])
+                            })
+                            .collect();
+                        let r = self.fb.call(sig.full_name.clone(), call_args, sig.ret);
+                        return (r, sig.ret);
+                    }
+                }
                 // Method call on a receiver: `obj.Method(args)` / `this.M(args)`.
                 if let Expr::Member { base, name, .. } = &**callee {
                     return self.lower_method_call(base, name.text(src), args, src);
@@ -1845,13 +2086,20 @@ impl<'a> Lowerer<'a> {
             } => self.lower_delete(operand, src),
             // Member read (`obj.field` / `ref.field`): load the resolved field;
             // degrade if the base isn't a known struct/reference place.
-            Expr::Member { base, name, .. } => match self.lvalue(e, src) {
-                Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
-                // Not a storable field — try a computed property getter.
-                None => self
-                    .try_property_get(base, name.text(src), src)
-                    .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
-            },
+            Expr::Member { base, name, .. } => {
+                // `Enum.Case` resolves to its constant before anything else.
+                if let Some(r) = self.try_enum_const(base, name.text(src), src) {
+                    r
+                } else {
+                    match self.lvalue(e, src) {
+                        Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
+                        // Not a storable field — try a computed property getter.
+                        None => self
+                            .try_property_get(base, name.text(src), src)
+                            .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
+                    }
+                }
+            }
             // Index read (`p[i]`): load the element at the computed address.
             Expr::Index { .. } => match self.lvalue(e, src) {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
@@ -2075,6 +2323,30 @@ impl<'a> Lowerer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `Enum.Case` where `Enum` is a registered enum and `Case` is one of its
+    /// members → the constant int32 value.
+    fn try_enum_const(&self, base: &Expr, name: &str, src: &str) -> Option<(Value, IrType)> {
+        if let Expr::Ident(s) = base
+            && let Some(cases) = self.structs.enums.get(s.text(src))
+            && let Some(&v) = cases.get(name)
+        {
+            return Some((
+                Value::int(
+                    v as i128,
+                    IrType::Int {
+                        bits: 32,
+                        signed: true,
+                    },
+                ),
+                IrType::Int {
+                    bits: 32,
+                    signed: true,
+                },
+            ));
+        }
+        None
     }
 
     /// `obj.Name` where `Name` is not a field but the receiver's type defines a
@@ -2729,6 +3001,13 @@ fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> I
             // A bare type-parameter resolves through the monomorphization env.
             if let Some((_, t)) = env.iter().find(|(n, _)| n.as_str() == name) {
                 return *t;
+            }
+            // An int-backed enum type is just `int32`.
+            if structs.enums.contains_key(name) {
+                return IrType::Int {
+                    bits: 32,
+                    signed: true,
+                };
             }
             structs.ty_of(name).unwrap_or_else(|| primitive(name))
         }
