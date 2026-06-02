@@ -11,6 +11,10 @@ implementations.
 
 ## Status
 
+**~20% complete** toward the full Beef language. The compiler pipeline and the
+core language are well along; the long tail — comptime metaprogramming,
+reflection, and the broad standard library — is mostly ahead.
+
 A working compiler. The full pipeline — lexer → parser → semantic analysis →
 typed SSA IR → LLVM 22 → **ORC JIT** *and* **AOT `.exe`** — compiles and runs
 real Beef:
@@ -21,6 +25,14 @@ real Beef:
 - **value `struct`s** — fields, member access, nested aggregates;
 - **heap `class`es** with manual `new` / `delete` (no GC), reference fields, chained access;
 - **constructors + destructors** and **instance methods** (`obj.Method()`, `this`);
+- **generics** (monomorphized value structs, classes, and methods); **inheritance
+  + virtual dispatch** (vtables, multi-level, `override`, `abstract`); **properties**
+  (computed + auto); int-backed **enums** plus **payload enums + `match` with
+  binding** and generic **`Option<T>`**;
+- **lambdas, closures, and higher-order functions** (`Map`/`Filter`/`Fold`);
+  function pointers; `sizeof`; scalar `static` fields;
+- a corlib slice — `String`, a growable `List<T>`, a generational `Pool` + typed
+  `Handle<T>`, `Math`, `Console`;
 - Win32 FFI through an embedded ABI oracle; SEH crash dumps with symbolicated
   stack traces; a compile-time const-evaluator.
 
@@ -29,10 +41,11 @@ assert its result — alongside a curated feature corpus that verifies clean und
 the LLVM verifier. The reasoning behind each step is logged in
 [`NewBF/docs/journals/`](NewBF/docs/journals).
 
-Not yet: indexing / arrays, generics, inheritance / virtual dispatch, the
-standard library. The *optional* GC direction (conservative roots + precise heap
-via the sibling **NewGC** collector — no safepoints) is designed in
-[`NewBF/docs/GC.md`](NewBF/docs/GC.md).
+Not yet: comptime metaprogramming, reflection / attributes-as-behaviour, the
+broad standard library, dynamic interface dispatch, delegates + events, and full
+pattern matching (`when` guards, tuples). The *optional* GC direction
+(conservative roots + precise heap via the sibling **NewGC** collector — no
+safepoints) is designed in [`NewBF/docs/GC.md`](NewBF/docs/GC.md).
 
 ## Building
 
