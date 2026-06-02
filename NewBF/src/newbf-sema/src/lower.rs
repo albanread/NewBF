@@ -177,7 +177,7 @@ impl StructTable {
         }
         for (id, decl, decl_src, env) in &monos {
             let kind = struct_kind(decl).unwrap_or(StructKind::Value);
-            fill_members_at(decl, *id, kind, env, decl_src, &mut t);
+            fill_members_at(decl, *id, kind, env, decl_src, &mut t, true);
             t.monos
                 .push((*id, decl.name.text(decl_src).to_string(), env.clone()));
         }
@@ -874,10 +874,24 @@ fn enum_is_simple(td: &TypeDecl) -> bool {
             .all(|m| matches!(m, Member::EnumCase { .. }))
 }
 
+/// Whether a *non-generic* payload enum can be laid out as a tagged-union struct
+/// that also carries methods: no base/interface, and every member is a case or a
+/// method (so we can register and emit those methods, e.g. `Option`'s
+/// `GetValueOrDefault`). A base-bearing enum (corlib `Result<T> : IDisposable`)
+/// stays int-backed, exactly as before. Looser than [`enum_is_simple`], which
+/// still gates the *generic* monomorphization path (cases only).
+fn enum_is_layoutable(td: &TypeDecl) -> bool {
+    td.bases.is_empty()
+        && td
+            .members
+            .iter()
+            .all(|m| matches!(m, Member::EnumCase { .. } | Member::Method { .. }))
+}
+
 fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
     if td.kind == TypeKind::Enum
         && enum_has_payload(td)
-        && enum_is_simple(td)
+        && enum_is_layoutable(td)
         && td.generic_params.is_empty()
         && !t.by_name.contains_key(td.name.text(src))
     {
@@ -1193,6 +1207,11 @@ fn fill_fields_at(
 /// instantiations (`td` is the generic decl, `id`/prefix the monomorph's,
 /// `env` its parameter substitutions). `t.prefixes[id]` supplies the mangled
 /// symbol prefix in both cases.
+/// Register `td`'s constructors, destructor, and method signatures at `id`. When
+/// `fill_layout` is set (the usual case) it first lays out `id`'s fields and
+/// records its base; a reclassified payload enum passes `false`, since its
+/// tagged-union layout was already built by `register_payload_enums` and an
+/// (instance-field-less) refill would clobber it.
 fn fill_members_at(
     td: &TypeDecl,
     id: StructId,
@@ -1200,18 +1219,21 @@ fn fill_members_at(
     env: TyEnv,
     src: &str,
     t: &mut StructTable,
+    fill_layout: bool,
 ) {
-    fill_fields_at(td, id, kind, env, src, t);
+    if fill_layout {
+        fill_fields_at(td, id, kind, env, src, t);
 
-    // Single inheritance: record the first base that resolves to a class.
-    // `apply_inheritance` later composes its fields/methods into this type.
-    if matches!(kind, StructKind::Ref) {
-        for b in &td.bases {
-            if let IrType::Ref(bid) = lower_ty_env(b, src, t, env)
-                && bid != id
-            {
-                t.bases[id.0 as usize] = Some(bid);
-                break;
+        // Single inheritance: record the first base that resolves to a class.
+        // `apply_inheritance` later composes its fields/methods into this type.
+        if matches!(kind, StructKind::Ref) {
+            for b in &td.bases {
+                if let IrType::Ref(bid) = lower_ty_env(b, src, t, env)
+                    && bid != id
+                {
+                    t.bases[id.0 as usize] = Some(bid);
+                    break;
+                }
             }
         }
     }
@@ -1393,7 +1415,15 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     let kind = struct_kind(td).filter(|_| td.generic_params.is_empty());
     let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
     if let (Some(kind), Some(id)) = (kind, id) {
-        fill_members_at(td, id, kind, &[], src, t);
+        fill_members_at(td, id, kind, &[], src, t, true);
+    } else if td.kind == TypeKind::Enum
+        && td.generic_params.is_empty()
+        && let Some(&id) = t.payload_enums.get(td.name.text(src))
+    {
+        // A reclassified payload enum: register its methods so `obj.Method()`
+        // resolves. Its tagged-union field layout already exists (built in
+        // `register_payload_enums`), so don't refill it (`fill_layout = false`).
+        fill_members_at(td, id, StructKind::Value, &[], src, t, false);
     }
     for m in &td.members {
         if let Member::Nested(n) = m {
@@ -2952,6 +2982,12 @@ impl<'a> Lowerer<'a> {
             Expr::Unary { op, operand, .. } => self.unary(*op, operand, src),
             Expr::PostInc { operand, .. } => self.incdec(operand, 1, false, src),
             Expr::PostDec { operand, .. } => self.incdec(operand, -1, false, src),
+            Expr::Binary {
+                op: AstBin::Case,
+                lhs,
+                rhs,
+                ..
+            } => self.case_test(lhs, rhs, src),
             Expr::Binary { op, lhs, rhs, .. } => self.binary(*op, lhs, rhs, src),
             Expr::Ternary {
                 cond, then, els, ..
@@ -3576,6 +3612,64 @@ impl<'a> Lowerer<'a> {
         }
         self.loops.pop();
         self.switch(exit);
+    }
+
+    /// `x case .Some(let v)` — a boolean case-test that *also* binds any payload
+    /// names into the current scope, so the guarded branch can read them
+    /// (`if (x case .Some(let v)) { use v; }`). It's one arm of
+    /// [`Self::lower_enum_match`] turned into an expression: store the scrutinee,
+    /// compare its discriminant against the named case, and bind each payload
+    /// field to its `let`-name. A non-enum scrutinee or an unknown case evaluates
+    /// to `false` and binds nothing.
+    fn case_test(&mut self, lhs: &Expr, pat: &Expr, src: &str) -> (Value, IrType) {
+        let (sv, st) = self.expr(lhs, src);
+        // The scrutinee may be the enum *value* (a local/field, `Struct(id)`) or a
+        // *pointer* to it (`this` inside an enum method, `Ref(id)`). Resolve both
+        // to (enum id, address-of-body): spill a value into a slot; a pointer is
+        // already the body address.
+        let (id, addr) = match st {
+            IrType::Struct(id) => {
+                let slot = self.fb.alloca(st);
+                self.fb.store(slot.clone(), sv);
+                (id, slot)
+            }
+            IrType::Ref(id) => (id, sv),
+            _ => return (Value::bool(false), IrType::Bool),
+        };
+        if !self.structs.enum_cases.contains_key(&id) {
+            return (Value::bool(false), IrType::Bool);
+        }
+        let Some((case, binds)) = enum_pattern(pat, src) else {
+            return (Value::bool(false), IrType::Bool);
+        };
+        let Some((disc, ptys)) = self
+            .structs
+            .enum_cases
+            .get(&id)
+            .and_then(|cs| cs.iter().find(|(n, _, _)| *n == case))
+            .map(|(_, d, p)| (*d, p.clone()))
+        else {
+            return (Value::bool(false), IrType::Bool);
+        };
+        let i32t = IrType::Int {
+            bits: 32,
+            signed: true,
+        };
+        let disc_addr = self.fb.field_addr(addr.clone(), id, 0);
+        let cur = self.fb.load(disc_addr, i32t);
+        let eq = self
+            .fb
+            .cmp(CmpPred::Eq, cur, Value::int(disc as i128, i32t));
+        // Bind each payload field to its `let`-name. The address is a stable slot,
+        // so the binding is valid even when the case doesn't match — reading it is
+        // only meaningful in the matched branch (Beef's contract).
+        for (j, bspan) in binds.iter().enumerate() {
+            if let Some(&fty) = ptys.get(j) {
+                let fa = self.fb.field_addr(addr.clone(), id, (1 + j) as u32);
+                self.bind(bspan.text(src), fa, fty, None);
+            }
+        }
+        (eq, IrType::Bool)
     }
 
     /// `Type.StaticMethod` used as a *value* (not called) → a function pointer:
