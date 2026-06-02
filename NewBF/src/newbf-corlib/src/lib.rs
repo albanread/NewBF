@@ -23,6 +23,7 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         ("Handle.bf", include_str!("../bf/Handle.bf")),
         ("List.bf", include_str!("../bf/List.bf")),
         ("Probe.bf", include_str!("../bf/Probe.bf")),
+        ("Option.bf", include_str!("../bf/Option.bf")),
         ("Math.bf", include_str!("../bf/Math.bf")),
     ]
 }

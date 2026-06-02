@@ -181,6 +181,15 @@ impl StructTable {
             t.monos
                 .push((*id, decl.name.text(decl_src).to_string(), env.clone()));
         }
+        // 4c. Generic payload enums: overwrite each enum monomorph's (empty) layout
+        //     with its tagged-union fields, resolving payload types through the
+        //     mono env (`Opt<int>` → `{$disc, $p0:i32}`). After the fill above, which
+        //     leaves an enum mono field-less.
+        for (id, decl, decl_src, env) in &monos {
+            if decl.kind == TypeKind::Enum {
+                register_payload_enum_mono(*id, decl, decl_src, env, &mut t);
+            }
+        }
         // 5. Compose single inheritance once every type's own layout is filled,
         //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
@@ -221,7 +230,16 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
             Item::Namespace {
                 body: Some(body), ..
             } => index_generic_decls(body, src, out),
-            Item::Type(td) if struct_kind(td).is_some() && !td.generic_params.is_empty() => {
+            // Generic value structs / classes — and generic *simple payload enums*
+            // (`Option<T>`), which monomorphize into tagged-union structs the same
+            // way (their `struct_kind` is `None`, so name them explicitly).
+            Item::Type(td)
+                if !td.generic_params.is_empty()
+                    && (struct_kind(td).is_some()
+                        || (td.kind == TypeKind::Enum
+                            && enum_has_payload(td)
+                            && enum_is_simple(td))) =>
+            {
                 out.entry(td.name.text(src).to_string())
                     .or_insert((td, src));
             }
@@ -844,9 +862,22 @@ fn register_payload_enums(items: &[Item], src: &str, t: &mut StructTable) {
     }
 }
 
+/// Whether an enum is a *simple* tagged union we can lay out: every member is a
+/// case (no methods/properties/ctors on the enum) and it has no base/interface.
+/// Method-bearing enums (e.g. corlib `Result<T> : IDisposable`) stay int-backed —
+/// reclassifying them would strand their methods, which we don't lower yet.
+fn enum_is_simple(td: &TypeDecl) -> bool {
+    td.bases.is_empty()
+        && td
+            .members
+            .iter()
+            .all(|m| matches!(m, Member::EnumCase { .. }))
+}
+
 fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
     if td.kind == TypeKind::Enum
         && enum_has_payload(td)
+        && enum_is_simple(td)
         && td.generic_params.is_empty()
         && !t.by_name.contains_key(td.name.text(src))
     {
@@ -944,6 +975,94 @@ fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
             register_payload_enum_type(n, src, t);
         }
     }
+}
+
+/// Register a *generic* payload enum's monomorph (`Option<int>`) as a tagged-union
+/// struct, reusing the mono's already-allocated `id`. Runs after the member-fill
+/// pass (which leaves an enum mono with empty fields), so it OVERWRITES that id's
+/// layout. Payload types resolve through the mono's `env` (so `T` → concrete), and
+/// the mangled name (`Option$i32`) maps to `id` for type resolution + construction.
+fn register_payload_enum_mono(
+    id: StructId,
+    td: &TypeDecl,
+    src: &str,
+    env: TyEnv,
+    t: &mut StructTable,
+) {
+    if !(enum_has_payload(td) && enum_is_simple(td)) {
+        return;
+    }
+    // Collect cases (payload types resolved through the mono env).
+    let mut cases: Vec<(String, i64, Vec<IrType>)> = Vec::new();
+    let mut next: i64 = 0;
+    for m in &td.members {
+        if let Member::EnumCase {
+            name,
+            value,
+            payload,
+            ..
+        } = m
+        {
+            let disc = match value {
+                Some(Expr::Int(s)) => {
+                    let v = parse_int(s.text(src)) as i64;
+                    next = v.wrapping_add(1);
+                    v
+                }
+                _ => {
+                    let v = next;
+                    next = next.wrapping_add(1);
+                    v
+                }
+            };
+            let ptys: Vec<IrType> = payload
+                .iter()
+                .map(|p| lower_ty_env(&p.ty, src, t, env))
+                .collect();
+            cases.push((name.text(src).to_string(), disc, ptys));
+        }
+    }
+    // Homogeneity check (slot `i` agreed by every case that fills it).
+    let maxf = cases.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
+    let mut slots: Vec<IrType> = Vec::with_capacity(maxf);
+    let mut homogeneous = true;
+    for i in 0..maxf {
+        let mut slot: Option<IrType> = None;
+        for (_, _, p) in &cases {
+            if let Some(&ft) = p.get(i) {
+                match slot {
+                    None => slot = Some(ft),
+                    Some(prev) if prev == ft => {}
+                    Some(_) => homogeneous = false,
+                }
+            }
+        }
+        slots.push(slot.unwrap_or(IrType::I64));
+    }
+    if !homogeneous {
+        return;
+    }
+    let mut fields = vec![FieldDef {
+        name: "$disc".to_string(),
+        ty: IrType::Int {
+            bits: 32,
+            signed: true,
+        },
+    }];
+    for (i, slot_ty) in slots.iter().enumerate() {
+        fields.push(FieldDef {
+            name: format!("$p{i}"),
+            ty: *slot_ty,
+        });
+    }
+    let nfields = fields.len();
+    // Overwrite the mono struct's (empty) layout in place.
+    t.defs[id.0 as usize].fields = fields;
+    t.field_elems[id.0 as usize] = vec![None; nfields];
+    let argtys: Vec<IrType> = env.iter().map(|(_, ty)| *ty).collect();
+    let mangled = mangle_generic(td.name.text(src), &argtys);
+    t.payload_enums.insert(mangled, id);
+    t.enum_cases.insert(id, cases);
 }
 
 fn fill_struct_fields(items: &[Item], src: &str, t: &mut StructTable) {
@@ -3315,10 +3434,25 @@ impl<'a> Lowerer<'a> {
         args: &[Expr],
         src: &str,
     ) -> Option<(Value, IrType)> {
-        let Expr::Ident(s) = base else {
-            return None;
+        // `Enum.Case` (base = the enum's name) or `Enum<T>.Case` (base = a generic
+        // application) → the key into `payload_enums` is the (possibly mangled) name.
+        let key = match base {
+            Expr::Ident(s) => s.text(src).to_string(),
+            Expr::Generic {
+                base: gbase, args, ..
+            } => {
+                let Expr::Ident(s) = &**gbase else {
+                    return None;
+                };
+                let argtys: Vec<IrType> = args
+                    .iter()
+                    .map(|a| lower_ty_env(a, src, self.structs, self.env))
+                    .collect();
+                mangle_generic(s.text(src), &argtys)
+            }
+            _ => return None,
         };
-        let id = *self.structs.payload_enums.get(s.text(src))?;
+        let id = *self.structs.payload_enums.get(&key)?;
         let (disc, ptys) = {
             let cases = self.structs.enum_cases.get(&id)?;
             let (_, disc, ptys) = cases.iter().find(|(n, _, _)| n == case)?;
