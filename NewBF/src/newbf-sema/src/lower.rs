@@ -24,8 +24,8 @@ use newbf_ir::{
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
     AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody,
-    Modifier, Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp,
-    parse_file,
+    Modifier, Param as AstParam, PrefixKw, Stmt, SwitchArm, Type as AstType, TypeDecl, TypeKind,
+    UnOp, parse_file,
 };
 
 use crate::Program;
@@ -96,8 +96,17 @@ struct StructTable {
     /// instantiation, so lowering re-finds the decl and emits its body.
     gen_method_monos: Vec<GenMethodMono>,
     /// Int-backed enums: enum name -> (case name -> value). An enum type lowers to
-    /// `int32`; `Enum.Case` is the constant.
+    /// `int32`; `Enum.Case` is the constant. Only enums whose cases ALL lack a
+    /// payload land here; a payload-bearing enum is a tagged-union struct instead.
     enums: HashMap<String, HashMap<String, i64>>,
+    /// Payload (tagged-union) enums — `enum Opt { Some(int32), None }`: the enum
+    /// name -> the value-struct id backing it (`{$disc:i32, $p0, $p1, …}`). The
+    /// enum type lowers to `Struct(id)`; a case constructs/matches that struct.
+    payload_enums: HashMap<String, StructId>,
+    /// Per payload-enum struct id: its cases in declaration order, each
+    /// `(case name, discriminant, that case's payload field types)`. Drives
+    /// construction (store disc + payload) and `match` (test disc, bind payload).
+    enum_cases: HashMap<StructId, Vec<(String, i64, Vec<IrType>)>>,
     /// `static` fields → a mutable global. Key is the global symbol
     /// `{prefix}{field}` (e.g. "Counter.Total"); value is its IR type.
     statics: HashMap<String, IrType>,
@@ -127,6 +136,14 @@ impl StructTable {
         for f in files {
             register_struct_names(&f.unit.items, "", f.src, &mut t);
             register_enums(&f.unit.items, f.src, &mut t);
+        }
+        // 1b. Reclassify payload-bearing enums as tagged-union structs *before*
+        //     members/signatures fill — so a `Shape`-typed param/field/return
+        //     resolves to the struct everywhere (the call site's recorded sig and
+        //     the function definition agree). `fill_type_struct` skips enums
+        //     (struct_kind = None), so it won't clobber the synthetic layout.
+        for f in files {
+            register_payload_enums(&f.unit.items, f.src, &mut t);
         }
         // 2. Index generic declarations by name (with their owning file's src),
         //    so an instantiation can find the template and its parameter names.
@@ -729,7 +746,49 @@ fn register_enums(items: &[Item], src: &str, t: &mut StructTable) {
     }
 }
 
+/// Whether any case of an `enum` carries a payload (`Some(int32)`), making it a
+/// tagged union rather than a plain int-backed enum.
+fn enum_has_payload(td: &TypeDecl) -> bool {
+    td.members
+        .iter()
+        .any(|m| matches!(m, Member::EnumCase { payload, .. } if !payload.is_empty()))
+}
+
+/// Extract `(case name, binding-name spans)` from a `match`/`case` pattern:
+/// `.Some(let v)` / `Enum.Some(let v)` → `("Some", [v])`; `.None` / `Enum.None`
+/// → `("None", [])`. `None` if the pattern isn't an enum-case shape. (The parser
+/// keeps the bound name's span in a `let v` binding, so `args` are `Ident`s.)
+fn enum_pattern(pat: &Expr, src: &str) -> Option<(String, Vec<Span>)> {
+    match pat {
+        Expr::Call { callee, args, .. } => {
+            let case = match &**callee {
+                Expr::DotIdent { name, .. } | Expr::Member { name, .. } => {
+                    name.text(src).to_string()
+                }
+                _ => return None,
+            };
+            let binds = args
+                .iter()
+                .filter_map(|a| match a {
+                    Expr::Ident(s) => Some(*s),
+                    _ => None,
+                })
+                .collect();
+            Some((case, binds))
+        }
+        Expr::DotIdent { name, .. } | Expr::Member { name, .. } => {
+            Some((name.text(src).to_string(), Vec::new()))
+        }
+        _ => None,
+    }
+}
+
 fn register_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    // Record EVERY enum's case→value table (the int-backed view). A payload-bearing
+    // enum may *also* be reclassified as a tagged-union struct by
+    // `register_payload_enums` (which takes precedence in type resolution and
+    // construction); this int-backed entry is the fallback for enums whose payload
+    // we can't yet lay out — e.g. heterogeneous cases like `A(int), B(float)`.
     if td.kind == TypeKind::Enum {
         let enum_name = td.name.text(src).to_string();
         let mut next: i64 = 0;
@@ -762,6 +821,127 @@ fn register_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
     for m in &td.members {
         if let Member::Nested(n) = m {
             register_enum_type(n, src, t);
+        }
+    }
+}
+
+/// Register payload-bearing `enum`s as tagged-union value structs. Each becomes a
+/// struct `{$disc:i32, $p0, $p1, …}`: field 0 is the discriminant, and the payload
+/// slots are sized to the widest case (slot `i`'s type comes from the first case
+/// with an `i`-th field — a homogeneous-position union; heterogeneous payload
+/// types per slot are a follow-on). Runs *after* `fill_struct_fields` so that pass
+/// can't overwrite the synthetic field list. Records `payload_enums` (name → id)
+/// for type resolution + construction, and `enum_cases` (id → cases) for both.
+fn register_payload_enums(items: &[Item], src: &str, t: &mut StructTable) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => register_payload_enums(body, src, t),
+            Item::Type(td) => register_payload_enum_type(td, src, t),
+            _ => {}
+        }
+    }
+}
+
+fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    if td.kind == TypeKind::Enum
+        && enum_has_payload(td)
+        && td.generic_params.is_empty()
+        && !t.by_name.contains_key(td.name.text(src))
+    {
+        let enum_name = td.name.text(src).to_string();
+        // Collect cases as (name, discriminant, payload field IR types). Discriminants
+        // number sequentially from 0; an explicit `= <int>` reseeds the counter
+        // (mirroring the int-backed path).
+        let mut cases: Vec<(String, i64, Vec<IrType>)> = Vec::new();
+        let mut next: i64 = 0;
+        for m in &td.members {
+            if let Member::EnumCase {
+                name,
+                value,
+                payload,
+                ..
+            } = m
+            {
+                let disc = match value {
+                    Some(Expr::Int(s)) => {
+                        let v = parse_int(s.text(src)) as i64;
+                        next = v.wrapping_add(1);
+                        v
+                    }
+                    _ => {
+                        let v = next;
+                        next = next.wrapping_add(1);
+                        v
+                    }
+                };
+                let ptys: Vec<IrType> = payload
+                    .iter()
+                    .map(|p| lower_ty_env(&p.ty, src, t, &[]))
+                    .collect();
+                cases.push((name.text(src).to_string(), disc, ptys));
+            }
+        }
+        // Payload slot layout: max arity across cases; slot `i`'s type must be
+        // agreed by every case that fills it. A *heterogeneous* position (e.g.
+        // `A(int), B(float)`) can't share one typed slot, so such an enum isn't
+        // reclassified — it stays int-backed (registered in `enums`). A real
+        // size-based union (reinterpreting a byte blob per case) is a follow-on.
+        let maxf = cases.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
+        let mut slots: Vec<IrType> = Vec::with_capacity(maxf);
+        let mut homogeneous = true;
+        for i in 0..maxf {
+            let mut slot: Option<IrType> = None;
+            for (_, _, p) in &cases {
+                if let Some(&ft) = p.get(i) {
+                    match slot {
+                        None => slot = Some(ft),
+                        Some(prev) if prev == ft => {}
+                        Some(_) => homogeneous = false,
+                    }
+                }
+            }
+            slots.push(slot.unwrap_or(IrType::I64));
+        }
+        if homogeneous {
+            let mut fields = vec![FieldDef {
+                name: "$disc".to_string(),
+                ty: IrType::Int {
+                    bits: 32,
+                    signed: true,
+                },
+            }];
+            for (i, slot_ty) in slots.iter().enumerate() {
+                fields.push(FieldDef {
+                    name: format!("$p{i}"),
+                    ty: *slot_ty,
+                });
+            }
+            let nfields = fields.len();
+            let id = StructId(t.defs.len() as u32);
+            t.defs.push(StructDef {
+                name: enum_name.clone(),
+                fields,
+            });
+            t.kinds.push(StructKind::Value);
+            t.prefixes.push(format!("{enum_name}."));
+            t.ctors.push(Vec::new());
+            t.dtors.push(None);
+            t.methods.push(HashMap::new());
+            t.field_elems.push(vec![None; nfields]);
+            t.bases.push(None);
+            t.virtuals.push(Vec::new());
+            t.vslots.push(HashMap::new());
+            t.vimpls.push(Vec::new());
+            t.by_name.insert(enum_name.clone(), id);
+            t.payload_enums.insert(enum_name, id);
+            t.enum_cases.insert(id, cases);
+        }
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            register_payload_enum_type(n, src, t);
         }
     }
 }
@@ -2361,6 +2541,14 @@ impl<'a> Lowerer<'a> {
                 // branches to a single exit. A `break` inside an arm exits the
                 // switch; `continue` still targets the enclosing loop.
                 let (sv, st) = self.expr(scrutinee, src);
+                // Payload-enum `match`: a discriminant test per arm + payload
+                // binding, instead of the scalar value-equality chain below.
+                if let IrType::Struct(eid) = st
+                    && self.structs.enum_cases.contains_key(&eid)
+                {
+                    self.lower_enum_match(sv, eid, arms, src);
+                    return;
+                }
                 let exit = self.fb.create_block("switch.exit");
                 let body_blocks: Vec<BlockId> = (0..arms.len())
                     .map(|i| self.fb.create_block(format!("switch.case{i}")))
@@ -2682,7 +2870,17 @@ impl<'a> Lowerer<'a> {
                 }
                 // Method call on a receiver: `obj.Method(args)` / `this.M(args)`.
                 if let Expr::Member { base, name, .. } = &**callee {
+                    // `Enum.Case(payload)` for a payload enum constructs its struct.
+                    if let Some(r) = self.try_enum_construct(base, name.text(src), args, src) {
+                        return r;
+                    }
                     return self.lower_method_call(base, name.text(src), args, src);
+                }
+                // Target-typed `.Case(payload)` — a payload-enum case shorthand.
+                if let Expr::DotIdent { name, .. } = &**callee
+                    && let Some(r) = self.try_enum_construct_dot(name.text(src), args, src)
+                {
+                    return r;
                 }
                 let arg_vals: Vec<(Value, IrType)> =
                     args.iter().map(|a| self.expr(a, src)).collect();
@@ -2764,8 +2962,11 @@ impl<'a> Lowerer<'a> {
             // Member read (`obj.field` / `ref.field`): load the resolved field;
             // degrade if the base isn't a known struct/reference place.
             Expr::Member { base, name, .. } => {
-                // `Enum.Case` resolves to its constant before anything else.
-                if let Some(r) = self.try_enum_const(base, name.text(src), src) {
+                // A payloadless payload-enum case (`IntOpt.None`) constructs its
+                // tagged-union struct; a plain int-backed `Enum.Case` is a constant.
+                if let Some(r) = self.try_enum_construct(base, name.text(src), &[], src) {
+                    r
+                } else if let Some(r) = self.try_enum_const(base, name.text(src), src) {
                     r
                 } else {
                     match self.lvalue(e, src) {
@@ -2789,6 +2990,11 @@ impl<'a> Lowerer<'a> {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
             },
+            // Bare `.Case` (a `DotIdent`) — a payloadless payload-enum case
+            // shorthand (`IntOpt x = .None`). Constructs the unique owning enum.
+            Expr::DotIdent { name, .. } => self
+                .try_enum_construct_dot(name.text(src), &[], src)
+                .unwrap_or((undef(IrType::I64), IrType::I64)),
             // this/base, index, generic, cast, tuple, lambda, new/scope
             // prefixes, .Variant, named args — not lowered yet.
             _ => (undef(IrType::I64), IrType::I64),
@@ -3042,6 +3248,200 @@ impl<'a> Lowerer<'a> {
             ));
         }
         None
+    }
+
+    /// `Enum.Case(args)` (or payloadless `Enum.Case`) for a *payload* enum →
+    /// construct its tagged-union struct: store the case discriminant in `$disc`
+    /// and each argument in `$p{i}` (coerced to that case's declared payload
+    /// type), then load the struct value. `None` if it isn't a payload-enum case.
+    /// The unique payload enum with a case named `case` → `(struct id,
+    /// discriminant, payload field types)`. `None` if no payload enum — or more
+    /// than one — has that case, so a target-typed `.Case(args)` is constructed
+    /// only when unambiguous. (A qualified `Enum.Case` always resolves by name.)
+    fn payload_enum_for_case(&self, case: &str) -> Option<(StructId, i64, Vec<IrType>)> {
+        let mut found = None;
+        for (id, cases) in &self.structs.enum_cases {
+            if let Some((_, disc, ptys)) = cases.iter().find(|(n, _, _)| n == case) {
+                if found.is_some() {
+                    return None; // ambiguous across enums
+                }
+                found = Some((*id, *disc, ptys.clone()));
+            }
+        }
+        found
+    }
+
+    /// Build a payload-enum value: alloca its struct, store the discriminant in
+    /// `$disc` and each argument in `$p{i}` (coerced to that case's payload type),
+    /// then load the aggregate.
+    fn build_enum_value(
+        &mut self,
+        id: StructId,
+        disc: i64,
+        ptys: &[IrType],
+        args: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        let sty = IrType::Struct(id);
+        let slot = self.fb.alloca(sty);
+        let disc_addr = self.fb.field_addr(slot.clone(), id, 0);
+        self.fb.store(
+            disc_addr,
+            Value::int(
+                disc as i128,
+                IrType::Int {
+                    bits: 32,
+                    signed: true,
+                },
+            ),
+        );
+        for (i, a) in args.iter().enumerate() {
+            let (v, t) = self.expr(a, src);
+            let want = ptys.get(i).copied().unwrap_or(t);
+            let cv = self.coerce(v, t, want);
+            let fa = self.fb.field_addr(slot.clone(), id, (1 + i) as u32);
+            self.fb.store(fa, cv);
+        }
+        let val = self.fb.load(slot, sty);
+        (val, sty)
+    }
+
+    /// Qualified `Enum.Case(args)` (base is the enum's name) → construct it.
+    /// `None` if `base.case` isn't a payload-enum case.
+    fn try_enum_construct(
+        &mut self,
+        base: &Expr,
+        case: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let Expr::Ident(s) = base else {
+            return None;
+        };
+        let id = *self.structs.payload_enums.get(s.text(src))?;
+        let (disc, ptys) = {
+            let cases = self.structs.enum_cases.get(&id)?;
+            let (_, disc, ptys) = cases.iter().find(|(n, _, _)| n == case)?;
+            (*disc, ptys.clone())
+        };
+        Some(self.build_enum_value(id, disc, &ptys, args, src))
+    }
+
+    /// Target-typed `.Case(args)` / bare `.Case` (a `DotIdent`, no enum-name
+    /// prefix) → construct the unique payload enum owning that case. `None` if the
+    /// case is unknown or ambiguous.
+    fn try_enum_construct_dot(
+        &mut self,
+        case: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let (id, disc, ptys) = self.payload_enum_for_case(case)?;
+        Some(self.build_enum_value(id, disc, &ptys, args, src))
+    }
+
+    /// Lower a `match`/`switch` whose scrutinee is a payload-enum struct: spill the
+    /// value so its fields are addressable, load its `$disc`, then test each arm's
+    /// case discriminant; in a matched arm, bind its payload fields (`$p{j}`) to the
+    /// pattern's binding names before running the body. Mirrors the value-switch's
+    /// block + `break` structure (a patternless arm is the default; no fallthrough).
+    fn lower_enum_match(&mut self, sv: Value, id: StructId, arms: &[SwitchArm], src: &str) {
+        let i32t = IrType::Int {
+            bits: 32,
+            signed: true,
+        };
+        let sty = IrType::Struct(id);
+        let slot = self.fb.alloca(sty);
+        self.fb.store(slot.clone(), sv);
+        let disc_addr = self.fb.field_addr(slot.clone(), id, 0);
+        let disc = self.fb.load(disc_addr, i32t);
+
+        let exit = self.fb.create_block("match.exit");
+        let body_blocks: Vec<BlockId> = (0..arms.len())
+            .map(|i| self.fb.create_block(format!("match.case{i}")))
+            .collect();
+        let default_target = arms
+            .iter()
+            .position(|a| a.pattern.is_none())
+            .map(|i| body_blocks[i])
+            .unwrap_or(exit);
+        let cont = self.loops.last().map(|&(c, _)| c).unwrap_or(exit);
+
+        let case_idxs: Vec<usize> = (0..arms.len())
+            .filter(|&i| arms[i].pattern.is_some())
+            .collect();
+        if case_idxs.is_empty() {
+            self.fb.br(default_target);
+            self.terminated = true;
+        }
+        for (chain_i, &arm_i) in case_idxs.iter().enumerate() {
+            let pat = arms[arm_i].pattern.as_ref().unwrap();
+            // The discriminant this arm matches — `None` ⇒ not a known case ⇒ never
+            // matches (branch straight to the next test).
+            let want = enum_pattern(pat, src).and_then(|(case, _)| {
+                self.structs
+                    .enum_cases
+                    .get(&id)
+                    .and_then(|cs| cs.iter().find(|(n, _, _)| *n == case).map(|(_, d, _)| *d))
+            });
+            let last = chain_i + 1 == case_idxs.len();
+            let next = if last {
+                default_target
+            } else {
+                self.fb.create_block("match.test")
+            };
+            if let Some(d) = want {
+                let eq = self
+                    .fb
+                    .cmp(CmpPred::Eq, disc.clone(), Value::int(d as i128, i32t));
+                self.fb.cond_br(eq, body_blocks[arm_i], next);
+            } else {
+                self.fb.br(next);
+            }
+            self.terminated = true;
+            if !last {
+                self.switch(next);
+            }
+        }
+
+        self.loops.push((cont, exit));
+        for i in 0..arms.len() {
+            self.switch(body_blocks[i]);
+            // A fresh scope so a payload binding doesn't leak across arms.
+            self.scopes.push(HashMap::new());
+            if let Some(pat) = arms[i].pattern.as_ref()
+                && let Some((case, binds)) = enum_pattern(pat, src)
+            {
+                let ptys: Vec<IrType> = self
+                    .structs
+                    .enum_cases
+                    .get(&id)
+                    .and_then(|cs| {
+                        cs.iter()
+                            .find(|(n, _, _)| *n == case)
+                            .map(|(_, _, p)| p.clone())
+                    })
+                    .unwrap_or_default();
+                for (j, bspan) in binds.iter().enumerate() {
+                    if let Some(&fty) = ptys.get(j) {
+                        let fa = self.fb.field_addr(slot.clone(), id, (1 + j) as u32);
+                        self.bind(bspan.text(src), fa, fty, None);
+                    }
+                }
+            }
+            for s in &arms[i].body {
+                self.stmt(s, src);
+                if self.terminated {
+                    break;
+                }
+            }
+            if !self.terminated {
+                self.fb.br(exit);
+            }
+            self.scopes.pop();
+        }
+        self.loops.pop();
+        self.switch(exit);
     }
 
     /// `Type.StaticMethod` used as a *value* (not called) → a function pointer:
@@ -3748,6 +4148,11 @@ fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> I
                 return *t;
             }
             // An int-backed enum type is just `int32`.
+            // A payload-bearing enum lowers to its tagged-union struct; a plain
+            // int-backed enum is `int32`.
+            if let Some(&id) = structs.payload_enums.get(name) {
+                return IrType::Struct(id);
+            }
             if structs.enums.contains_key(name) {
                 return IrType::Int {
                     bits: 32,
