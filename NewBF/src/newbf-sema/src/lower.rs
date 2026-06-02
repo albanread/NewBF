@@ -1685,6 +1685,10 @@ struct Lowerer<'a> {
     /// Generic type-parameter env when lowering a monomorph's body (so a `T`
     /// local declaration resolves to its concrete type). Empty otherwise.
     env: TyEnv<'a>,
+    /// Function-pointer locals: name → (return type, parameter types). A
+    /// `function R(P)` local holds a code address; a call `f(args)` through it
+    /// lowers to an indirect call with this signature.
+    fn_sigs: HashMap<String, (IrType, Vec<IrType>)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -1705,6 +1709,7 @@ impl<'a> Lowerer<'a> {
             loops: Vec::new(),
             this_slot: None,
             env,
+            fn_sigs: HashMap::new(),
         }
     }
 
@@ -1802,6 +1807,20 @@ impl<'a> Lowerer<'a> {
                     .as_ref()
                     .and_then(|t| pointer_elem_env(t, src, self.structs, self.env));
                 self.bind(name.text(src), slot, slot_ty, elem);
+                // A `function R(P)` local is a code pointer (slot type `Ptr`);
+                // record its signature so a later `name(args)` can lower to an
+                // indirect call with the right return type + arg coercions.
+                if let Some(AstType::Function {
+                    return_ty, params, ..
+                }) = ty
+                {
+                    let ret = lower_ty_env(return_ty, src, self.structs, self.env);
+                    let ptys: Vec<IrType> = params
+                        .iter()
+                        .map(|p| lower_ty_env(p, src, self.structs, self.env))
+                        .collect();
+                    self.fn_sigs.insert(name.text(src).to_string(), (ret, ptys));
+                }
             }
             Stmt::Return { value, .. } => {
                 // Coerce the returned value to the function's return type so
@@ -2229,6 +2248,22 @@ impl<'a> Lowerer<'a> {
                     args.iter().map(|a| self.expr(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
                     let name = s.text(src);
+                    // A function-pointer local (`function R(P) f`): `f(args)`
+                    // loads the code pointer and calls it indirectly.
+                    if let Some((ret, ptys)) = self.fn_sigs.get(name).cloned()
+                        && let Some((slot, _)) = self.lookup(name)
+                    {
+                        let fptr = self.fb.load(slot, IrType::Ptr);
+                        let call_args: Vec<Value> = arg_vals
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (v, t))| {
+                                let pt = ptys.get(i).copied().unwrap_or(t);
+                                self.coerce(v, t, pt)
+                            })
+                            .collect();
+                        return (self.fb.call_indirect(fptr, call_args, ret), ret);
+                    }
                     // Resolve among the same-type overloads by argument type
                     // (`this`-less candidates — statics and free fns; an instance
                     // method's leading `this` won't match here, so a bare call
@@ -2280,10 +2315,17 @@ impl<'a> Lowerer<'a> {
                 } else {
                     match self.lvalue(e, src) {
                         Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
-                        // Not a storable field — try a computed property getter.
-                        None => self
-                            .try_property_get(base, name.text(src), src)
-                            .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
+                        // Not a storable field — try a computed property getter,
+                        // then a `Type.StaticMethod` reference (a function pointer).
+                        None => {
+                            if let Some(r) = self.try_property_get(base, name.text(src), src) {
+                                r
+                            } else if let Some(r) = self.try_method_ref(base, name.text(src), src) {
+                                r
+                            } else {
+                                (undef(IrType::I64), IrType::I64)
+                            }
+                        }
                     }
                 }
             }
@@ -2543,6 +2585,25 @@ impl<'a> Lowerer<'a> {
                     signed: true,
                 },
             ));
+        }
+        None
+    }
+
+    /// `Type.StaticMethod` used as a *value* (not called) → a function pointer:
+    /// the method's code address as a `Ptr`. Backs `function R(P) f = Type.M;`.
+    /// Only a non-instance (static) method qualifies, and `Type` must be a type
+    /// name (not a local).
+    fn try_method_ref(&mut self, base: &Expr, name: &str, src: &str) -> Option<(Value, IrType)> {
+        if let Expr::Ident(s) = base {
+            let tyname = s.text(src);
+            if self.lookup(tyname).is_none()
+                && let Some(&id) = self.structs.by_name.get(tyname)
+                && let Some(sig) = self.structs.methods[id.0 as usize]
+                    .get(name)
+                    .and_then(|c| c.iter().find(|s| !s.is_instance))
+            {
+                return Some((self.fb.global_addr(sig.full_name.clone()), IrType::Ptr));
+            }
         }
         None
     }

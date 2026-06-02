@@ -554,7 +554,15 @@ impl<'ctx> Codegen<'ctx, '_> {
             InstKind::GlobalAddr { name } => self
                 .module
                 .get_global(name)
-                .map(|g| g.as_pointer_value().into()),
+                .map(|g| g.as_pointer_value().into())
+                // A `GlobalAddr` may name a *function* (a method reference taken
+                // as a function pointer), not a global variable — fall back to
+                // the function's code address.
+                .or_else(|| {
+                    self.module
+                        .get_function(name)
+                        .map(|f| f.as_global_value().as_pointer_value().into())
+                }),
             InstKind::CallIndirect { callee, args } => {
                 let fp = self.as_ptr(self.value_of(callee, results, llvm_fn)?);
                 let argv: Vec<BasicValueEnum<'ctx>> = args
