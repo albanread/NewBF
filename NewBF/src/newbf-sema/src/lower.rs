@@ -2364,17 +2364,22 @@ impl<'a> Lowerer<'a> {
             }
             Stmt::Empty(_) => {}
             Stmt::Local { ty, name, init, .. } => {
+                // Resolve the declared slot type up front so a target-typed enum
+                // initializer (`Option<int32> a = .Some(40);`) can pick the right
+                // monomorph — `.Some` alone is ambiguous across `Option`'s monos.
+                let declared = ty
+                    .as_ref()
+                    .map(|t| lower_ty_env(t, src, self.structs, self.env));
                 let (init_val, init_ty) = match init {
                     Some(e) => {
-                        let (v, t) = self.expr(e, src);
+                        let (v, t) = declared
+                            .and_then(|target| self.try_target_typed_enum(target, e, src))
+                            .unwrap_or_else(|| self.expr(e, src));
                         (Some(v), Some(t))
                     }
                     None => (None, None),
                 };
-                let slot_ty = match ty {
-                    Some(t) => lower_ty_env(t, src, self.structs, self.env),
-                    None => init_ty.unwrap_or(IrType::I64), // `var`/`let`: infer from init
-                };
+                let slot_ty = declared.unwrap_or_else(|| init_ty.unwrap_or(IrType::I64));
                 let slot = self.fb.alloca(slot_ty);
                 // Coerce the initializer to the slot's type before storing —
                 // otherwise e.g. `int32 x = 0` stores an i64 literal into a
@@ -2428,7 +2433,11 @@ impl<'a> Lowerer<'a> {
                     None
                 } else {
                     value.as_ref().map(|e| {
-                        let (v, t) = self.expr(e, src);
+                        // Target-type a `.Some(x)` return against the function's
+                        // return type before falling back to a plain eval.
+                        let (v, t) = self
+                            .try_target_typed_enum(self.ret_ty, e, src)
+                            .unwrap_or_else(|| self.expr(e, src));
                         self.coerce(v, t, self.ret_ty)
                     })
                 };
@@ -3507,6 +3516,40 @@ impl<'a> Lowerer<'a> {
             _ => return None,
         };
         let id = *self.structs.payload_enums.get(&key)?;
+        let (disc, ptys) = {
+            let cases = self.structs.enum_cases.get(&id)?;
+            let (_, disc, ptys) = cases.iter().find(|(n, _, _)| n == case)?;
+            (*disc, ptys.clone())
+        };
+        Some(self.build_enum_value(id, disc, &ptys, args, src))
+    }
+
+    /// Construct a `.Case(args)` / bare `.Case` initializer against a *known
+    /// target type* (a local's declared type, a return type). Unlike
+    /// [`Self::try_enum_construct_dot`] this resolves the enum by the target — not
+    /// by uniqueness — so it disambiguates `.Some(40)` between `Option<int32>` and
+    /// `Option<bool>`. `None` if the target isn't a payload enum or `e` isn't a
+    /// leading-dot case form (the caller then evaluates `e` normally).
+    fn try_target_typed_enum(
+        &mut self,
+        target: IrType,
+        e: &Expr,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let IrType::Struct(id) = target else {
+            return None;
+        };
+        if !self.structs.enum_cases.contains_key(&id) {
+            return None;
+        }
+        let (case, args): (&str, &[Expr]) = match e {
+            Expr::Call { callee, args, .. } => match &**callee {
+                Expr::DotIdent { name, .. } => (name.text(src), args.as_slice()),
+                _ => return None,
+            },
+            Expr::DotIdent { name, .. } => (name.text(src), &[]),
+            _ => return None,
+        };
         let (disc, ptys) = {
             let cases = self.structs.enum_cases.get(&id)?;
             let (_, disc, ptys) = cases.iter().find(|(n, _, _)| n == case)?;
