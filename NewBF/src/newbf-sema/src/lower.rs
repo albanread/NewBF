@@ -4009,6 +4009,68 @@ impl<'a> Lowerer<'a> {
         Some((val, val_pty))
     }
 
+    /// `obj[i] op= v` → `set_this(obj, i, get_this(obj, i) op v)`. Reads the
+    /// element through the indexer getter, combines it (operator overload for a
+    /// user type, `arith` for a scalar), and writes it back through the setter,
+    /// evaluating the receiver and index args once. `None` if the type has no
+    /// matching get+set indexer pair.
+    fn try_indexer_compound(
+        &mut self,
+        astbin: AstBin,
+        base: &Expr,
+        args: &[Expr],
+        rhs: Value,
+        rhs_ty: IrType,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let (body_ptr, owner) = self.struct_base(base, src)?;
+        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.expr(a, src)).collect();
+        let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
+        let getter = self.structs.methods[owner.0 as usize]
+            .get("get_this")
+            .and_then(|c| pick_overload(c, &arg_tys, true))?
+            .clone();
+        let pty = getter.ret;
+        let set_tys: Vec<IrType> = arg_tys
+            .iter()
+            .copied()
+            .chain(std::iter::once(pty))
+            .collect();
+        let setter = self.structs.methods[owner.0 as usize]
+            .get("set_this")
+            .and_then(|c| pick_overload(c, &set_tys, true))?
+            .clone();
+        // Read the current element through the getter.
+        let mut get_args = vec![body_ptr.clone()];
+        for (i, (v, t)) in arg_vals.iter().enumerate() {
+            let pt = getter.params.get(i + 1).copied().unwrap_or(*t);
+            let cv = self.coerce(v.clone(), *t, pt);
+            get_args.push(cv);
+        }
+        let cur = self.fb.call(getter.full_name, get_args, pty);
+        // Combine `cur op rhs` (operator overload for a user type, else numeric).
+        let combined = if matches!(pty, IrType::Struct(_) | IrType::Ref(_))
+            && let Some(sym) = operator_symbol(astbin)
+            && let Some((res, _)) =
+                self.try_operator_overload(sym, cur.clone(), pty, rhs.clone(), rhs_ty)
+        {
+            res
+        } else {
+            let v = self.coerce(rhs, rhs_ty, pty);
+            self.arith(astbin, cur, v, pty)
+        };
+        // Write it back through the setter.
+        let mut set_args = vec![body_ptr];
+        for (i, (v, t)) in arg_vals.iter().enumerate() {
+            let pt = setter.params.get(i + 1).copied().unwrap_or(*t);
+            let cv = self.coerce(v.clone(), *t, pt);
+            set_args.push(cv);
+        }
+        set_args.push(combined.clone());
+        self.fb.call(setter.full_name, set_args, IrType::Void);
+        Some((combined, pty))
+    }
+
     /// The element type of a typed-pointer base expression (`T* p` → `T`), for
     /// indexing. Resolves pointer locals/params (and through parens) today.
     fn ptr_elem_of(&self, e: &Expr, src: &str) -> Option<IrType> {
@@ -4268,11 +4330,17 @@ impl<'a> Lowerer<'a> {
             self.fb.store(slot, stored.clone());
             return (stored, ty);
         }
-        // Indexer assignment `obj[i] = v` → `set_this(obj, i, v)`. (Plain `=`;
-        // compound indexer assignment is a follow-on.)
+        // Indexer assignment `obj[i] = v` → `set_this(obj, i, v)`.
         if matches!(op, AssignOp::Assign)
             && let Expr::Index { base, args, .. } = target
             && let Some(r) = self.try_indexer_set(base, args, rhs.clone(), rhs_ty, src)
+        {
+            return r;
+        }
+        // Compound indexer assignment `obj[i] op= v` → set the combined value.
+        if let Some(astbin) = compound_op(op)
+            && let Expr::Index { base, args, .. } = target
+            && let Some(r) = self.try_indexer_compound(astbin, base, args, rhs.clone(), rhs_ty, src)
         {
             return r;
         }
