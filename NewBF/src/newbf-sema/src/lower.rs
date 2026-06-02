@@ -1096,8 +1096,10 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     }
 }
 
-/// Lower a whole program (the parsed files; the def graph is available for
-/// future resolution) into one IR [`Module`].
+/// A lambda queued for emission: `(symbol, return type, (param name, param
+/// type) pairs, body, source)`.
+type LambdaEmit<'a> = (String, IrType, Vec<(String, IrType)>, &'a Stmt, &'a str);
+
 /// Collect anonymous lambdas to emit as free functions. Minimal slice:
 /// paramless lambdas assigned to a `function R()` local (`function R() f =
 /// () => …;`) — the target type gives the signature (no inference/capture).
@@ -1106,7 +1108,7 @@ fn collect_lambdas<'a>(
     items: &'a [Item],
     src: &'a str,
     structs: &mut StructTable,
-    emits: &mut Vec<(String, IrType, &'a Stmt, &'a str)>,
+    emits: &mut Vec<LambdaEmit<'a>>,
 ) {
     for item in items {
         match item {
@@ -1144,7 +1146,7 @@ fn collect_lambdas_stmt<'a>(
     stmt: &'a Stmt,
     src: &'a str,
     structs: &mut StructTable,
-    emits: &mut Vec<(String, IrType, &'a Stmt, &'a str)>,
+    emits: &mut Vec<LambdaEmit<'a>>,
 ) {
     match stmt {
         Stmt::Block { stmts, .. } => {
@@ -1153,16 +1155,36 @@ fn collect_lambdas_stmt<'a>(
             }
         }
         Stmt::Local {
-            ty: Some(AstType::Function {
-                return_ty, params, ..
-            }),
-            init: Some(Expr::Lambda { span, body }),
+            ty:
+                Some(AstType::Function {
+                    return_ty,
+                    params: tparams,
+                    ..
+                }),
+            init:
+                Some(Expr::Lambda {
+                    span,
+                    params: lparams,
+                    body,
+                }),
             ..
-        } if params.is_empty() => {
+        } if lparams.len() == tparams.len() => {
             let name = format!("$lambda{}", structs.lambda_names.len());
             let ret = lower_ty_env(return_ty, src, structs, &[]);
+            // Lambda params are untyped; the target `function R(P)` supplies the
+            // types. Pair each captured param name with its target type.
+            let param_pairs: Vec<(String, IrType)> = lparams
+                .iter()
+                .zip(tparams.iter())
+                .map(|(nspan, t)| {
+                    (
+                        nspan.text(src).to_string(),
+                        lower_ty_env(t, src, structs, &[]),
+                    )
+                })
+                .collect();
             structs.lambda_names.insert(*span, name.clone());
-            emits.push((name, ret, &**body, src));
+            emits.push((name, ret, param_pairs, &**body, src));
         }
         Stmt::If { then, els, .. } => {
             collect_lambdas_stmt(then, src, structs, emits);
@@ -1211,7 +1233,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Collect anonymous lambdas (paramless, target-typed) before lowering: each
     // gets a `$lambdaN` symbol recorded by span (so `Expr::Lambda` lowers to its
     // address) and its body is queued to emit as a free function below.
-    let mut lambda_emits: Vec<(String, IrType, &Stmt, &str)> = Vec::new();
+    let mut lambda_emits: Vec<LambdaEmit> = Vec::new();
     for f in &all {
         collect_lambdas(&f.unit.items, f.src, &mut structs, &mut lambda_emits);
     }
@@ -1237,12 +1259,14 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     }
     // Emit each collected lambda as a free function `$lambdaN() -> R { body }`.
     // An expression body (`=> e`) returns `e`; a block body lowers as-is.
-    for (name, ret, body, lsrc) in &lambda_emits {
+    for (name, ret, params, body, lsrc) in &lambda_emits {
         let mb = match *body {
             Stmt::Expr { expr, .. } => MethodBody::Expr(expr.clone()),
             other => MethodBody::Block(other.clone()),
         };
         let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+        // The lambda's (target-typed) params bind as pre-named extra params.
+        let extra: Vec<(&str, IrType)> = params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
         if let Some(func) = lower_method(
             name.clone(),
             *ret,
@@ -1253,7 +1277,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             &structs,
             None,
             &[],
-            &[],
+            &extra,
         ) {
             m.add_function(func);
         }

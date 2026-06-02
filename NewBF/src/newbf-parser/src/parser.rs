@@ -354,7 +354,7 @@ impl<'a> Parser<'a> {
         // Paramless / inferred-param lambda: `=> expr` / `=> { … }`
         // (also the operand of `scope => …`).
         if self.at(TokenKind::FatArrow) {
-            return self.lambda_body(lo);
+            return self.lambda_body(lo, Vec::new());
         }
         if let Some(op) = self.peek_unary_op() {
             self.bump();
@@ -662,8 +662,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a lambda body after `=>` (current token is `=>`). `lo` is the
-    /// lambda's start offset (covering any params already consumed).
-    fn lambda_body(&mut self, lo: u32) -> Expr {
+    /// lambda's start offset (covering any params already consumed); `params`
+    /// are the captured parameter-name spans (empty if none / uncapturable).
+    fn lambda_body(&mut self, lo: u32, params: Vec<Span>) -> Expr {
         self.bump(); // =>
         let body = if self.at(TokenKind::LBrace) {
             self.block()
@@ -677,8 +678,24 @@ impl<'a> Parser<'a> {
         };
         Expr::Lambda {
             span: self.finish(lo),
+            params,
             body: Box::new(body),
         }
+    }
+
+    /// Capture lambda parameter names from the already-parsed parenthesized
+    /// elements: each must be a plain identifier (`(x)`, `(x, y)`). If any
+    /// element isn't a bare ident (a typed/complex param), capture nothing — the
+    /// lambda then has no recorded params and lowering degrades it.
+    fn lambda_param_names(elems: &[Expr]) -> Vec<Span> {
+        let mut names = Vec::with_capacity(elems.len());
+        for e in elems {
+            match e {
+                Expr::Ident(s) => names.push(*s),
+                _ => return Vec::new(),
+            }
+        }
+        names
     }
 
     /// Consume an object/collection initializer `{ a = 1, b, … }`
@@ -837,7 +854,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 // Single-parameter lambda: `x => body`.
                 if self.at(TokenKind::FatArrow) {
-                    return self.lambda_body(span.lo);
+                    return self.lambda_body(span.lo, vec![span]);
                 }
                 Expr::Ident(span)
             }
@@ -976,7 +993,7 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::RParen) {
             self.bump();
             if self.at(TokenKind::FatArrow) {
-                return self.lambda_body(lo);
+                return self.lambda_body(lo, Vec::new());
             }
             return Expr::Tuple {
                 span: self.finish(lo),
@@ -1000,7 +1017,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(TokenKind::RParen, "`)` to close tuple literal");
             if self.at(TokenKind::FatArrow) {
-                return self.lambda_body(lo);
+                return self.lambda_body(lo, Self::lambda_param_names(&elems));
             }
             return Expr::Tuple {
                 span: self.finish(lo),
@@ -1010,7 +1027,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen, "`)` to close parenthesized expression");
         // `(x) => …` — single-param lambda.
         if self.at(TokenKind::FatArrow) {
-            return self.lambda_body(lo);
+            return self.lambda_body(lo, Self::lambda_param_names(std::slice::from_ref(&inner)));
         }
         Expr::Paren {
             span: self.finish(lo),

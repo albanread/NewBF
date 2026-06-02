@@ -319,6 +319,10 @@ pub enum Expr {
     /// parameters are parsed and discarded for now; `body` is retained.
     Lambda {
         span: Span,
+        /// Parameter names (untyped — the types are target-typed from the
+        /// `function R(P)` the lambda is assigned to). Empty for `() => …` /
+        /// `=> …`, or when params couldn't be captured as plain identifiers.
+        params: Vec<Span>,
         body: Box<Stmt>,
     },
     /// A named argument in a call/index/attribute argument list:
