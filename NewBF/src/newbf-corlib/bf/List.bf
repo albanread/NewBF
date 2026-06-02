@@ -63,3 +63,41 @@ class List<T> {
 		this.mCap = nc;
 	}
 }
+
+// Higher-order functions over List<T> — the payoff of lambdas/closures. These
+// are free static generics, called bare (`Map<int,int>(xs, f)`): a generic
+// *method* on the generic *type* List<T> (i.e. `xs.Map<R>(f)`) isn't supported
+// yet (global-name mangling), so the receiver is an explicit `self` parameter.
+// The `function R(T) f` parameter is callable inside the body (the higher-order
+// payoff), so each method just walks the list applying `f`. Non-capturing
+// lambdas and method references work as the function argument today; capturing
+// closures await the uniform function-value representation.
+class Functional {
+	// A new list holding `f` applied to each element of `self`.
+	public static List<R> Map<T, R>(List<T> self, function R(T) f) {
+		List<R> r = new List<R>();
+		for (int i = 0; i < self.Count(); i++) {
+			r.Add(f(self.Get(i)));
+		}
+		return r;
+	}
+
+	// A new list of the elements of `self` for which `pred` holds.
+	public static List<T> Filter<T>(List<T> self, function bool(T) pred) {
+		List<T> r = new List<T>();
+		for (int i = 0; i < self.Count(); i++) {
+			T x = self.Get(i);
+			if (pred(x)) { r.Add(x); }
+		}
+		return r;
+	}
+
+	// Left-fold: thread `seed` through `f(acc, elem)` over every element.
+	public static A Fold<T, A>(List<T> self, A seed, function A(A, T) f) {
+		A acc = seed;
+		for (int i = 0; i < self.Count(); i++) {
+			acc = f(acc, self.Get(i));
+		}
+		return acc;
+	}
+}

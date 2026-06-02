@@ -1787,6 +1787,26 @@ fn lower_method(
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty, elem);
+            // A `function R(P)`-typed *parameter* is callable: record its
+            // signature (under the monomorph env) so `name(args)` in the body
+            // lowers to an indirect call. This is what lets a higher-order
+            // method like `Map(self, f)` actually call its `f`. Bare code
+            // pointer — fine for non-capturing-lambda / method-ref arguments;
+            // passing a *closure* needs the uniform function-value repr (a
+            // follow-on), so closures aren't recorded here.
+            if let AstType::Function {
+                return_ty,
+                params: fps,
+                ..
+            } = &p.ty
+            {
+                let fret = lower_ty_env(return_ty, src, structs, env);
+                let fptys: Vec<IrType> = fps
+                    .iter()
+                    .map(|t| lower_ty_env(t, src, structs, env))
+                    .collect();
+                lw.fn_sigs.insert(nm.text(src).to_string(), (fret, fptys));
+            }
         }
     }
     // Bind pre-named extra params (no source span): their `Param` index follows
