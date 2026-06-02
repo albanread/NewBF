@@ -1146,10 +1146,16 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_kw(Keyword::Ref)
                     || self.eat_kw(Keyword::Mut)
                     || self.eat_kw(Keyword::Out);
-                if self.at(TokenKind::Ident) {
-                    self.bump();
-                }
-                Expr::Ident(span)
+                // Keep the *bound name*'s span (the `v` in `let v`), not the
+                // `let`/`var` keyword's — so a pattern like `case .Some(let v)`
+                // carries the binding name for the match lowering to bind. Fall
+                // back to the keyword span if no name follows.
+                let name = if self.at(TokenKind::Ident) {
+                    self.bump().span
+                } else {
+                    span
+                };
+                Expr::Ident(name)
             }
             _ => {
                 self.error("expected an expression");
