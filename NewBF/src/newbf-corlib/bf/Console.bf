@@ -45,6 +45,20 @@ class Console {
 		delete s;
 	}
 
+	// Print a bool as `true`/`false` with a trailing newline. Selected over the
+	// int/String overloads by the argument's type.
+	public static void WriteLine(bool b) {
+		if (b) {
+			String t = "true";
+			Console.WriteLine(t);
+			delete t;
+		} else {
+			String f = "false";
+			Console.WriteLine(f);
+			delete f;
+		}
+	}
+
 	// Append n's decimal digits most-significant-first: the recursion emits the
 	// high digits before appending the current low one.
 	static void AppendDigits(String s, int n) {

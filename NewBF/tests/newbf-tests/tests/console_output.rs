@@ -147,4 +147,19 @@ class Program {
 "#,
     );
     assert_eq!(numbers, "12345\n-7\n0\n", "int stdout mismatch");
+
+    // Bool rendering via WriteLine(bool) — overload-by-type picks `true`/`false`
+    // over the int/String overloads.
+    let bools = capture_stdout(
+        r#"
+class Program {
+    public static int32 Main() {
+        Console.WriteLine(true);
+        Console.WriteLine(false);
+        return 0;
+    }
+}
+"#,
+    );
+    assert_eq!(bools, "true\nfalse\n", "bool stdout mismatch");
 }
