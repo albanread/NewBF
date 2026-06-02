@@ -882,10 +882,17 @@ fn enum_is_simple(td: &TypeDecl) -> bool {
 /// still gates the *generic* monomorphization path (cases only).
 fn enum_is_layoutable(td: &TypeDecl) -> bool {
     td.bases.is_empty()
-        && td
-            .members
-            .iter()
-            .all(|m| matches!(m, Member::EnumCase { .. } | Member::Method { .. }))
+        && td.members.iter().all(|m| match m {
+            Member::EnumCase { .. } | Member::Method { .. } => true,
+            // Computed (body-having) properties only: an *auto* property needs a
+            // synthesized backing field, but the enum's layout is fixed
+            // (`$disc, $p0…`) and the `fill_layout = false` member fill won't add
+            // one — so an auto-property-bearing enum stays int-backed.
+            Member::Property { accessors, .. } => accessors
+                .iter()
+                .all(|a| !matches!(a.body, MethodBody::None)),
+            _ => false,
+        })
 }
 
 fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
