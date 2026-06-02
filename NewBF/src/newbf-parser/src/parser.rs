@@ -3170,7 +3170,7 @@ impl<'a> Parser<'a> {
         // Indexer: `Type this[params] { accessors }` or `=> expr;`.
         if self.at_kw(Keyword::This) && self.nth_kind(1) == TokenKind::LBracket {
             let name = self.bump().span;
-            let _params = self.bracketed_params();
+            let index_params = self.bracketed_params();
             let accessors = if self.eat(TokenKind::LBrace) {
                 let mut accs = Vec::new();
                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -3207,6 +3207,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 accessors,
+                index_params,
                 explicit_iface: None,
             };
         }
@@ -3278,7 +3279,7 @@ impl<'a> Parser<'a> {
 
         // Explicit-interface indexer: `Ret IFoo.this[params] { … }`.
         if self.at(TokenKind::LBracket) {
-            let _params = self.bracketed_params();
+            let index_params = self.bracketed_params();
             let accessors = if self.eat(TokenKind::LBrace) {
                 let mut accs = Vec::new();
                 while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -3312,6 +3313,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 accessors,
+                index_params,
                 explicit_iface: None,
             };
         }
@@ -3352,6 +3354,7 @@ impl<'a> Parser<'a> {
                     ty,
                     name,
                     accessors,
+                    index_params: Vec::new(),
                     explicit_iface,
                 }
             }
@@ -3374,6 +3377,7 @@ impl<'a> Parser<'a> {
                         kind: AccessorKind::Get,
                         body: MethodBody::Expr(e),
                     }],
+                    index_params: Vec::new(),
                     explicit_iface,
                 }
             }

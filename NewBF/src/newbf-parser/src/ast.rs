@@ -816,6 +816,8 @@ pub enum Member {
         body: MethodBody,
     },
     /// `Type name { get; set; }` / `Type name { get => …; set { … } }`.
+    /// Also an indexer `Type this[params] { … }`: `name` is the `this` span and
+    /// `index_params` holds the bracket params (empty for an ordinary property).
     Property {
         span: Span,
         attributes: Vec<Attribute>,
@@ -823,6 +825,8 @@ pub enum Member {
         ty: Type,
         name: Span,
         accessors: Vec<Accessor>,
+        /// Indexer parameters (`this[int i]`); empty for an ordinary property.
+        index_params: Vec<Param>,
         /// `Some` for an explicit interface implementation
         /// (`Ret IFace<Args>.Name { … }`): the qualifying interface type.
         explicit_iface: Option<Type>,

@@ -1359,23 +1359,31 @@ fn fill_members_at(
                 name,
                 accessors,
                 modifiers,
+                index_params,
                 ..
             } => {
                 // A `get` accessor registers as a `get_{Name}` instance method;
                 // reading `obj.Name` calls it. Both computed (body-having) and
                 // auto (body-less, backed by the synthesized `{Name}$prop`
                 // field) accessors register here — lowering picks the body.
+                // An indexer (`this[i]`) registers as `get_this`/`set_this` with
+                // its bracket params threaded between `this` and `value`.
                 let nm = name.text(src).to_string();
                 let is_instance = !modifiers
                     .iter()
                     .any(|(mo, _)| matches!(mo, Modifier::Static));
                 let pty = lower_ty_env(ty, src, t, env);
+                let idx_tys: Vec<IrType> = index_params
+                    .iter()
+                    .map(|p| lower_ty_env(&p.ty, src, t, env))
+                    .collect();
                 for acc in accessors {
                     if matches!(acc.kind, AccessorKind::Get) {
                         let mut ps = Vec::new();
                         if is_instance {
                             ps.push(IrType::Ref(id));
                         }
+                        ps.extend(idx_tys.iter().copied());
                         let sig = MethodSig {
                             full_name: format!("{}get_{}", t.prefixes[id.0 as usize], nm),
                             ret: pty,
@@ -1397,6 +1405,7 @@ fn fill_members_at(
                         if is_instance {
                             ps.push(IrType::Ref(id));
                         }
+                        ps.extend(idx_tys.iter().copied());
                         ps.push(pty);
                         let sig = MethodSig {
                             full_name: format!("{}set_{}", t.prefixes[id.0 as usize], nm),
@@ -1975,13 +1984,16 @@ fn lower_type_at(
                 name,
                 accessors,
                 modifiers,
+                index_params,
                 ..
             } => {
                 // Lower each `get`/`set` accessor as the `get_{Name}`/`set_{Name}`
                 // method the pre-pass registered. A computed accessor lowers its
                 // AST body via `lower_method` (sees `this` like any instance
                 // method); an auto accessor has no body, so we synthesize a
-                // trivial read/write of the backing field `{Name}$prop`.
+                // trivial read/write of the backing field `{Name}$prop`. An
+                // indexer's bracket params (`this[i]`) are the accessor's explicit
+                // params — bound in the body just like a method's.
                 let nm = name.text(src);
                 let is_static = modifiers
                     .iter()
@@ -2010,7 +2022,7 @@ fn lower_type_at(
                         if let Some(func) = lower_method(
                             full_name,
                             ret,
-                            &[],
+                            index_params,
                             &acc.body,
                             src,
                             sigs,
@@ -2052,7 +2064,7 @@ fn lower_type_at(
                         if let Some(func) = lower_method(
                             full_name,
                             IrType::Void,
-                            &[],
+                            index_params,
                             &acc.body,
                             src,
                             sigs,
@@ -3203,10 +3215,13 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            // Index read (`p[i]`): load the element at the computed address.
-            Expr::Index { .. } => match self.lvalue(e, src) {
+            // Index read (`p[i]`): load the element at the computed address for a
+            // pointer/array; otherwise a user indexer (`obj[i]` → `get_this`).
+            Expr::Index { base, args, .. } => match self.lvalue(e, src) {
                 Some((ptr, ty)) => (self.fb.load(ptr, ty), ty),
-                None => (undef(IrType::I64), IrType::I64),
+                None => self
+                    .try_indexer_get(base, args, src)
+                    .unwrap_or((undef(IrType::I64), IrType::I64)),
             },
             // Bare `.Case` (a `DotIdent`) — a payloadless payload-enum case
             // shorthand (`IntOpt x = .None`). Constructs the unique owning enum.
@@ -3933,6 +3948,67 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
+    /// `obj[i]` for a user type with an indexer → call its `get_this(this,
+    /// idx…)`. The receiver's body pointer is the leading `this`; the bracket
+    /// args follow, coerced to the getter's parameter types. `None` if the
+    /// receiver isn't a struct/class or has no matching indexer getter.
+    fn try_indexer_get(
+        &mut self,
+        base: &Expr,
+        args: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let (body_ptr, owner) = self.struct_base(base, src)?;
+        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.expr(a, src)).collect();
+        let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
+        let getter = self.structs.methods[owner.0 as usize]
+            .get("get_this")
+            .and_then(|c| pick_overload(c, &arg_tys, true))?
+            .clone();
+        let mut call_args = vec![body_ptr];
+        for (i, (v, t)) in arg_vals.into_iter().enumerate() {
+            let pt = getter.params.get(i + 1).copied().unwrap_or(t);
+            call_args.push(self.coerce(v, t, pt));
+        }
+        Some((
+            self.fb.call(getter.full_name, call_args, getter.ret),
+            getter.ret,
+        ))
+    }
+
+    /// `obj[i] = v` for a user type with an indexer → call `set_this(this, idx…,
+    /// value)`. `None` if there's no matching indexer setter.
+    fn try_indexer_set(
+        &mut self,
+        base: &Expr,
+        args: &[Expr],
+        rhs: Value,
+        rhs_ty: IrType,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let (body_ptr, owner) = self.struct_base(base, src)?;
+        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.expr(a, src)).collect();
+        let arg_tys: Vec<IrType> = arg_vals
+            .iter()
+            .map(|(_, t)| *t)
+            .chain(std::iter::once(rhs_ty))
+            .collect();
+        let setter = self.structs.methods[owner.0 as usize]
+            .get("set_this")
+            .and_then(|c| pick_overload(c, &arg_tys, true))?
+            .clone();
+        let mut call_args = vec![body_ptr];
+        for (i, (v, t)) in arg_vals.into_iter().enumerate() {
+            let pt = setter.params.get(i + 1).copied().unwrap_or(t);
+            call_args.push(self.coerce(v, t, pt));
+        }
+        let val_pty = *setter.params.last().unwrap();
+        let val = self.coerce(rhs, rhs_ty, val_pty);
+        call_args.push(val.clone());
+        self.fb.call(setter.full_name, call_args, IrType::Void);
+        Some((val, val_pty))
+    }
+
     /// The element type of a typed-pointer base expression (`T* p` → `T`), for
     /// indexing. Resolves pointer locals/params (and through parens) today.
     fn ptr_elem_of(&self, e: &Expr, src: &str) -> Option<IrType> {
@@ -4191,6 +4267,14 @@ impl<'a> Lowerer<'a> {
             };
             self.fb.store(slot, stored.clone());
             return (stored, ty);
+        }
+        // Indexer assignment `obj[i] = v` → `set_this(obj, i, v)`. (Plain `=`;
+        // compound indexer assignment is a follow-on.)
+        if matches!(op, AssignOp::Assign)
+            && let Expr::Index { base, args, .. } = target
+            && let Some(r) = self.try_indexer_set(base, args, rhs.clone(), rhs_ty, src)
+        {
+            return r;
         }
         // Plain `obj.X = v` where `X` is not a field but a computed property
         // with a `set_X` accessor: lower to `set_X(receiver, v)`. Compound

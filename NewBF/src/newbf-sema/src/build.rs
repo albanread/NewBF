@@ -357,6 +357,7 @@ impl Builder {
                     name,
                     accessors,
                     explicit_iface,
+                    ..
                 } => {
                     let ty = self.lower_type(ty, f);
                     let attrs = self.lower_attrs(attributes, f);
