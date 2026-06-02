@@ -299,6 +299,11 @@ pub enum Expr {
         ty: Type,
         operand: Box<Expr>,
     },
+    /// `sizeof(Type)` — the byte size of a type (a compile-time `int`).
+    SizeOf {
+        span: Span,
+        ty: Type,
+    },
     /// `.Variant` — leading-dot enum-case shorthand (the type is inferred
     /// from context).
     DotIdent {
@@ -353,6 +358,7 @@ impl Expr {
             | Expr::Prefix { span, .. }
             | Expr::Generic { span, .. }
             | Expr::Cast { span, .. }
+            | Expr::SizeOf { span, .. }
             | Expr::DotIdent { span, .. }
             | Expr::Tuple { span, .. }
             | Expr::Lambda { span, .. }

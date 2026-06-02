@@ -1079,9 +1079,20 @@ impl<'a> Parser<'a> {
             }
             // `sizeof`/`typeof`/`alignof`/`strideof` take a *type* argument,
             // which can use type-only syntax an expression can't (`char8*`,
-            // `int[]`, `List<T>`). Parse `( type )` and drop it for now (the
-            // result is a placeholder primary; the type is recovered later).
-            Keyword::SizeOf | Keyword::AlignOf | Keyword::StrideOf | Keyword::TypeOf => {
+            // `int[]`, `List<T>`). `sizeof` keeps its type (lowered to a
+            // compile-time byte size); the others still drop it (placeholder
+            // primary; recovered later).
+            Keyword::SizeOf => {
+                self.bump();
+                if self.eat(TokenKind::LParen) {
+                    let ty = self.ty();
+                    self.expect(TokenKind::RParen, "`)` after type argument");
+                    Expr::SizeOf { span, ty }
+                } else {
+                    Expr::Ident(span)
+                }
+            }
+            Keyword::AlignOf | Keyword::StrideOf | Keyword::TypeOf => {
                 self.bump();
                 if self.eat(TokenKind::LParen) {
                     let _ty = self.ty();

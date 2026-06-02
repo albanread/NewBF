@@ -190,6 +190,11 @@ impl Printer<'_> {
                 self.ty(ty, d + 2);
                 self.labeled_expr(d + 1, "operand", operand);
             }
+            Expr::SizeOf { ty, .. } => {
+                self.line(d, "SizeOf");
+                self.line(d + 1, "ty:");
+                self.ty(ty, d + 2);
+            }
             Expr::DotIdent { name, .. } => {
                 self.line(d, &format!("DotIdent .{}", self.txt(*name)));
             }

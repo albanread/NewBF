@@ -615,6 +615,8 @@ fn collect_insts_expr<'a>(
         Expr::Paren { inner, .. } => {
             collect_insts_expr(inner, src, generics, gmethods, t, seen, monos)
         }
+        // `sizeof(List<int>)` instantiates the type it names.
+        Expr::SizeOf { ty, .. } => use_in_type(ty, src, generics, t, seen, monos),
         Expr::Unary { operand, .. }
         | Expr::PostInc { operand, .. }
         | Expr::PostDec { operand, .. }
@@ -2156,6 +2158,22 @@ impl<'a> Lowerer<'a> {
             ),
             Expr::Null(_) => (Value::Const(Const::Null), IrType::Ptr),
             Expr::Str(s) => (Value::str(decode_string_literal(s.text(src))), IrType::Ptr),
+            // `sizeof(T)` → the type's byte size, an `int` (I64). A value struct
+            // defers to the IR `SizeOf` (LLVM's DataLayout — the same size `new`
+            // allocates); scalars and references are constant-sized (a class
+            // reference is pointer-sized).
+            Expr::SizeOf { ty, .. } => {
+                let it = lower_ty_env(ty, src, self.structs, self.env);
+                let sz = match it {
+                    IrType::Struct(id) => self.fb.size_of(id),
+                    IrType::Bool => Value::int(1, IrType::I64),
+                    IrType::Int { bits, .. } => Value::int((bits / 8) as i128, IrType::I64),
+                    IrType::Float { bits } => Value::int((bits / 8) as i128, IrType::I64),
+                    IrType::Ptr | IrType::Ref(_) => Value::int(8, IrType::I64),
+                    IrType::Void => Value::int(0, IrType::I64),
+                };
+                (sz, IrType::I64)
+            }
             Expr::Paren { inner, .. } => self.expr(inner, src),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
