@@ -23,6 +23,8 @@ class String {
 
 	public int Length() { return this.mLength; }
 	public char8 CharAt(int i) { return this.mPtr[i]; }
+	// Indexer: `s[i]` is the i-th char (read-only). Assumes a valid index.
+	public char8 this[int i] { get { return this.mPtr[i]; } }
 	// The raw buffer, for length-based I/O (e.g. Console.Write over WriteFile).
 	public char8* Ptr() { return this.mPtr; }
 

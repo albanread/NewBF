@@ -21,6 +21,13 @@ class List<T> {
 	public int Count() { return this.mCount; }
 	public T Get(int i) { return this.mItems[i]; }
 
+	// Indexer: `xs[i]` reads/writes the element in place (same as Get/Set, the
+	// idiomatic form). Assumes a valid index (caller-checked).
+	public T this[int i] {
+		get { return this.mItems[i]; }
+		set { this.mItems[i] = value; }
+	}
+
 	public void Add(T v) {
 		if (this.mCount >= this.mCap) { this.Grow(); }
 		this.mItems[this.mCount] = v;
