@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder, IrType,
-    Module, Param as IrParam, StructDef, StructId, Value, VtableDef,
+    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder,
+    GlobalDef, IrType, Module, Param as IrParam, StructDef, StructId, Value, VtableDef,
 };
 use newbf_lexer::FileId;
 use newbf_parser::{
@@ -97,6 +97,9 @@ struct StructTable {
     /// Int-backed enums: enum name -> (case name -> value). An enum type lowers to
     /// `int32`; `Enum.Case` is the constant.
     enums: HashMap<String, HashMap<String, i64>>,
+    /// `static` fields → a mutable global. Key is the global symbol
+    /// `{prefix}{field}` (e.g. "Counter.Total"); value is its IR type.
+    statics: HashMap<String, IrType>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -798,6 +801,36 @@ fn fill_fields_at(
                 .iter()
                 .any(|(mo, _)| matches!(mo, Modifier::Static | Modifier::Const))
             {
+                // A `static` field becomes a mutable module global keyed by its
+                // `{prefix}{field}` symbol (e.g. "Counter.Total"). Register it
+                // here, then fall through to skip the instance layout. (Pure
+                // non-static `Const` is unchanged: registered nowhere.)
+                //
+                // Only *scalar* statics (int/float/bool/ptr/ref) are registered:
+                // an aggregate (`struct`) static can't be zero-initialized as a
+                // single global cleanly, and — because the backend skips emitting
+                // such a global — a member access through it (`Type.Field.x`)
+                // would address a missing global and drop the receiver argument,
+                // breaking call arity. Skipping aggregate statics keeps sema and
+                // the backend in lock-step (every registered static has a real
+                // global) and leaves the prior (unsupported) behavior intact.
+                if modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static))
+                {
+                    let fty = lower_ty_env(ty, src, t, env);
+                    if matches!(
+                        fty,
+                        IrType::Bool
+                            | IrType::Int { .. }
+                            | IrType::Float { .. }
+                            | IrType::Ptr
+                            | IrType::Ref(_)
+                    ) {
+                        let sym = format!("{}{}", t.prefixes[id.0 as usize], name.text(src));
+                        t.statics.insert(sym, fty);
+                    }
+                }
                 continue;
             }
             let fty = lower_ty_env(ty, src, t, env);
@@ -1097,6 +1130,13 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 entries: structs.vimpls[i].clone(),
             });
         }
+    }
+    // Emit a mutable module global for each `static` field.
+    for (sym, ty) in &structs.statics {
+        m.add_global(GlobalDef {
+            name: sym.clone(),
+            ty: *ty,
+        });
     }
     for f in &all {
         lower_items(&f.unit.items, "", f.src, &structs, &mut m);
@@ -2301,6 +2341,17 @@ impl<'a> Lowerer<'a> {
             Expr::Ident(s) => self.lookup(s.text(src)),
             Expr::This(_) => self.this_slot.clone(),
             Expr::Member { base, name, .. } => {
+                // A `static` field is a mutable global addressed as `Type.Field`.
+                // Resolving it here — before the instance-field path — makes
+                // reads, plain assignment, and compound assignment all work,
+                // since `lvalue` powers all three. Falls through to the
+                // instance path when the symbol isn't a registered static.
+                if let Expr::Ident(s) = &**base {
+                    let sym = format!("{}.{}", s.text(src), name.text(src));
+                    if let Some(&ty) = self.structs.statics.get(&sym) {
+                        return Some((self.fb.global_addr(sym), ty));
+                    }
+                }
                 let (body_ptr, id) = self.struct_base(base, src)?;
                 let fname = name.text(src);
                 // Copy index + field type out, ending the `defs` borrow before

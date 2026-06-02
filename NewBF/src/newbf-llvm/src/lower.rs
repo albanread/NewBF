@@ -58,6 +58,7 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
     cg.build_struct_types(ir);
     cg.declare_all(ir);
     cg.emit_vtables(ir);
+    cg.emit_globals(ir);
     for f in &ir.funcs {
         if !f.is_extern {
             cg.lower_function(f);
@@ -233,6 +234,23 @@ impl<'ctx> Codegen<'ctx, '_> {
                 .add_global(ptr_ty.array_type(entries.len() as u32), None, &vt.name);
             g.set_initializer(&arr);
             g.set_constant(true);
+        }
+    }
+
+    /// Emit each `static` field as a mutable, zero-initialized module global.
+    /// Only scalar globals (int/float/bool/ptr/ref) are emitted; an aggregate
+    /// (`Struct`) or `Void` is skipped so a real-corpus static of such a type
+    /// can never break emission (it simply has no backing global, matching the
+    /// sema-side narrowing). A scalar `BasicTypeEnum::const_zero()` is the
+    /// initializer; the global is left non-constant (mutable).
+    fn emit_globals(&self, ir: &IrModule) {
+        for g in &ir.globals {
+            if matches!(g.ty, IrType::Void | IrType::Struct(_)) {
+                continue;
+            }
+            let ty = self.basic_type_of(g.ty);
+            let global = self.module.add_global(ty, None, &g.name);
+            global.set_initializer(&ty.const_zero());
         }
     }
 

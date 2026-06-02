@@ -37,12 +37,20 @@ pub struct VtableDef {
     pub entries: Vec<String>,
 }
 
+/// A mutable module global (a `static` field). Emitted zero-initialized.
+#[derive(Clone, PartialEq, Debug)]
+pub struct GlobalDef {
+    pub name: String,
+    pub ty: IrType,
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
     pub name: String,
     pub structs: Vec<StructDef>,
     pub funcs: Vec<Function>,
     pub vtables: Vec<VtableDef>,
+    pub globals: Vec<GlobalDef>,
 }
 
 impl Module {
@@ -52,12 +60,18 @@ impl Module {
             structs: Vec::new(),
             funcs: Vec::new(),
             vtables: Vec::new(),
+            globals: Vec::new(),
         }
     }
 
     /// Register a class vtable global.
     pub fn add_vtable(&mut self, def: VtableDef) {
         self.vtables.push(def);
+    }
+
+    /// Register a mutable module global (a `static` field).
+    pub fn add_global(&mut self, g: GlobalDef) {
+        self.globals.push(g);
     }
 
     /// Register an aggregate layout, returning its [`StructId`] handle.
