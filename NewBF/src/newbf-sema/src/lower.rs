@@ -1791,6 +1791,17 @@ fn operator_symbol(op: AstBin) -> Option<&'static str> {
     })
 }
 
+/// The source symbol of a prefix unary operator, for matching a user-defined
+/// one-arg `operator <sym>`. `None` for prefixes that don't overload this way.
+fn unary_operator_symbol(op: UnOp) -> Option<&'static str> {
+    Some(match op {
+        UnOp::Neg => "-",
+        UnOp::Not => "!",
+        UnOp::BitNot => "~",
+        _ => return None,
+    })
+}
+
 /// A compact, deterministic encoding of a parameter-type list, used to suffix
 /// the mangled symbol of an overloaded method so each overload is distinct
 /// (e.g. `Append(char8)` vs `Append(String)` → `…$i8` vs `…$R3`).
@@ -3217,6 +3228,15 @@ impl<'a> Lowerer<'a> {
             _ => {}
         }
         let (v, t) = self.expr(operand, src);
+        // Unary operator overloading: a user type may define a static one-arg
+        // `operator -` / `operator !` / `operator ~`. (Binary `-` is also
+        // `operator-`, but a one-param signature picks the unary form.)
+        if matches!(t, IrType::Struct(_) | IrType::Ref(_))
+            && let Some(sym) = unary_operator_symbol(op)
+            && let Some(res) = self.try_unary_operator_overload(sym, v.clone(), t)
+        {
+            return res;
+        }
         match op {
             UnOp::Pos => (v, t),
             // Negation and bit-complement are numeric (LLVM has no pointer
@@ -3599,6 +3619,38 @@ impl<'a> Lowerer<'a> {
         let b = self.coerce(r, rt, sig.params[1]);
         Some((
             self.fb.call(sig.full_name.clone(), vec![a, b], sig.ret),
+            sig.ret,
+        ))
+    }
+
+    /// Resolve `<sym> v` to a user-defined one-arg `operator <sym>` on `v`'s type.
+    /// Mirrors [`Self::try_operator_overload`] but for a single operand (so it
+    /// picks the unary `operator-` over the binary one by param count).
+    fn try_unary_operator_overload(
+        &mut self,
+        sym: &str,
+        v: Value,
+        t: IrType,
+    ) -> Option<(Value, IrType)> {
+        let id = match t {
+            IrType::Struct(id) | IrType::Ref(id) => id,
+            _ => return None,
+        };
+        let want = format!("operator{sym}");
+        let mut found: Option<MethodSig> = None;
+        for (key, sigs) in &self.structs.methods[id.0 as usize] {
+            if key.split_whitespace().collect::<String>() != want {
+                continue;
+            }
+            if let Some(sig) = sigs.iter().find(|s| !s.is_instance && s.params.len() == 1) {
+                found = Some(sig.clone());
+                break;
+            }
+        }
+        let sig = found?;
+        let a = self.coerce(v, t, sig.params[0]);
+        Some((
+            self.fb.call(sig.full_name.clone(), vec![a], sig.ret),
             sig.ret,
         ))
     }
