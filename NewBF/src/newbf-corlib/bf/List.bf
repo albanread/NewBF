@@ -52,6 +52,29 @@ class List<T> {
 		return this.IndexOf(value) >= 0;
 	}
 
+	// Insert `value` at `index`, shifting elements [index..] up one slot.
+	// Assumes 0 <= index <= count (caller-checked).
+	public void Insert(int32 index, T value) {
+		if (this.mCount >= this.mCap) { this.Grow(); }
+		for (int i = this.mCount; i > index; i--) {
+			this.mItems[i] = this.mItems[i - 1];
+		}
+		this.mItems[index] = value;
+		this.mCount = this.mCount + 1;
+	}
+	// Reverse the elements in place.
+	public void Reverse() {
+		int i = 0;
+		int j = this.mCount - 1;
+		while (i < j) {
+			T tmp = this.mItems[i];
+			this.mItems[i] = this.mItems[j];
+			this.mItems[j] = tmp;
+			i = i + 1;
+			j = j - 1;
+		}
+	}
+
 	void Grow() {
 		int nc = this.mCap * 2;
 		T* nb = Internal.Malloc(nc * 8);

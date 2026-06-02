@@ -47,6 +47,26 @@ class String {
 		return this.IndexOf(c) >= 0;
 	}
 
+	// Whether this string begins with `prefix` (byte-for-byte).
+	public bool StartsWith(String prefix) {
+		int n = prefix.Length();
+		if (n > this.mLength) { return false; }
+		for (int i = 0; i < n; i++) {
+			if (this.mPtr[i] != prefix.CharAt(i)) { return false; }
+		}
+		return true;
+	}
+	// Whether this string ends with `suffix` (byte-for-byte).
+	public bool EndsWith(String suffix) {
+		int n = suffix.Length();
+		if (n > this.mLength) { return false; }
+		int off = this.mLength - n;
+		for (int i = 0; i < n; i++) {
+			if (this.mPtr[off + i] != suffix.CharAt(i)) { return false; }
+		}
+		return true;
+	}
+
 	// A new String of `len` chars starting at `start`. Assumes valid arguments
 	// (caller-checked); builds the result through the same Append path as Grow.
 	public String Substring(int32 start, int32 len) {
