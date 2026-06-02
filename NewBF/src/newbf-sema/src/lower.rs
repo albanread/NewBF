@@ -20,7 +20,7 @@ use newbf_ir::{
     BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder,
     GlobalDef, IrType, Module, Param as IrParam, StructDef, StructId, Value, VtableDef,
 };
-use newbf_lexer::FileId;
+use newbf_lexer::{FileId, Span};
 use newbf_parser::{
     AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody,
     Modifier, Param as AstParam, PrefixKw, Stmt, Type as AstType, TypeDecl, TypeKind, UnOp,
@@ -100,6 +100,10 @@ struct StructTable {
     /// `static` fields → a mutable global. Key is the global symbol
     /// `{prefix}{field}` (e.g. "Counter.Total"); value is its IR type.
     statics: HashMap<String, IrType>,
+    /// Anonymous lambdas: the lambda expression's span → the free-function
+    /// symbol it was emitted as. `lower_program` collects + emits each
+    /// `function R() f = () => …` lambda; `Expr::Lambda` lowers to its address.
+    lambda_names: HashMap<Span, String>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -1094,6 +1098,87 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
 
 /// Lower a whole program (the parsed files; the def graph is available for
 /// future resolution) into one IR [`Module`].
+/// Collect anonymous lambdas to emit as free functions. Minimal slice:
+/// paramless lambdas assigned to a `function R()` local (`function R() f =
+/// () => …;`) — the target type gives the signature (no inference/capture).
+/// Each gets a `$lambdaN` symbol recorded by span; its body is queued to emit.
+fn collect_lambdas<'a>(
+    items: &'a [Item],
+    src: &'a str,
+    structs: &mut StructTable,
+    emits: &mut Vec<(String, IrType, &'a Stmt, &'a str)>,
+) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_lambdas(body, src, structs, emits),
+            Item::Type(td) => {
+                for m in &td.members {
+                    let body = match m {
+                        Member::Method {
+                            body: MethodBody::Block(s),
+                            ..
+                        }
+                        | Member::Constructor {
+                            body: MethodBody::Block(s),
+                            ..
+                        }
+                        | Member::Destructor {
+                            body: MethodBody::Block(s),
+                            ..
+                        } => Some(s),
+                        _ => None,
+                    };
+                    if let Some(s) = body {
+                        collect_lambdas_stmt(s, src, structs, emits);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_lambdas_stmt<'a>(
+    stmt: &'a Stmt,
+    src: &'a str,
+    structs: &mut StructTable,
+    emits: &mut Vec<(String, IrType, &'a Stmt, &'a str)>,
+) {
+    match stmt {
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                collect_lambdas_stmt(s, src, structs, emits);
+            }
+        }
+        Stmt::Local {
+            ty: Some(AstType::Function {
+                return_ty, params, ..
+            }),
+            init: Some(Expr::Lambda { span, body }),
+            ..
+        } if params.is_empty() => {
+            let name = format!("$lambda{}", structs.lambda_names.len());
+            let ret = lower_ty_env(return_ty, src, structs, &[]);
+            structs.lambda_names.insert(*span, name.clone());
+            emits.push((name, ret, &**body, src));
+        }
+        Stmt::If { then, els, .. } => {
+            collect_lambdas_stmt(then, src, structs, emits);
+            if let Some(e) = els {
+                collect_lambdas_stmt(e, src, structs, emits);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_lambdas_stmt(body, src, structs, emits),
+        _ => {}
+    }
+}
+
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Prepend the corlib prelude as source — parsed, then composed at the AST
     // and lowered once with the user program (STDLIB.md). The prelude units are
@@ -1122,7 +1207,14 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     }
 
     let mut m = Module::new("program");
-    let structs = StructTable::build(&all);
+    let mut structs = StructTable::build(&all);
+    // Collect anonymous lambdas (paramless, target-typed) before lowering: each
+    // gets a `$lambdaN` symbol recorded by span (so `Expr::Lambda` lowers to its
+    // address) and its body is queued to emit as a free function below.
+    let mut lambda_emits: Vec<(String, IrType, &Stmt, &str)> = Vec::new();
+    for f in &all {
+        collect_lambdas(&f.unit.items, f.src, &mut structs, &mut lambda_emits);
+    }
     m.structs = structs.defs.clone();
     // Emit a vtable global for each class that has virtual methods.
     for i in 0..structs.vimpls.len() {
@@ -1142,6 +1234,29 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     }
     for f in &all {
         lower_items(&f.unit.items, "", f.src, &structs, &mut m);
+    }
+    // Emit each collected lambda as a free function `$lambdaN() -> R { body }`.
+    // An expression body (`=> e`) returns `e`; a block body lowers as-is.
+    for (name, ret, body, lsrc) in &lambda_emits {
+        let mb = match *body {
+            Stmt::Expr { expr, .. } => MethodBody::Expr(expr.clone()),
+            other => MethodBody::Block(other.clone()),
+        };
+        let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+        if let Some(func) = lower_method(
+            name.clone(),
+            *ret,
+            &[],
+            &mb,
+            lsrc,
+            &empty,
+            &structs,
+            None,
+            &[],
+            &[],
+        ) {
+            m.add_function(func);
+        }
     }
     // Lower each monomorphized instantiation's methods/ctors at its mono id and
     // mangled prefix, with its type-parameter env (so a `T` resolves concretely).
@@ -2193,6 +2308,15 @@ impl<'a> Lowerer<'a> {
                 };
                 (sz, IrType::I64)
             }
+            // An anonymous lambda is the address of the free function it was
+            // emitted as (collected in `lower_program`); degrades to undef when
+            // it wasn't in a recognized (paramless, target-typed) position.
+            Expr::Lambda { span, .. } => self
+                .structs
+                .lambda_names
+                .get(span)
+                .map(|n| (self.fb.global_addr(n.clone()), IrType::Ptr))
+                .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
             Expr::Paren { inner, .. } => self.expr(inner, src),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),

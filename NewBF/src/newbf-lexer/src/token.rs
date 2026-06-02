@@ -8,7 +8,7 @@ pub struct FileId(pub u32);
 
 /// A byte range within a source file. `lo`/`hi` are byte offsets; `hi` is
 /// exclusive. Spans always land on UTF-8 char boundaries.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
     pub file: FileId,
     pub lo: u32,
