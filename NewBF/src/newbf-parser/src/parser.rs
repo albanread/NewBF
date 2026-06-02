@@ -272,8 +272,8 @@ impl<'a> Parser<'a> {
         let mut lhs = self.unary();
         loop {
             // `not case` — Beef's negated case-test operator. `not` lexes as
-            // an identifier; treat the pair as a `case` operator (the
-            // negation is dropped for now). Same precedence as `case`.
+            // an identifier; parse the pair as a `case` operator and wrap the
+            // result in a logical `!` below. Same precedence as `case`.
             let not_case =
                 self.at_ident_text("not") && self.nth_kind(1) == TokenKind::Keyword(Keyword::Case);
             let Some(op) = (if not_case {
@@ -324,12 +324,21 @@ impl<'a> Parser<'a> {
             } else {
                 self.binary(bp + 1) // left-associative
             };
+            let span = self.finish(lo);
             lhs = Expr::Binary {
-                span: self.finish(lo),
+                span,
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
+            // `x not case P` is `!(x case P)` — negate the case-test result.
+            if not_case {
+                lhs = Expr::Unary {
+                    span,
+                    op: UnOp::Not,
+                    operand: Box::new(lhs),
+                };
+            }
         }
         lhs
     }

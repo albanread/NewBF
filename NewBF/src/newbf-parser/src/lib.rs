@@ -715,8 +715,8 @@ mod tests {
         // guard are dropped for now, but must not error).
         let s = ok_stmt("switch (x) { case .Ok(let a) when a > 0: f(); default: g(); }");
         assert!(s.contains("(switch x"), "got {s}");
-        // `not case` is parsed as a case-test operator.
-        assert_eq!(ok("x not case .Foo"), "(case x .Foo)");
+        // `not case` is `!(x case .Foo)` — a negated case-test.
+        assert_eq!(ok("x not case .Foo"), "(u! (case x .Foo))");
     }
 
     #[test]
