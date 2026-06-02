@@ -2636,6 +2636,37 @@ impl<'a> Lowerer<'a> {
                 .call(setter.full_name, vec![body_ptr, val.clone()], IrType::Void);
             return (val, pty);
         }
+        // Compound assignment on a property: `obj.X op= v` lowers to
+        // `set_X(obj, get_X(obj) op v)` (reusing the receiver pointer once). Plain `=`
+        // is handled by the setter block above; this fires only for `+=`, `-=`, etc.
+        if let Some(astbin) = compound_op(op)
+            && let Expr::Member { base, name, .. } = target
+            && let Some((body_ptr, owner)) = self.struct_base(base, src)
+        {
+            let prop = name.text(src);
+            let getter = self.structs.methods[owner.0 as usize]
+                .get(&format!("get_{prop}"))
+                .and_then(|c| pick_overload(c, &[], true))
+                .cloned();
+            if let Some(getter) = getter {
+                let pty = getter.ret;
+                let setter = self.structs.methods[owner.0 as usize]
+                    .get(&format!("set_{prop}"))
+                    .and_then(|c| pick_overload(c, &[pty], true))
+                    .cloned();
+                if let Some(setter) = setter {
+                    let cur = self.fb.call(getter.full_name, vec![body_ptr.clone()], pty);
+                    let v = self.coerce(rhs, rhs_ty, pty);
+                    let combined = self.arith(astbin, cur, v, pty);
+                    self.fb.call(
+                        setter.full_name,
+                        vec![body_ptr, combined.clone()],
+                        IrType::Void,
+                    );
+                    return (combined, pty);
+                }
+            }
+        }
         // Unsupported lvalue (index/deref/…) — not lowered yet.
         (rhs, rhs_ty)
     }
