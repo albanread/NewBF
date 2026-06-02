@@ -1932,7 +1932,63 @@ impl<'a> Lowerer<'a> {
             Stmt::ForEach {
                 name, iter, body, ..
             } => {
-                // `for (name in coll) body` over a List-like receiver — one with
+                // Two iterable shapes lower to counting loops (both with
+                // `break`/`continue` wired to the loop stack): a numeric range
+                // `lo..<hi` / `lo...hi`, or a List-like receiver with
+                // `Count() -> int` + `Get(int) -> T`. Anything else degrades to a
+                // skipped body.
+                if let Expr::Binary {
+                    op: rop @ (AstBin::Range | AstBin::ClosedRange),
+                    lhs,
+                    rhs,
+                    ..
+                } = iter
+                {
+                    // `for (var i in lo..<hi)` → `for (i = lo; i </<= hi; i += 1)`.
+                    let (lo, lot) = self.expr(lhs, src);
+                    let (hi, hit) = self.expr(rhs, src);
+                    let ity = common_type(lot, hit);
+                    let lo = self.coerce(lo, lot, ity);
+                    let hi = self.coerce(hi, hit, ity);
+                    self.scopes.push(HashMap::new());
+                    let hi_slot = self.fb.alloca(ity);
+                    self.fb.store(hi_slot.clone(), hi);
+                    let var_slot = self.fb.alloca(ity);
+                    self.fb.store(var_slot.clone(), lo);
+                    self.bind(name.text(src), var_slot.clone(), ity, None);
+                    let head = self.fb.create_block("foreach.head");
+                    let body_b = self.fb.create_block("foreach.body");
+                    let cont = self.fb.create_block("foreach.cont");
+                    let exit = self.fb.create_block("foreach.exit");
+                    self.fb.br(head);
+                    self.switch(head);
+                    let iv = self.fb.load(var_slot.clone(), ity);
+                    let hv = self.fb.load(hi_slot.clone(), ity);
+                    let pred = if matches!(rop, AstBin::ClosedRange) {
+                        CmpPred::Sle
+                    } else {
+                        CmpPred::Slt
+                    };
+                    let test = self.fb.cmp(pred, iv, hv);
+                    self.fb.cond_br(test, body_b, exit);
+                    self.terminated = true;
+                    self.switch(body_b);
+                    self.loops.push((cont, exit));
+                    self.stmt(body, src);
+                    self.loops.pop();
+                    if !self.terminated {
+                        self.fb.br(cont);
+                    }
+                    self.switch(cont);
+                    let iv = self.fb.load(var_slot.clone(), ity);
+                    let inc = self.fb.bin(IrBin::Add, iv, Value::int(1, ity), ity);
+                    self.fb.store(var_slot, inc);
+                    self.fb.br(head);
+                    self.switch(exit);
+                    self.scopes.pop();
+                    return;
+                }
+                // `for (name in coll)` over a List-like receiver — one with
                 // `Count() -> int` and `Get(int) -> T` (e.g. corlib `List<T>`).
                 // Lowered as an indexed loop: `for (i = 0; i < coll.Count();
                 // i += 1) { name = coll.Get(i); body }`. A non-iterable
