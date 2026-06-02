@@ -47,6 +47,16 @@ class String {
 		return this.IndexOf(c) >= 0;
 	}
 
+	// A new String of `len` chars starting at `start`. Assumes valid arguments
+	// (caller-checked); builds the result through the same Append path as Grow.
+	public String Substring(int32 start, int32 len) {
+		String r = new String();
+		for (int32 i = 0; i < len; i++) {
+			r.Append(this.mPtr[start + i]);
+		}
+		return r;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;

@@ -27,6 +27,19 @@ class List<T> {
 		this.mCount = this.mCount + 1;
 	}
 
+	// Remove the element at `index`, shifting later elements down one slot and
+	// decrementing the count. Assumes a valid index (caller-checked).
+	public void RemoveAt(int32 index) {
+		for (int32 i = index; i < this.mCount - 1; i++) {
+			this.mItems[i] = this.mItems[i + 1];
+		}
+		this.mCount = this.mCount - 1;
+	}
+	// Drop all elements (count to 0) while keeping the buffer for reuse.
+	public void Clear() {
+		this.mCount = 0;
+	}
+
 	// Index of the first element equal to `value` (by ==), or -1 if absent.
 	public int32 IndexOf(T value) {
 		for (int32 i = 0; i < this.mCount; i++) {
