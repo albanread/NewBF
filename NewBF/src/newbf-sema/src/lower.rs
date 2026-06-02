@@ -14,7 +14,8 @@
 //! propagation in lieu of a full type checker. Reference for the eventual
 //! full lowering: `E:\beef\IDEHelper\Compiler\BfIRCodeGen.cpp`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use newbf_ir::{
     BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder,
@@ -104,6 +105,12 @@ struct StructTable {
     /// symbol it was emitted as. `lower_program` collects + emits each
     /// `function R() f = () => …` lambda; `Expr::Lambda` lowers to its address.
     lambda_names: HashMap<Span, String>,
+    /// Closure captures per lambda symbol (`$lambdaN`): the outer locals a lambda
+    /// body references, as `(name, type)` in environment order. Filled at the
+    /// lambda-creation site (where the enclosing scope is live) via interior
+    /// mutability, and read back when the lambda body is emitted. Empty (or
+    /// absent) ⇒ a non-capturing lambda (a bare function pointer).
+    lambda_captures: RefCell<HashMap<String, Vec<(String, IrType)>>>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -1264,21 +1271,33 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             Stmt::Expr { expr, .. } => MethodBody::Expr(expr.clone()),
             other => MethodBody::Block(other.clone()),
         };
-        let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
-        // The lambda's (target-typed) params bind as pre-named extra params.
-        let extra: Vec<(&str, IrType)> = params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
-        if let Some(func) = lower_method(
-            name.clone(),
-            *ret,
-            &[],
-            &mb,
-            lsrc,
-            &empty,
-            &structs,
-            None,
-            &[],
-            &extra,
-        ) {
+        let caps = structs
+            .lambda_captures
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let func = if caps.is_empty() {
+            // Non-capturing → a plain free function; params bind as `extra`.
+            let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+            let extra: Vec<(&str, IrType)> = params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+            lower_method(
+                name.clone(),
+                *ret,
+                &[],
+                &mb,
+                lsrc,
+                &empty,
+                &structs,
+                None,
+                &[],
+                &extra,
+            )
+        } else {
+            // Capturing → a closure function taking the env as `$self`.
+            emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs)
+        };
+        if let Some(func) = func {
             m.add_function(func);
         }
     }
@@ -1796,6 +1815,70 @@ fn lower_method(
     Some(lw.fb.finish())
 }
 
+/// Emit a *capturing* lambda as a closure function `$lambdaN($self, params…) ->
+/// ret`. `$self` (param 0) is the env pointer `[code_ptr | cap0 | cap1 …]`; each
+/// capture binds to its env slot `$self[i+1]` (reads/writes flow through that
+/// address); the lambda's own params follow and spill to slots as usual.
+#[allow(clippy::too_many_arguments)]
+fn emit_closure(
+    name: &str,
+    ret: IrType,
+    params: &[(String, IrType)],
+    caps: &[(String, IrType)],
+    body: &MethodBody,
+    src: &str,
+    structs: &StructTable,
+) -> Option<Function> {
+    let body_stmt = match body {
+        MethodBody::None => return None,
+        other => other,
+    };
+    let mut ir_params: Vec<IrParam> = vec![IrParam {
+        name: Some("$self".to_string()),
+        ty: IrType::Ptr,
+    }];
+    ir_params.extend(params.iter().map(|(n, t)| IrParam {
+        name: Some(n.clone()),
+        ty: *t,
+    }));
+    let fb = FunctionBuilder::new(name.to_string(), ir_params, ret);
+    let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+    let mut lw = Lowerer::new(fb, ret, &empty, structs, &[]);
+
+    // Captures: bind each name to its env address `$self[i+1]`.
+    let self_env = Value::Param(0);
+    for (i, (n, t)) in caps.iter().enumerate() {
+        let addr = lw.fb.elem_addr(
+            self_env.clone(),
+            IrType::Ptr,
+            Value::int((i + 1) as i128, IrType::I64),
+        );
+        lw.bind(n, addr, *t, None);
+    }
+    // The lambda's params follow `$self` (param indices offset by 1).
+    for (i, (n, t)) in params.iter().enumerate() {
+        let slot = lw.fb.alloca(*t);
+        lw.fb.store(slot.clone(), Value::Param((i + 1) as u32));
+        lw.bind(n, slot, *t, None);
+    }
+
+    match body_stmt {
+        MethodBody::Block(stmt) => lw.stmt(stmt, src),
+        MethodBody::Expr(expr) => {
+            let (v, t) = lw.expr(expr, src);
+            if lw.ret_ty == IrType::Void {
+                lw.ret(None);
+            } else {
+                let cv = lw.coerce(v, t, lw.ret_ty);
+                lw.ret(Some(cv));
+            }
+        }
+        MethodBody::None => unreachable!(),
+    }
+    lw.finish_ret();
+    Some(lw.fb.finish())
+}
+
 /// A bound local/parameter: stack slot, slot type, and (for typed pointers)
 /// the element type — see [`Lowerer::lookup_elem`].
 type Binding = (Value, IrType, Option<IrType>);
@@ -1828,6 +1911,10 @@ struct Lowerer<'a> {
     /// `function R(P)` local holds a code address; a call `f(args)` through it
     /// lowers to an indirect call with this signature.
     fn_sigs: HashMap<String, (IrType, Vec<IrType>)>,
+    /// Names of function-pointer locals that hold a *closure* (an env pointer
+    /// whose slot 0 is the code pointer), not a bare code pointer. A call
+    /// through one passes the env as a hidden first argument.
+    closures: std::collections::HashSet<String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -1849,6 +1936,7 @@ impl<'a> Lowerer<'a> {
             this_slot: None,
             env,
             fn_sigs: HashMap::new(),
+            closures: std::collections::HashSet::new(),
         }
     }
 
@@ -1959,6 +2047,21 @@ impl<'a> Lowerer<'a> {
                         .map(|p| lower_ty_env(p, src, self.structs, self.env))
                         .collect();
                     self.fn_sigs.insert(name.text(src).to_string(), (ret, ptys));
+                    // If the initializer is a *capturing* lambda, this local
+                    // holds a closure (env pointer) — a call through it passes
+                    // the env as a hidden first arg. (The lambda's captures were
+                    // recorded by name when its `Expr::Lambda` was lowered above.)
+                    if let Some(Expr::Lambda { span, .. }) = init
+                        && let Some(lname) = self.structs.lambda_names.get(span)
+                        && self
+                            .structs
+                            .lambda_captures
+                            .borrow()
+                            .get(lname)
+                            .is_some_and(|c| !c.is_empty())
+                    {
+                        self.closures.insert(name.text(src).to_string());
+                    }
                 }
             }
             Stmt::Return { value, .. } => {
@@ -2300,6 +2403,142 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    // ── closure capture detection ─────────────────────────────────────────
+
+    /// Find the outer locals a lambda body references (its free variables) — the
+    /// closure captures — as `(name, slot, type)` read from the live enclosing
+    /// scope. Excludes the lambda's own params and any locals the body declares.
+    fn detect_captures(
+        &self,
+        body: &Stmt,
+        params: &[Span],
+        src: &str,
+    ) -> Vec<(String, Value, IrType)> {
+        let mut bound: HashSet<String> = params.iter().map(|p| p.text(src).to_string()).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut caps: Vec<(String, Value, IrType)> = Vec::new();
+        self.caps_stmt(body, src, &mut bound, &mut seen, &mut caps);
+        caps
+    }
+
+    fn caps_stmt(
+        &self,
+        s: &Stmt,
+        src: &str,
+        bound: &mut HashSet<String>,
+        seen: &mut HashSet<String>,
+        caps: &mut Vec<(String, Value, IrType)>,
+    ) {
+        match s {
+            Stmt::Block { stmts, .. } => {
+                for st in stmts {
+                    self.caps_stmt(st, src, bound, seen, caps);
+                }
+            }
+            Stmt::Local { name, init, .. } => {
+                if let Some(e) = init {
+                    self.caps_expr(e, src, bound, seen, caps);
+                }
+                bound.insert(name.text(src).to_string());
+            }
+            Stmt::Expr { expr, .. } => self.caps_expr(expr, src, bound, seen, caps),
+            Stmt::Return { value: Some(e), .. } => self.caps_expr(e, src, bound, seen, caps),
+            Stmt::If {
+                cond, then, els, ..
+            } => {
+                self.caps_expr(cond, src, bound, seen, caps);
+                self.caps_stmt(then, src, bound, seen, caps);
+                if let Some(e) = els {
+                    self.caps_stmt(e, src, bound, seen, caps);
+                }
+            }
+            Stmt::While { cond, body, .. } | Stmt::DoWhile { cond, body, .. } => {
+                self.caps_expr(cond, src, bound, seen, caps);
+                self.caps_stmt(body, src, bound, seen, caps);
+            }
+            Stmt::For {
+                init,
+                cond,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.caps_stmt(i, src, bound, seen, caps);
+                }
+                if let Some(c) = cond {
+                    self.caps_expr(c, src, bound, seen, caps);
+                }
+                if let Some(u) = update {
+                    self.caps_expr(u, src, bound, seen, caps);
+                }
+                self.caps_stmt(body, src, bound, seen, caps);
+            }
+            Stmt::ForEach {
+                name, iter, body, ..
+            } => {
+                self.caps_expr(iter, src, bound, seen, caps);
+                bound.insert(name.text(src).to_string());
+                self.caps_stmt(body, src, bound, seen, caps);
+            }
+            _ => {}
+        }
+    }
+
+    fn caps_expr(
+        &self,
+        e: &Expr,
+        src: &str,
+        bound: &mut HashSet<String>,
+        seen: &mut HashSet<String>,
+        caps: &mut Vec<(String, Value, IrType)>,
+    ) {
+        match e {
+            Expr::Ident(s) => {
+                let n = s.text(src);
+                if !bound.contains(n)
+                    && !seen.contains(n)
+                    && let Some((slot, ty)) = self.lookup(n)
+                {
+                    seen.insert(n.to_string());
+                    caps.push((n.to_string(), slot, ty));
+                }
+            }
+            Expr::Paren { inner, .. } => self.caps_expr(inner, src, bound, seen, caps),
+            Expr::Unary { operand, .. }
+            | Expr::Prefix { operand, .. }
+            | Expr::PostInc { operand, .. }
+            | Expr::PostDec { operand, .. } => self.caps_expr(operand, src, bound, seen, caps),
+            Expr::Member { base, .. } => self.caps_expr(base, src, bound, seen, caps),
+            Expr::Binary { lhs, rhs, .. } => {
+                self.caps_expr(lhs, src, bound, seen, caps);
+                self.caps_expr(rhs, src, bound, seen, caps);
+            }
+            Expr::Assign { target, value, .. } => {
+                self.caps_expr(target, src, bound, seen, caps);
+                self.caps_expr(value, src, bound, seen, caps);
+            }
+            Expr::Ternary {
+                cond, then, els, ..
+            } => {
+                self.caps_expr(cond, src, bound, seen, caps);
+                self.caps_expr(then, src, bound, seen, caps);
+                self.caps_expr(els, src, bound, seen, caps);
+            }
+            Expr::Cast { operand, .. } => self.caps_expr(operand, src, bound, seen, caps),
+            Expr::Call { callee, args, .. }
+            | Expr::Index {
+                base: callee, args, ..
+            } => {
+                self.caps_expr(callee, src, bound, seen, caps);
+                for a in args {
+                    self.caps_expr(a, src, bound, seen, caps);
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── expressions ───────────────────────────────────────────────────────
 
     fn expr(&mut self, e: &Expr, src: &str) -> (Value, IrType) {
@@ -2332,15 +2571,48 @@ impl<'a> Lowerer<'a> {
                 };
                 (sz, IrType::I64)
             }
-            // An anonymous lambda is the address of the free function it was
-            // emitted as (collected in `lower_program`); degrades to undef when
-            // it wasn't in a recognized (paramless, target-typed) position.
-            Expr::Lambda { span, .. } => self
-                .structs
-                .lambda_names
-                .get(span)
-                .map(|n| (self.fb.global_addr(n.clone()), IrType::Ptr))
-                .unwrap_or_else(|| (undef(IrType::I64), IrType::I64)),
+            // An anonymous lambda lowers to the address of the free function it
+            // was emitted as. If it captures outer locals it becomes a *closure*:
+            // allocate a heap env `[code_ptr | cap0 | cap1 …]` (8-byte slots),
+            // store the code pointer + each captured value, and the lambda value
+            // is the env pointer. Non-capturing ⇒ the bare code pointer. The
+            // captures (name, type) are recorded for the emit pass.
+            Expr::Lambda {
+                span, params, body, ..
+            } => {
+                let Some(name) = self.structs.lambda_names.get(span).cloned() else {
+                    return (undef(IrType::I64), IrType::I64);
+                };
+                let caps = self.detect_captures(body, params, src);
+                self.structs.lambda_captures.borrow_mut().insert(
+                    name.clone(),
+                    caps.iter().map(|(n, _, t)| (n.clone(), *t)).collect(),
+                );
+                let code = self.fb.global_addr(name);
+                if caps.is_empty() {
+                    return (code, IrType::Ptr);
+                }
+                let words = (1 + caps.len()) as i128;
+                let env = self.fb.call(
+                    "malloc",
+                    vec![Value::int(words * 8, IrType::I64)],
+                    IrType::Ptr,
+                );
+                let slot0 = self
+                    .fb
+                    .elem_addr(env.clone(), IrType::Ptr, Value::int(0, IrType::I64));
+                self.fb.store(slot0, code);
+                for (i, (_n, slot, ty)) in caps.iter().enumerate() {
+                    let dst = self.fb.elem_addr(
+                        env.clone(),
+                        IrType::Ptr,
+                        Value::int((i + 1) as i128, IrType::I64),
+                    );
+                    let val = self.fb.load(slot.clone(), *ty);
+                    self.fb.store(dst, val);
+                }
+                (env, IrType::Ptr)
+            }
             Expr::Paren { inner, .. } => self.expr(inner, src),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
@@ -2401,15 +2673,30 @@ impl<'a> Lowerer<'a> {
                     if let Some((ret, ptys)) = self.fn_sigs.get(name).cloned()
                         && let Some((slot, _)) = self.lookup(name)
                     {
-                        let fptr = self.fb.load(slot, IrType::Ptr);
-                        let call_args: Vec<Value> = arg_vals
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (v, t))| {
-                                let pt = ptys.get(i).copied().unwrap_or(t);
-                                self.coerce(v, t, pt)
-                            })
-                            .collect();
+                        let is_closure = self.closures.contains(name);
+                        // `f`'s value is the env pointer for a closure, or the
+                        // code pointer for a bare function pointer.
+                        let f = self.fb.load(slot, IrType::Ptr);
+                        let (fptr, env) = if is_closure {
+                            // Code pointer is env slot 0; the env is the hidden
+                            // first argument (`$self`).
+                            let code_slot = self.fb.elem_addr(
+                                f.clone(),
+                                IrType::Ptr,
+                                Value::int(0, IrType::I64),
+                            );
+                            (self.fb.load(code_slot, IrType::Ptr), Some(f))
+                        } else {
+                            (f, None)
+                        };
+                        let mut call_args: Vec<Value> = Vec::new();
+                        if let Some(env) = env {
+                            call_args.push(env);
+                        }
+                        for (i, (v, t)) in arg_vals.into_iter().enumerate() {
+                            let pt = ptys.get(i).copied().unwrap_or(t);
+                            call_args.push(self.coerce(v, t, pt));
+                        }
                         return (self.fb.call_indirect(fptr, call_args, ret), ret);
                     }
                     // Resolve among the same-type overloads by argument type
