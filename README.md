@@ -27,8 +27,12 @@ real Beef:
 - **constructors + destructors** and **instance methods** (`obj.Method()`, `this`);
 - **generics** (monomorphized value structs, classes, and methods); **inheritance
   + virtual dispatch** (vtables, multi-level, `override`, `abstract`); **properties**
-  (computed + auto); int-backed **enums** plus **payload enums + `match` with
-  binding** and generic **`Option<T>`**;
+  (computed + auto) and **user-defined indexers** (`obj[i]`); int-backed **enums**
+  plus **payload enums + `match`** with payload binding, `when` guards, the
+  `x case .Some(let v)` test operator, **methods + computed properties on enums**,
+  and generic **`Option<T>`** with target-typed `.Some(x)`/`.None` construction;
+- **user-defined operator overloading** — binary (`a + b`), unary (`-v`), and
+  compound (`v += w`);
 - **lambdas, closures, and higher-order functions** (`Map`/`Filter`/`Fold`);
   function pointers; `sizeof`; scalar `static` fields;
 - a corlib slice — `String`, a growable `List<T>`, a generational `Pool` + typed
@@ -43,7 +47,8 @@ the LLVM verifier. The reasoning behind each step is logged in
 
 Not yet: comptime metaprogramming, reflection / attributes-as-behaviour, the
 broad standard library, dynamic interface dispatch, delegates + events, and full
-pattern matching (`when` guards, tuples). The *optional* GC direction
+pattern matching (tuple/positional patterns; `when` guards already land). The
+*optional* GC direction
 (conservative roots + precise heap via the sibling **NewGC** collector — no
 safepoints) is designed in [`NewBF/docs/GC.md`](NewBF/docs/GC.md).
 
