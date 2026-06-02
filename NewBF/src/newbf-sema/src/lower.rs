@@ -1929,6 +1929,79 @@ impl<'a> Lowerer<'a> {
                 self.switch(exit);
                 self.scopes.pop();
             }
+            Stmt::ForEach {
+                name, iter, body, ..
+            } => {
+                // `for (name in coll) body` over a List-like receiver — one with
+                // `Count() -> int` and `Get(int) -> T` (e.g. corlib `List<T>`).
+                // Lowered as an indexed loop: `for (i = 0; i < coll.Count();
+                // i += 1) { name = coll.Get(i); body }`. A non-iterable
+                // collection (no Count/Get) degrades to a skipped body.
+                let (coll, coll_ty) = self.expr(iter, src);
+                let sigs = if let IrType::Ref(id) = coll_ty {
+                    let count = self.structs.methods[id.0 as usize]
+                        .get("Count")
+                        .and_then(|c| pick_overload(c, &[], true))
+                        .cloned();
+                    let get = self.structs.methods[id.0 as usize]
+                        .get("Get")
+                        .and_then(|c| pick_overload(c, &[IrType::I64], true))
+                        .cloned();
+                    count.zip(get)
+                } else {
+                    None
+                };
+                if let Some((count_sig, get_sig)) = sigs {
+                    let idx_ty = get_sig.params[1];
+                    let elem_ty = get_sig.ret;
+                    self.scopes.push(HashMap::new());
+                    // Evaluate the collection once; index + loop-var slots.
+                    let coll_slot = self.fb.alloca(coll_ty);
+                    self.fb.store(coll_slot.clone(), coll);
+                    let idx_slot = self.fb.alloca(idx_ty);
+                    self.fb.store(idx_slot.clone(), Value::int(0, idx_ty));
+                    let var_slot = self.fb.alloca(elem_ty);
+                    self.bind(name.text(src), var_slot.clone(), elem_ty, None);
+                    let head = self.fb.create_block("foreach.head");
+                    let body_b = self.fb.create_block("foreach.body");
+                    let cont = self.fb.create_block("foreach.cont");
+                    let exit = self.fb.create_block("foreach.exit");
+                    self.fb.br(head);
+                    // head: i < coll.Count()
+                    self.switch(head);
+                    let cv = self.fb.load(coll_slot.clone(), coll_ty);
+                    let cnt = self
+                        .fb
+                        .call(count_sig.full_name.clone(), vec![cv], count_sig.ret);
+                    let cnt = self.coerce(cnt, count_sig.ret, idx_ty);
+                    let iv = self.fb.load(idx_slot.clone(), idx_ty);
+                    let test = self.fb.cmp(CmpPred::Slt, iv, cnt);
+                    self.fb.cond_br(test, body_b, exit);
+                    self.terminated = true;
+                    // body: name = coll.Get(i); <body>
+                    self.switch(body_b);
+                    let cv = self.fb.load(coll_slot.clone(), coll_ty);
+                    let iv = self.fb.load(idx_slot.clone(), idx_ty);
+                    let elem = self
+                        .fb
+                        .call(get_sig.full_name.clone(), vec![cv, iv], elem_ty);
+                    self.fb.store(var_slot.clone(), elem);
+                    self.loops.push((cont, exit));
+                    self.stmt(body, src);
+                    self.loops.pop();
+                    if !self.terminated {
+                        self.fb.br(cont);
+                    }
+                    // cont: i += 1; back to head
+                    self.switch(cont);
+                    let iv = self.fb.load(idx_slot.clone(), idx_ty);
+                    let inc = self.fb.bin(IrBin::Add, iv, Value::int(1, idx_ty), idx_ty);
+                    self.fb.store(idx_slot, inc);
+                    self.fb.br(head);
+                    self.switch(exit);
+                    self.scopes.pop();
+                }
+            }
             Stmt::Break { .. } => {
                 if let Some(&(_, brk)) = self.loops.last() {
                     self.fb.br(brk);
