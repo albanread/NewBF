@@ -4175,7 +4175,17 @@ impl<'a> Lowerer<'a> {
             let stored = match compound_op(op) {
                 Some(astbin) => {
                     let cur = self.fb.load(slot.clone(), ty);
-                    self.arith(astbin, cur, rhs, ty)
+                    // A struct/class `v op= w` uses the `operator op` overload if
+                    // defined; scalars take the numeric `arith` path.
+                    if matches!(ty, IrType::Struct(_) | IrType::Ref(_))
+                        && let Some(sym) = operator_symbol(astbin)
+                        && let Some((res, _)) =
+                            self.try_operator_overload(sym, cur.clone(), ty, rhs.clone(), ty)
+                    {
+                        res
+                    } else {
+                        self.arith(astbin, cur, rhs, ty)
+                    }
                 }
                 None => rhs, // plain `=`
             };
@@ -4220,7 +4230,15 @@ impl<'a> Lowerer<'a> {
                 if let Some(setter) = setter {
                     let cur = self.fb.call(getter.full_name, vec![body_ptr.clone()], pty);
                     let v = self.coerce(rhs, rhs_ty, pty);
-                    let combined = self.arith(astbin, cur, v, pty);
+                    let combined = if matches!(pty, IrType::Struct(_) | IrType::Ref(_))
+                        && let Some(sym) = operator_symbol(astbin)
+                        && let Some((res, _)) =
+                            self.try_operator_overload(sym, cur.clone(), pty, v.clone(), pty)
+                    {
+                        res
+                    } else {
+                        self.arith(astbin, cur, v, pty)
+                    };
                     self.fb.call(
                         setter.full_name,
                         vec![body_ptr, combined.clone()],
