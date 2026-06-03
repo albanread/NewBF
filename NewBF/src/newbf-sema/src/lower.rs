@@ -2373,6 +2373,12 @@ fn lower_method(
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty, elem);
+            // A `T[]` parameter is an array: mark it so `a.Count`/`foreach`/`delete`
+            // work on it just like an array local (the value is the elements
+            // pointer; the length header rides 8 bytes behind it).
+            if matches!(p.ty, AstType::Array { .. }) {
+                lw.array_locals.insert(nm.text(src).to_string());
+            }
             // A `function R(P)`-typed *parameter* is callable: record its
             // signature (under the monomorph env) so `name(args)` in the body
             // lowers to an indirect call. This is what lets a higher-order
