@@ -34,6 +34,17 @@ class List<T> {
 		this.mCount = this.mCount + 1;
 	}
 
+	// Append every element of `other` (in order). Reads through `other`'s public
+	// surface, so it works for any same-typed list.
+	public void AddRange(List<T> other) {
+		for (int i = 0; i < other.Count(); i++) {
+			this.Add(other.Get(i));
+		}
+	}
+	// First / last element. Assume non-empty (caller-checked).
+	public T First() { return this.mItems[0]; }
+	public T Last() { return this.mItems[this.mCount - 1]; }
+
 	// Remove the element at `index`, shifting later elements down one slot and
 	// decrementing the count. Assumes a valid index (caller-checked).
 	public void RemoveAt(int32 index) {
