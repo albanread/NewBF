@@ -2896,6 +2896,59 @@ impl<'a> Lowerer<'a> {
                     self.scopes.pop();
                     return;
                 }
+                // `for (x in arr)` over a heap-array local → an indexed loop
+                // `for (i = 0; i < arr.Count; i += 1) { x = arr[i]; body }`. The
+                // element address is the same typed-pointer index `a[i]` uses.
+                if let Expr::Ident(s) = iter
+                    && self.array_locals.contains(s.text(src))
+                    && let Some(elem_ty) = self.lookup_elem(s.text(src))
+                {
+                    let (arr, _) = self.expr(iter, src);
+                    self.scopes.push(HashMap::new());
+                    let hdr =
+                        self.fb
+                            .elem_addr(arr.clone(), IrType::U8, Value::int(-8, IrType::I64));
+                    let count = self.fb.load(hdr, IrType::I64);
+                    let arr_slot = self.fb.alloca(IrType::Ptr);
+                    self.fb.store(arr_slot.clone(), arr);
+                    let cnt_slot = self.fb.alloca(IrType::I64);
+                    self.fb.store(cnt_slot.clone(), count);
+                    let idx_slot = self.fb.alloca(IrType::I64);
+                    self.fb.store(idx_slot.clone(), Value::int(0, IrType::I64));
+                    let var_slot = self.fb.alloca(elem_ty);
+                    self.bind(name.text(src), var_slot.clone(), elem_ty, None);
+                    let head = self.fb.create_block("foreach.head");
+                    let body_b = self.fb.create_block("foreach.body");
+                    let cont = self.fb.create_block("foreach.cont");
+                    let exit = self.fb.create_block("foreach.exit");
+                    self.fb.br(head);
+                    self.switch(head);
+                    let iv = self.fb.load(idx_slot.clone(), IrType::I64);
+                    let cv = self.fb.load(cnt_slot.clone(), IrType::I64);
+                    let test = self.fb.cmp(CmpPred::Slt, iv, cv);
+                    self.fb.cond_br(test, body_b, exit);
+                    self.terminated = true;
+                    self.switch(body_b);
+                    let base = self.fb.load(arr_slot.clone(), IrType::Ptr);
+                    let iv = self.fb.load(idx_slot.clone(), IrType::I64);
+                    let ep = self.fb.elem_addr(base, elem_ty, iv);
+                    let ev = self.fb.load(ep, elem_ty);
+                    self.fb.store(var_slot.clone(), ev);
+                    self.loops.push((cont, exit));
+                    self.stmt(body, src);
+                    self.loops.pop();
+                    if !self.terminated {
+                        self.fb.br(cont);
+                    }
+                    self.switch(cont);
+                    let iv = self.fb.load(idx_slot.clone(), IrType::I64);
+                    let inc = self.fb.bin(IrBin::Add, iv, Value::int(1, IrType::I64), IrType::I64);
+                    self.fb.store(idx_slot, inc);
+                    self.fb.br(head);
+                    self.switch(exit);
+                    self.scopes.pop();
+                    return;
+                }
                 // `for (name in coll)` over a List-like receiver — one with
                 // `Count() -> int` and `Get(int) -> T` (e.g. corlib `List<T>`).
                 // Lowered as an indexed loop: `for (i = 0; i < coll.Count();
