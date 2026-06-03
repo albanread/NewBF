@@ -114,6 +114,28 @@ class String {
 		return r;
 	}
 
+	static bool IsWs(char8 c) {
+		return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+	}
+	// A new String with leading and/or trailing ASCII whitespace removed.
+	public String Trim() {
+		int32 lo = 0;
+		while (lo < this.mLength && String.IsWs(this.mPtr[lo])) { lo = lo + 1; }
+		int32 hi = this.mLength;
+		while (hi > lo && String.IsWs(this.mPtr[hi - 1])) { hi = hi - 1; }
+		return this.Substring(lo, hi - lo);
+	}
+	public String TrimStart() {
+		int32 lo = 0;
+		while (lo < this.mLength && String.IsWs(this.mPtr[lo])) { lo = lo + 1; }
+		return this.Substring(lo, this.mLength - lo);
+	}
+	public String TrimEnd() {
+		int32 hi = this.mLength;
+		while (hi > 0 && String.IsWs(this.mPtr[hi - 1])) { hi = hi - 1; }
+		return this.Substring(0, hi);
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
