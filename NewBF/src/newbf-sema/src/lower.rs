@@ -4907,6 +4907,18 @@ impl<'a> Lowerer<'a> {
         // `Initializer` wrapping the construction. Allocate + run the ctor on the
         // inner base, then store each field through the new reference.
         if let Expr::Initializer { base, entries, .. } = operand {
+            // Array collection init `new T[N] { v0, v1, … }`: the entries are the
+            // element values, so build the array directly (the size from `[N]`, or
+            // the entry count).
+            if let Expr::Index {
+                base: ibase,
+                args: sz,
+                ..
+            } = &**base
+                && let Some(elem) = self.array_elem_ty(ibase, src)
+            {
+                return self.lower_array_new_init(elem, sz.first(), entries, src);
+            }
             let (obj, t) = self.lower_new(base, src);
             if let IrType::Ref(id) = t {
                 self.assign_init_fields(obj.clone(), id, entries, src);
