@@ -4408,6 +4408,23 @@ impl<'a> Lowerer<'a> {
         // stored value takes the place's type so later loads stay consistent.
         if let Some((slot, ty)) = self.lvalue(target, src) {
             let rhs = self.coerce(rhs, rhs_ty, ty);
+            // `a ??= b`: store `b` only when `a` is currently null; the result is
+            // the final value of `a`. (`b` is eagerly evaluated, as with the other
+            // compound forms.) Only the local/field slot path is handled here.
+            if matches!(op, AssignOp::NullCoalesce) {
+                let cur = self.fb.load(slot.clone(), ty);
+                let is_null = self.fb.cmp(CmpPred::Eq, cur.clone(), zero_of(ty));
+                let from = self.fb.current_block();
+                let assign_b = self.fb.create_block("nca.assign");
+                let join_b = self.fb.create_block("nca.join");
+                self.fb.cond_br(is_null, assign_b, join_b);
+                self.switch(assign_b);
+                self.fb.store(slot.clone(), rhs.clone());
+                self.fb.br(join_b);
+                self.switch(join_b);
+                let r = self.fb.phi(vec![(from, cur), (assign_b, rhs)], ty);
+                return (r, ty);
+            }
             let stored = match compound_op(op) {
                 Some(astbin) => {
                     let cur = self.fb.load(slot.clone(), ty);
