@@ -125,6 +125,10 @@ struct StructTable {
     /// everywhere is one struct, fields named "0", "1", …). A pre-pass over
     /// type positions registers them; `lower_ty_env` resolves a `Tuple` here.
     tuples: HashMap<String, StructId>,
+    /// Local (nested) functions: the declaration's name span → its emitted free-
+    /// function symbol. A pre-pass assigns each `$localfn{N}`; the body lowers it
+    /// and a same-method call resolves the name to a direct call.
+    local_fn_syms: HashMap<Span, String>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -1740,6 +1744,93 @@ fn collect_lambdas_stmt<'a>(
     }
 }
 
+/// A local (nested) function queued for emission as a free function:
+/// `(symbol, return type, params, body, src)`.
+type LocalFnEmit<'a> = (String, IrType, &'a [AstParam], &'a Stmt, &'a str);
+
+/// Collect non-generic local functions across all method bodies, assigning each
+/// a unique `$localfn{N}` symbol (recorded by name span so the call site and the
+/// emit pass agree) and queuing it for emission. Mirrors `collect_lambdas`.
+fn collect_local_fns<'a>(
+    items: &'a [Item],
+    src: &'a str,
+    structs: &mut StructTable,
+    emits: &mut Vec<LocalFnEmit<'a>>,
+) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_local_fns(body, src, structs, emits),
+            Item::Type(td) => {
+                for m in &td.members {
+                    let body = match m {
+                        Member::Method {
+                            body: MethodBody::Block(s),
+                            ..
+                        }
+                        | Member::Constructor {
+                            body: MethodBody::Block(s),
+                            ..
+                        }
+                        | Member::Destructor {
+                            body: MethodBody::Block(s),
+                            ..
+                        } => Some(s),
+                        _ => None,
+                    };
+                    if let Some(s) = body {
+                        collect_local_fns_stmt(s, src, structs, emits);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_local_fns_stmt<'a>(
+    stmt: &'a Stmt,
+    src: &'a str,
+    structs: &mut StructTable,
+    emits: &mut Vec<LocalFnEmit<'a>>,
+) {
+    match stmt {
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                collect_local_fns_stmt(s, src, structs, emits);
+            }
+        }
+        Stmt::LocalFunction {
+            return_ty,
+            name,
+            generic_params,
+            params,
+            body,
+            ..
+        } if generic_params.is_empty() => {
+            let sym = format!("$localfn{}", structs.local_fn_syms.len());
+            let ret = lower_ty_env(return_ty, src, structs, &[]);
+            structs.local_fn_syms.insert(*name, sym.clone());
+            emits.push((sym, ret, params, &**body, src));
+            // A local function's own body may contain nested locals.
+            collect_local_fns_stmt(body, src, structs, emits);
+        }
+        Stmt::If { then, els, .. } => {
+            collect_local_fns_stmt(then, src, structs, emits);
+            if let Some(e) = els {
+                collect_local_fns_stmt(e, src, structs, emits);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_local_fns_stmt(body, src, structs, emits),
+        _ => {}
+    }
+}
+
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Prepend the corlib prelude as source — parsed, then composed at the AST
     // and lowered once with the user program (STDLIB.md). The prelude units are
@@ -1772,6 +1863,10 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Collect anonymous lambdas (paramless, target-typed) before lowering: each
     // gets a `$lambdaN` symbol recorded by span (so `Expr::Lambda` lowers to its
     // address) and its body is queued to emit as a free function below.
+    let mut local_fn_emits: Vec<LocalFnEmit> = Vec::new();
+    for f in &all {
+        collect_local_fns(&f.unit.items, f.src, &mut structs, &mut local_fn_emits);
+    }
     let mut lambda_emits: Vec<LambdaEmit> = Vec::new();
     for f in &all {
         collect_lambdas(&f.unit.items, f.src, &mut structs, &mut lambda_emits);
@@ -1830,6 +1925,27 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs)
         };
         if let Some(func) = func {
+            m.add_function(func);
+        }
+    }
+    // Emit each local (nested) function as a plain free function under its
+    // `$localfn{N}` symbol. Non-capturing: the body lowers like a static method
+    // with its own params (no access to the enclosing method's locals).
+    for (sym, ret, params, body, lsrc) in &local_fn_emits {
+        let mb = MethodBody::Block((*body).clone());
+        let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+        if let Some(func) = lower_method(
+            sym.clone(),
+            *ret,
+            params,
+            &mb,
+            lsrc,
+            &empty,
+            &structs,
+            None,
+            &[],
+            &[],
+        ) {
             m.add_function(func);
         }
     }
@@ -2535,6 +2651,9 @@ struct Lowerer<'a> {
     /// own in reverse on normal exit; a `return` runs every pending scope's, all
     /// in reverse (LIFO), before the `ret`. Parallel to `scopes`.
     defers: Vec<Vec<Stmt>>,
+    /// In-scope local (nested) functions: name → (emitted symbol, return type,
+    /// parameter types). A bare call to one lowers to a direct call to its symbol.
+    local_fns: HashMap<String, (String, IrType, Vec<IrType>)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -2559,6 +2678,7 @@ impl<'a> Lowerer<'a> {
             closures: std::collections::HashSet::new(),
             array_locals: std::collections::HashSet::new(),
             defers: vec![Vec::new()],
+            local_fns: HashMap::new(),
         }
     }
 
@@ -3127,6 +3247,26 @@ impl<'a> Lowerer<'a> {
                     scope.push((**body).clone());
                 }
             }
+            // A local (nested) function: its body is emitted separately (the
+            // `$localfn{N}` symbol assigned in the pre-pass); here we just bring
+            // the name into scope so a bare call resolves to a direct call.
+            Stmt::LocalFunction {
+                return_ty,
+                name,
+                params,
+                generic_params,
+                ..
+            } if generic_params.is_empty() => {
+                if let Some(sym) = self.structs.local_fn_syms.get(name).cloned() {
+                    let ret = lower_ty_env(return_ty, src, self.structs, self.env);
+                    let ptys: Vec<IrType> = params
+                        .iter()
+                        .map(|p| param_ir_ty(p, src, self.structs, self.env))
+                        .collect();
+                    self.local_fns
+                        .insert(name.text(src).to_string(), (sym, ret, ptys));
+                }
+            }
             // local-function, mixin — not in the kernel yet. Skipped (no IR
             // emitted), never panicking.
             _ => {}
@@ -3466,6 +3606,16 @@ impl<'a> Lowerer<'a> {
                     args.iter().map(|a| self.arg_value(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
                     let name = s.text(src);
+                    // A local (nested) function in scope → a direct call to its
+                    // emitted `$localfn{N}` symbol, args coerced to its params.
+                    if let Some((sym, ret, ptys)) = self.local_fns.get(name).cloned() {
+                        let call_args: Vec<Value> = arg_vals
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (v, t))| self.coerce(v, t, ptys.get(i).copied().unwrap_or(t)))
+                            .collect();
+                        return (self.fb.call(sym, call_args, ret), ret);
+                    }
                     // A function-pointer local (`function R(P) f`): `f(args)`
                     // loads the code pointer and calls it indirectly.
                     if let Some((ret, ptys)) = self.fn_sigs.get(name).cloned()
