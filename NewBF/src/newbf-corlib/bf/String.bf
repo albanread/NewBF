@@ -158,6 +158,32 @@ class String {
 		return parts;
 	}
 
+	// A new String with every `from` replaced by `to`; length is unchanged.
+	public String Replace(char8 from, char8 to) {
+		String r = new String();
+		for (int32 i = 0; i < this.mLength; i++) {
+			char8 c = this.mPtr[i];
+			if (c == from) { c = to; }
+			r.Append(c);
+		}
+		return r;
+	}
+	// The number of times `c` occurs in the string.
+	public int32 Count(char8 c) {
+		int32 n = 0;
+		for (int32 i = 0; i < this.mLength; i++) {
+			if (this.mPtr[i] == c) { n = n + 1; }
+		}
+		return n;
+	}
+	// Index of the last occurrence of `c`, or -1 if not present.
+	public int32 LastIndexOf(char8 c) {
+		for (int32 i = this.mLength - 1; i >= 0; i--) {
+			if (this.mPtr[i] == c) { return i; }
+		}
+		return -1;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
