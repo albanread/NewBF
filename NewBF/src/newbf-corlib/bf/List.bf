@@ -21,6 +21,17 @@ class List<T> {
 	public int Count() { return this.mCount; }
 	public T Get(int i) { return this.mItems[i]; }
 
+	// A fresh heap `T[]` holding a copy of the elements (length = Count). The
+	// caller owns it. `new T[n]` sizes by `T`'s stride via the monomorph env, so
+	// the array is packed at the element width (4 bytes for `List<int32>`).
+	public T[] ToArray() {
+		T[] a = new T[this.mCount];
+		for (int i = 0; i < this.mCount; i++) {
+			a[i] = this.mItems[i];
+		}
+		return a;
+	}
+
 	// Indexer: `xs[i]` reads/writes the element in place (same as Get/Set, the
 	// idiomatic form). Assumes a valid index (caller-checked).
 	public T this[int i] {

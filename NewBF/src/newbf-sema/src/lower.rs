@@ -4740,13 +4740,17 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The element IR type of an array-`new` size expression `T[n]` whose `base`
-    /// names the element type `T` (a primitive or registered type). `None` if the
-    /// base isn't a bare type name.
+    /// names the element type `T`. Resolves a generic type-parameter through the
+    /// monomorph env first (so `new T[n]` inside `List<int32>` sizes by `i32`),
+    /// then registered types and primitives. `None` if the base isn't a bare name.
     fn array_elem_ty(&self, base: &Expr, src: &str) -> Option<IrType> {
         match base {
             Expr::Paren { inner, .. } => self.array_elem_ty(inner, src),
             Expr::Ident(s) => {
                 let name = s.text(src);
+                if let Some((_, t)) = self.env.iter().find(|(n, _)| n.as_str() == name) {
+                    return Some(*t);
+                }
                 Some(self.structs.ty_of(name).unwrap_or_else(|| primitive(name)))
             }
             _ => None,
