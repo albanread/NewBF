@@ -2525,6 +2525,10 @@ struct Lowerer<'a> {
     /// the elements; the length is stored in the 8 bytes just *before* it, so
     /// `a[i]` reuses the typed-pointer index path and `a.Count` loads `ptr[-1]`.
     array_locals: std::collections::HashSet<String>,
+    /// Per-block stacks of `defer`red statement bodies (cloned). A block runs its
+    /// own in reverse on normal exit; a `return` runs every pending scope's, all
+    /// in reverse (LIFO), before the `ret`. Parallel to `scopes`.
+    defers: Vec<Vec<Stmt>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -2548,6 +2552,7 @@ impl<'a> Lowerer<'a> {
             fn_sigs: HashMap::new(),
             closures: std::collections::HashSet::new(),
             array_locals: std::collections::HashSet::new(),
+            defers: vec![Vec::new()],
         }
     }
 
@@ -2606,12 +2611,20 @@ impl<'a> Lowerer<'a> {
         match s {
             Stmt::Block { stmts, .. } => {
                 self.scopes.push(HashMap::new());
+                self.defers.push(Vec::new());
                 for st in stmts {
                     self.stmt(st, src);
                     if self.terminated {
                         break;
                     }
                 }
+                // Normal exit (fall-through): run this block's `defer`s in reverse.
+                // If a `return`/`break` already terminated the block, it ran the
+                // defers itself, so skip here.
+                if !self.terminated {
+                    self.run_block_defers(src);
+                }
+                self.defers.pop();
                 self.scopes.pop();
             }
             Stmt::Expr { expr, .. } => {
@@ -2704,6 +2717,10 @@ impl<'a> Lowerer<'a> {
                         self.coerce(v, t, self.ret_ty)
                     })
                 };
+                // The return value is captured (above) *before* `defer`s run, so a
+                // deferred mutation can't change it — then unwind every pending
+                // defer (LIFO) before the actual `ret`.
+                self.run_all_defers(src);
                 self.ret(v);
             }
             Stmt::If {
@@ -3043,10 +3060,50 @@ impl<'a> Lowerer<'a> {
                 self.loops.pop();
                 self.switch(exit);
             }
-            // foreach (needs iterators), defer (scope-exit ordering),
-            // local-function — not in the kernel yet. Skipped (no IR emitted),
-            // never panicking.
+            // `defer stmt;` — queue the statement to run at the enclosing block's
+            // exit (in reverse declaration order). The body is cloned so it can be
+            // lowered later when the scope closes (or a `return` unwinds it).
+            Stmt::Defer { body, .. } => {
+                if let Some(scope) = self.defers.last_mut() {
+                    scope.push((**body).clone());
+                }
+            }
+            // local-function, mixin — not in the kernel yet. Skipped (no IR
+            // emitted), never panicking.
             _ => {}
+        }
+    }
+
+    /// Run the current block's `defer`s in reverse declaration order (LIFO). The
+    /// block's variable scope is still live, so the deferred code can still see
+    /// its locals.
+    fn run_block_defers(&mut self, src: &str) {
+        let pending: Vec<Stmt> = match self.defers.last() {
+            Some(scope) => scope.iter().rev().cloned().collect(),
+            None => return,
+        };
+        for s in &pending {
+            self.stmt(s, src);
+            if self.terminated {
+                break;
+            }
+        }
+    }
+
+    /// Run *every* pending `defer` across all open scopes before a `return` —
+    /// innermost scope first, and within each scope reverse declaration order.
+    fn run_all_defers(&mut self, src: &str) {
+        let pending: Vec<Stmt> = self
+            .defers
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.iter().rev().cloned())
+            .collect();
+        for s in &pending {
+            self.stmt(s, src);
+            if self.terminated {
+                return;
+            }
         }
     }
 
