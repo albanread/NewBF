@@ -3588,6 +3588,17 @@ impl<'a> Lowerer<'a> {
                         return (r, sig.ret);
                     }
                 }
+                // Null-conditional call `a?.M(args)`: null-guard the whole call
+                // (the result is the method's default when `a` is null).
+                if let Expr::Member {
+                    base,
+                    name,
+                    conditional: true,
+                    ..
+                } = &**callee
+                {
+                    return self.lower_conditional_call(base, name.text(src), args, src);
+                }
                 // Method call on a receiver: `obj.Method(args)` / `this.M(args)`.
                 if let Expr::Member { base, name, .. } = &**callee {
                     // `Enum.Case(payload)` for a payload enum constructs its struct.
@@ -5109,6 +5120,40 @@ impl<'a> Lowerer<'a> {
         (r, fty)
     }
 
+    /// `a?.M(args)` — null-guard a method call. Evaluates `a` once for the null
+    /// test; the non-null branch performs the ordinary call (which re-resolves the
+    /// receiver — safe because `?.` is only short-circuited for a side-effect-free
+    /// base: an identifier, `this`, or a member/index chain). The result joins the
+    /// method's default on the null path. A `void` method needs no value.
+    fn lower_conditional_call(
+        &mut self,
+        base: &Expr,
+        mname: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        let (bv, bt) = self.expr(base, src);
+        if !matches!(bt, IrType::Ref(_)) || !is_idempotent(base) {
+            // Can't null-guard (non-reference or effectful base) — call plainly.
+            return self.lower_method_call(base, mname, args, src);
+        }
+        let is_null = self.fb.cmp(CmpPred::Eq, bv, Value::Const(Const::Null));
+        let entry = self.fb.current_block();
+        let nonnull_b = self.fb.create_block("qcall.nonnull");
+        let join_b = self.fb.create_block("qcall.join");
+        self.fb.cond_br(is_null, join_b, nonnull_b);
+        self.switch(nonnull_b);
+        let (rv, rty) = self.lower_method_call(base, mname, args, src);
+        let nn_end = self.fb.current_block();
+        self.fb.br(join_b);
+        self.switch(join_b);
+        if rty == IrType::Void {
+            return (Value::Const(Const::Undef(IrType::Void)), IrType::Void);
+        }
+        let r = self.fb.phi(vec![(entry, zero_of(rty)), (nn_end, rv)], rty);
+        (r, rty)
+    }
+
     /// Read field `name` directly from an already-evaluated base value (used when
     /// a `?.` base turns out to be non-null-able or the member isn't a field).
     fn member_field_on(&mut self, bv: Value, bt: IrType, name: &str) -> (Value, IrType) {
@@ -5519,6 +5564,19 @@ fn compound_op(op: AssignOp) -> Option<AstBin> {
         AssignOp::Shr => AstBin::Shr,
         AssignOp::NullCoalesce => return None,
     })
+}
+
+/// Whether evaluating `e` twice is safe (no side effects / no allocation): a bare
+/// identifier, `this`, or a member/index/paren chain over such. Used to decide
+/// whether a `?.M()` can re-evaluate its receiver in the non-null branch.
+fn is_idempotent(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(_) | Expr::This(_) => true,
+        Expr::Paren { inner, .. } => is_idempotent(inner),
+        Expr::Member { base, .. } => is_idempotent(base),
+        Expr::Index { base, args, .. } => is_idempotent(base) && args.iter().all(is_idempotent),
+        _ => false,
+    }
 }
 
 fn zero_of(ty: IrType) -> Value {
