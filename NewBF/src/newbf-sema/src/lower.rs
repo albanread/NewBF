@@ -4932,6 +4932,21 @@ impl<'a> Lowerer<'a> {
                     .global_addr(vtable_name(&self.structs.prefixes[id.0 as usize]))
             };
             self.fb.store(hdr, header);
+            // Implicitly chain the parameterless base constructors, root-first, so
+            // inherited fields are initialized before this class's own ctor runs.
+            // (Explicit `: base(args)` chaining isn't parsed yet, so every ctor is
+            // implicit — this is the whole chain.)
+            let mut chain: Vec<StructId> = Vec::new();
+            let mut bid = self.structs.bases[id.0 as usize];
+            while let Some(b) = bid {
+                chain.push(b);
+                bid = self.structs.bases[b.0 as usize];
+            }
+            for &b in chain.iter().rev() {
+                if let Some(ctor) = self.structs.ctor_for(b, 0) {
+                    self.fb.call(ctor.full_name, vec![p.clone()], IrType::Void);
+                }
+            }
             // Run the constructor overload matching the argument count; coercion
             // makes each arg its declared param type.
             let args = ctor_args(operand);
