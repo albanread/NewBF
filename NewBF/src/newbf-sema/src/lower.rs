@@ -24,8 +24,8 @@ use newbf_ir::{
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
     AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody,
-    Modifier, Param as AstParam, PrefixKw, Stmt, SwitchArm, Type as AstType, TypeDecl, TypeKind,
-    UnOp, parse_file,
+    Modifier, Param as AstParam, ParamModifier, PrefixKw, Stmt, SwitchArm, Type as AstType,
+    TypeDecl, TypeKind, UnOp, parse_file,
 };
 
 use crate::Program;
@@ -1343,7 +1343,7 @@ fn fill_members_at(
                 let nm = name.text(src).to_string();
                 let explicit: Vec<IrType> = params
                     .iter()
-                    .map(|p| lower_ty_env(&p.ty, src, t, env))
+                    .map(|p| param_ir_ty(p, src, t, env))
                     .collect();
                 // An `abstract` instance method is body-less but reserves a
                 // vtable slot a derived `override` fills; it mangles like a real
@@ -1947,7 +1947,7 @@ fn lower_type_at(
                 // to the plain name for unregistered types (generics/interfaces).
                 let explicit: Vec<IrType> = params
                     .iter()
-                    .map(|p| lower_ty_env(&p.ty, src, structs, env))
+                    .map(|p| param_ir_ty(p, src, structs, env))
                     .collect();
                 let full_name = sigs
                     .get(name.text(src))
@@ -2196,7 +2196,7 @@ fn lower_method(
     }
     ir_params.extend(params.iter().map(|p| IrParam {
         name: p.name.map(|s| s.text(src).to_string()),
-        ty: lower_ty_env(&p.ty, src, structs, env),
+        ty: param_ir_ty(p, src, structs, env),
     }));
     // Pre-named params with no source span (e.g. a setter's implicit `value`).
     ir_params.extend(extra.iter().map(|(n, t)| IrParam {
@@ -2219,6 +2219,21 @@ fn lower_method(
     // reads are `load`s and assignments just `store` (LLVM mem2reg cleans up).
     for (i, p) in params.iter().enumerate() {
         if let Some(nm) = &p.name {
+            // A `ref`/`out` parameter arrives as a pointer to the caller's
+            // storage (`Param` is already `Ptr`). Bind the name straight to that
+            // pointer — no entry spill — so reads `load` and writes `store` go
+            // *through* it, mutating the caller's variable. The bound value type
+            // is the pointee, so an ordinary read/assign sees the value.
+            if is_by_ref(p) {
+                let pointee = lower_ty_env(&p.ty, src, structs, env);
+                lw.bind(
+                    nm.text(src),
+                    Value::Param((i + base) as u32),
+                    pointee,
+                    None,
+                );
+                continue;
+            }
             let ty = lower_ty_env(&p.ty, src, structs, env);
             let elem = pointer_elem_env(&p.ty, src, structs, env);
             let slot = lw.fb.alloca(ty);
@@ -3172,7 +3187,7 @@ impl<'a> Lowerer<'a> {
                     return r;
                 }
                 let arg_vals: Vec<(Value, IrType)> =
-                    args.iter().map(|a| self.expr(a, src)).collect();
+                    args.iter().map(|a| self.arg_value(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
                     let name = s.text(src);
                     // A function-pointer local (`function R(P) f`): `f(args)`
@@ -4326,6 +4341,23 @@ impl<'a> Lowerer<'a> {
     /// type, looks up the method (this-aware), and emits a direct call — passing
     /// the receiver as `this` for an instance method. Degrades (evaluating args
     /// for their effects) when the method can't be resolved.
+    /// Lower a call argument. A `ref`/`out` argument is passed *by address*: the
+    /// operand's lvalue (a pointer to its storage) becomes the argument value
+    /// (typed `Ptr`), so the callee — whose matching param is also `Ptr` — can
+    /// mutate the caller's variable. Every other argument is an ordinary value.
+    fn arg_value(&mut self, a: &Expr, src: &str) -> (Value, IrType) {
+        if let Expr::Prefix {
+            kw: PrefixKw::Ref | PrefixKw::Out,
+            operand,
+            ..
+        } = a
+            && let Some((addr, _)) = self.lvalue(operand, src)
+        {
+            return (addr, IrType::Ptr);
+        }
+        self.expr(a, src)
+    }
+
     fn lower_method_call(
         &mut self,
         base: &Expr,
@@ -4337,7 +4369,7 @@ impl<'a> Lowerer<'a> {
         // values feed whichever site resolves. (Static and instance sites are
         // mutually exclusive — a type name isn't a receiver and vice versa — so
         // there's no double-emit.)
-        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.expr(a, src)).collect();
+        let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.arg_value(a, src)).collect();
         let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
 
         // Qualified static call `Type.Method(args)`: the base names a registered
@@ -4862,6 +4894,29 @@ fn pointer_elem_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) 
 /// A generic type-parameter environment: param name → the concrete IR type it
 /// was monomorphized to. Empty for ordinary (non-generic) lowering.
 type TyEnv<'a> = &'a [(String, IrType)];
+
+/// Whether a parameter is passed by reference (`ref`/`out`): the caller passes
+/// the address of an lvalue and the callee reads/writes through it. `ref` and
+/// `out` are identical at the IR level — both a pointer to the caller's
+/// storage; `out`'s definite-assignment requirement isn't enforced yet.
+fn is_by_ref(p: &AstParam) -> bool {
+    matches!(
+        p.modifier,
+        Some((ParamModifier::Ref | ParamModifier::Out, _))
+    )
+}
+
+/// A parameter's IR type in ABI order: a by-ref (`ref`/`out`) parameter is a
+/// raw pointer to the caller's storage; any other is its value type. Used at
+/// every signature-building site so the mangled symbol and the call's coercions
+/// agree on the pointer shape.
+fn param_ir_ty(p: &AstParam, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
+    if is_by_ref(p) {
+        IrType::Ptr
+    } else {
+        lower_ty_env(&p.ty, src, structs, env)
+    }
+}
 
 /// The monomorphized symbol name of a generic instantiation: `Box<int>` →
 /// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
