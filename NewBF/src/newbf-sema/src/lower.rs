@@ -5171,15 +5171,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Store each `field = value` initializer entry into the object at `obj` (a
-    /// pointer to the struct body / the class reference). Entries that aren't a
-    /// `name = value` over a known field are ignored.
+    /// Apply each initializer entry to the object at `obj` (a pointer to the
+    /// struct body / the class reference). A `field = value` entry stores into the
+    /// matching field (an object initializer); a bare value entry is added via the
+    /// type's `Add` method when it has one (a collection initializer, e.g.
+    /// `new List<int>() { 1, 2, 3 }`). Unrecognized entries are ignored.
     fn assign_init_fields(&mut self, obj: Value, id: StructId, entries: &[Expr], src: &str) {
         let fields: Vec<(String, IrType)> = self.structs.defs[id.0 as usize]
             .fields
             .iter()
             .map(|f| (f.name.clone(), f.ty))
             .collect();
+        let add_sigs = self.structs.methods[id.0 as usize].get("Add").cloned();
         for entry in entries {
             if let Expr::Assign { target: tgt, value, .. } = entry
                 && let Expr::Ident(nm) = &**tgt
@@ -5189,6 +5192,13 @@ impl<'a> Lowerer<'a> {
                 let cv = self.coerce(v, vt, fields[i].1);
                 let fp = self.fb.field_addr(obj.clone(), id, i as u32);
                 self.fb.store(fp, cv);
+            } else if let Some(cands) = &add_sigs {
+                // Collection initializer: `obj.Add(entry)`.
+                let (v, vt) = self.expr(entry, src);
+                if let Some(sig) = pick_overload(cands, &[vt], true).cloned() {
+                    let arg = self.coerce(v, vt, sig.params[1]);
+                    self.fb.call(sig.full_name, vec![obj.clone(), arg], sig.ret);
+                }
             }
         }
     }
