@@ -5268,6 +5268,33 @@ impl<'a> Lowerer<'a> {
         let arg_vals: Vec<(Value, IrType)> = args.iter().map(|a| self.arg_value(a, src)).collect();
         let arg_tys: Vec<IrType> = arg_vals.iter().map(|(_, t)| *t).collect();
 
+        // `base.Method(args)`: a *direct* (non-virtual) call to the nearest base
+        // class's implementation of `Method`, with the current `this` as receiver
+        // — so an `override` can chain to the parent without re-dispatching to
+        // itself. Walks up the `bases` chain from the enclosing type.
+        if let Expr::Base(_) = base
+            && let Some((slot, this_ty @ IrType::Ref(cur_id))) = self.this_slot.clone()
+        {
+            let mut bid = self.structs.bases[cur_id.0 as usize];
+            while let Some(id) = bid {
+                if let Some(sig) = self.structs.methods[id.0 as usize]
+                    .get(mname)
+                    .and_then(|cands| pick_overload(cands, &arg_tys, true))
+                    .cloned()
+                {
+                    let this_v = self.fb.load(slot, this_ty);
+                    let mut call_args = vec![this_v];
+                    for (i, (v, t)) in arg_vals.into_iter().enumerate() {
+                        let pt = sig.params.get(i + 1).copied().unwrap_or(t);
+                        call_args.push(self.coerce(v, t, pt));
+                    }
+                    let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                    return (r, sig.ret);
+                }
+                bid = self.structs.bases[id.0 as usize];
+            }
+        }
+
         // Qualified static call `Type.Method(args)`: the base names a registered
         // type (not a local). `members: false` keeps only static overloads.
         if let Expr::Ident(s) = base {
