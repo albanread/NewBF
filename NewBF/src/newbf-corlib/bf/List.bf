@@ -104,6 +104,22 @@ class List<T> {
 		}
 	}
 
+	// In-place ascending insertion sort using `<` on the element type. Stable and
+	// O(n^2) — fine for the small lists corlib v1 targets. Requires `T` to support
+	// `<` (any numeric element does); a comparable-constraint comes with the
+	// generic-constraint sprint.
+	public void Sort() {
+		for (int i = 1; i < this.mCount; i++) {
+			T key = this.mItems[i];
+			int j = i - 1;
+			while (j >= 0 && key < this.mItems[j]) {
+				this.mItems[j + 1] = this.mItems[j];
+				j = j - 1;
+			}
+			this.mItems[j + 1] = key;
+		}
+	}
+
 	void Grow() {
 		int nc = this.mCap * 2;
 		T* nb = Internal.Malloc(nc * 8);
