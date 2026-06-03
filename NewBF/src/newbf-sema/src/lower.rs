@@ -2792,6 +2792,7 @@ impl<'a> Lowerer<'a> {
                             .and_then(|target| {
                                 self.try_target_typed_enum(target, e, src)
                                     .or_else(|| self.try_target_typed_tuple(target, e, src))
+                                    .or_else(|| self.try_target_typed_initializer(target, e, src))
                             })
                             .unwrap_or_else(|| self.expr(e, src));
                         (Some(v), Some(t))
@@ -3538,6 +3539,10 @@ impl<'a> Lowerer<'a> {
             Expr::Tuple { elems, .. } => self
                 .build_tuple(None, elems, src)
                 .unwrap_or((undef(IrType::I64), IrType::I64)),
+            // Object/collection initializer with no target (`new T() { … }` or
+            // `Type { … }`): the base supplies the object; `.{ … }` needs a target
+            // (handled in `Stmt::Local`), so without one it degrades to the base.
+            Expr::Initializer { base, entries, .. } => self.lower_initializer(base, entries, None, src),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
@@ -4898,6 +4903,16 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_new(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
+        // Object initializer `new T(args) { field = value, … }`: the operand is an
+        // `Initializer` wrapping the construction. Allocate + run the ctor on the
+        // inner base, then store each field through the new reference.
+        if let Expr::Initializer { base, entries, .. } = operand {
+            let (obj, t) = self.lower_new(base, src);
+            if let IrType::Ref(id) = t {
+                self.assign_init_fields(obj.clone(), id, entries, src);
+            }
+            return (obj, t);
+        }
         // Array allocation `new T[n]`: the operand is an `Index` whose base names
         // the element type. (A user-indexer `new` would have a *value* base, not a
         // type name, so `array_elem_ty` returning `Some` discriminates.)
@@ -5083,6 +5098,87 @@ impl<'a> Lowerer<'a> {
             self.fb.store(fp, cv);
         }
         Some((self.fb.load(slot, ty), ty))
+    }
+
+    /// A target-typed `.{ field = value }` initializer on a `Stmt::Local` whose
+    /// declared type is `target`. `None` if the init isn't an `Initializer`.
+    fn try_target_typed_initializer(
+        &mut self,
+        target: IrType,
+        e: &Expr,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        if let Expr::Initializer { base, entries, .. } = e {
+            return Some(self.lower_initializer(base, entries, Some(target), src));
+        }
+        None
+    }
+
+    /// Lower an object/collection initializer: obtain the object (a fresh value-
+    /// struct slot for a target-typed `.{ }`, or the reference/struct the `base`
+    /// evaluates to — e.g. `new T()`), then store each `field = value` entry into
+    /// the matching field. Returns the initialized value (the struct, or the ref).
+    fn lower_initializer(
+        &mut self,
+        base: &Expr,
+        entries: &[Expr],
+        target: Option<IrType>,
+        src: &str,
+    ) -> (Value, IrType) {
+        // Resolve the object to write into: `(write-pointer, struct id, is value
+        // struct)`. A `.{ }` (DotIdent base) target-types to `target`; otherwise
+        // the base is evaluated (a class ref writes in place; a struct value is
+        // spilled to a slot so its fields are addressable).
+        let (obj, id, is_value) = if matches!(base, Expr::DotIdent { .. }) {
+            match target {
+                Some(IrType::Struct(id)) => (self.fb.alloca(IrType::Struct(id)), id, true),
+                Some(IrType::Ref(id)) => {
+                    let (v, _) = self.expr(base, src);
+                    let _ = v;
+                    return (undef(IrType::Ref(id)), IrType::Ref(id));
+                }
+                _ => return (undef(IrType::I64), IrType::I64),
+            }
+        } else {
+            let (v, t) = self.expr(base, src);
+            match t {
+                IrType::Ref(id) => (v, id, false),
+                IrType::Struct(id) => {
+                    let slot = self.fb.alloca(t);
+                    self.fb.store(slot.clone(), v);
+                    (slot, id, true)
+                }
+                _ => return (v, t),
+            }
+        };
+        self.assign_init_fields(obj.clone(), id, entries, src);
+        if is_value {
+            (self.fb.load(obj, IrType::Struct(id)), IrType::Struct(id))
+        } else {
+            (obj, IrType::Ref(id))
+        }
+    }
+
+    /// Store each `field = value` initializer entry into the object at `obj` (a
+    /// pointer to the struct body / the class reference). Entries that aren't a
+    /// `name = value` over a known field are ignored.
+    fn assign_init_fields(&mut self, obj: Value, id: StructId, entries: &[Expr], src: &str) {
+        let fields: Vec<(String, IrType)> = self.structs.defs[id.0 as usize]
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty))
+            .collect();
+        for entry in entries {
+            if let Expr::Assign { target: tgt, value, .. } = entry
+                && let Expr::Ident(nm) = &**tgt
+                && let Some(i) = fields.iter().position(|(n, _)| n == nm.text(src))
+            {
+                let (v, vt) = self.expr(value, src);
+                let cv = self.coerce(v, vt, fields[i].1);
+                let fp = self.fb.field_addr(obj.clone(), id, i as u32);
+                self.fb.store(fp, cv);
+            }
+        }
     }
 
     /// Lower a call argument. A `ref`/`out` argument is passed *by address*: the

@@ -137,6 +137,15 @@ mod tests {
                 s.push(')');
                 s
             }
+            Expr::Initializer { base, entries, .. } => {
+                let mut s = format!("(init {}", sx(src, base));
+                for e in entries {
+                    s.push(' ');
+                    s.push_str(&sx(src, e));
+                }
+                s.push(')');
+                s
+            }
             Expr::Lambda { body, .. } => format!("(lambda {})", sxs(src, body)),
             Expr::Named { name, value, .. } => {
                 format!("(named {} {})", name.text(src), sx(src, value))
@@ -410,11 +419,24 @@ mod tests {
 
     #[test]
     fn object_initializers() {
-        // Initializer is consumed and dropped for now, so the expr is just
-        // the constructed value — but it must parse without diagnostics.
-        assert_eq!(ok("StructB { mA = 2 }"), "StructB");
-        assert_eq!(ok("new Foo() { mA = 1, mB = 2 }"), "(new (call Foo))");
-        assert_eq!(ok("new int[3] { 1, 2, 3 }"), "(new (index int 3))");
+        // A postfix initializer (`Type { … }`, `.{ … }`) is now captured as an
+        // `Initializer` wrapping the base, with each `field = value` entry. The
+        // `new …` prefix form still drops its initializer (a later sprint).
+        assert_eq!(ok("StructB { mA = 2 }"), "(init StructB (= mA 2))");
+        assert_eq!(ok(".{ mA = 1, mB = 2 }"), "(init .. (= mA 1) (= mB 2))");
+        // `new T(args) { … }`: the initializer rides on the `new` operand (parsed
+        // as a postfix expression), so it's captured inside the `new`.
+        assert_eq!(
+            ok("new Foo() { mA = 1, mB = 2 }"),
+            "(new (init (call Foo) (= mA 1) (= mB 2)))"
+        );
+        // `new int[3] { … }` captures the collection initializer too (its bare
+        // entries aren't applied to the elements yet — the `new int[]( … )` paren
+        // form is the working array initializer).
+        assert_eq!(
+            ok("new int[3] { 1, 2, 3 }"),
+            "(new (init (index int 3) 1 2 3))"
+        );
         // A bare `Ident` followed by a block-shaped `{` is NOT an initializer.
         assert_eq!(ok_stmt("x;"), "(expr x)");
     }

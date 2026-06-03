@@ -204,6 +204,13 @@ impl Printer<'_> {
                     self.expr(e, d + 1);
                 }
             }
+            Expr::Initializer { base, entries, .. } => {
+                self.line(d, "Initializer");
+                self.expr(base, d + 1);
+                for e in entries {
+                    self.expr(e, d + 1);
+                }
+            }
             Expr::Lambda { body, .. } => {
                 self.line(d, "Lambda");
                 self.stmt(body, d + 1);

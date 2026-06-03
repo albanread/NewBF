@@ -315,6 +315,15 @@ pub enum Expr {
         span: Span,
         elems: Vec<Expr>,
     },
+    /// An object/collection initializer applied to a base: `new T() { a = 1 }`,
+    /// `.{ a = 1, b = 2 }`, `Type { a = 1 }`. `entries` holds each captured
+    /// element expression (a field set `a = 1` is an [`Expr::Assign`]); complex
+    /// member-declaration bodies are captured as no entries.
+    Initializer {
+        span: Span,
+        base: Box<Expr>,
+        entries: Vec<Expr>,
+    },
     /// A lambda / closure: `x => e`, `(a, b) => e`, `=> { … }`. The
     /// parameters are parsed and discarded for now; `body` is retained.
     Lambda {
@@ -365,6 +374,7 @@ impl Expr {
             | Expr::SizeOf { span, .. }
             | Expr::DotIdent { span, .. }
             | Expr::Tuple { span, .. }
+            | Expr::Initializer { span, .. }
             | Expr::Lambda { span, .. }
             | Expr::Named { span, .. } => *span,
         }

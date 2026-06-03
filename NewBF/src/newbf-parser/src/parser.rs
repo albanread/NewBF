@@ -586,7 +586,14 @@ impl<'a> Parser<'a> {
                 // records it). Control-flow bodies never reach here — their
                 // conditions are parenthesised, so the `{` follows the `)`.
                 TokenKind::LBrace if !self.suppress_init && self.initializer_follows(&e) => {
-                    self.consume_initializer();
+                    let entries = self.consume_initializer();
+                    if !entries.is_empty() {
+                        e = Expr::Initializer {
+                            span: self.finish(lo),
+                            base: Box::new(e),
+                            entries,
+                        };
+                    }
                 }
                 _ => break,
             }
@@ -707,10 +714,12 @@ impl<'a> Parser<'a> {
         names
     }
 
-    /// Consume an object/collection initializer `{ a = 1, b, … }`
-    /// (contents discarded for now — recovered in sema). Assumes the
-    /// current token is `{`.
-    fn consume_initializer(&mut self) {
+    /// Consume an object/collection initializer `{ a = 1, b, … }`, returning each
+    /// captured element expression (a field set `a = 1` is an [`Expr::Assign`]).
+    /// A complex member-declaration body (`{ public int mB = 5; }`) captures no
+    /// entries (it's skipped). Assumes the current token is `{`.
+    fn consume_initializer(&mut self) -> Vec<Expr> {
+        let mut entries: Vec<Expr> = Vec::new();
         self.bump(); // {
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let before = self.pos;
@@ -754,7 +763,7 @@ impl<'a> Parser<'a> {
                     let _ = self.expr();
                 }
             } else {
-                let _ = self.expr();
+                entries.push(self.expr());
             }
             if !self.eat(TokenKind::Comma) {
                 // Object/collection elements are comma-separated and end at
@@ -785,6 +794,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RBrace, "`}` to close initializer");
+        entries
     }
 
     fn arg_list(&mut self, close: TokenKind) -> Vec<Expr> {
