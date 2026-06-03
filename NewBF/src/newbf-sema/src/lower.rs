@@ -3525,6 +3525,14 @@ impl<'a> Lowerer<'a> {
                 operand,
                 ..
             } => self.lower_delete(operand, src),
+            // Null-conditional member read `a?.field`: evaluate `a` once and
+            // null-guard the field load (yields the field's default when null).
+            Expr::Member {
+                base,
+                name,
+                conditional: true,
+                ..
+            } => self.lower_conditional_member(base, name.text(src), src),
             // Member read (`obj.field` / `ref.field`): load the resolved field;
             // degrade if the base isn't a known struct/reference place.
             Expr::Member { base, name, .. } => {
@@ -4818,6 +4826,73 @@ impl<'a> Lowerer<'a> {
             return (addr, IrType::Ptr);
         }
         self.expr(a, src)
+    }
+
+    /// `a?.field` — evaluate `a` once; if it's null the result is the field's
+    /// default (`null`/`0`), else `a.field`. Lowered as a null test + branch with
+    /// a phi join. Exactly right for a reference-typed field (null default); for a
+    /// value field it yields `0` rather than Beef's `T?` (a documented
+    /// simplification). Falls back to a plain read if `a` isn't a reference or the
+    /// member isn't a stored field.
+    fn lower_conditional_member(&mut self, base: &Expr, name: &str, src: &str) -> (Value, IrType) {
+        let (bv, bt) = self.expr(base, src);
+        let IrType::Ref(id) = bt else {
+            // Non-reference base can't be null here — read the member plainly.
+            return self.member_field_on(bv, bt, name);
+        };
+        // Resolve the field's index + type from the reference's layout.
+        let field = self.structs.defs[id.0 as usize]
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| (i as u32, self.structs.defs[id.0 as usize].fields[i].ty));
+        let Some((idx, fty)) = field else {
+            // Not a plain field (a property/method) — degrade to a guarded plain
+            // read isn't worth it; just read non-conditionally on the value.
+            return self.member_field_on(bv, bt, name);
+        };
+        let is_null = self.fb.cmp(CmpPred::Eq, bv.clone(), Value::Const(Const::Null));
+        let entry = self.fb.current_block();
+        let nonnull_b = self.fb.create_block("qdot.nonnull");
+        let join_b = self.fb.create_block("qdot.join");
+        self.fb.cond_br(is_null, join_b, nonnull_b);
+        self.switch(nonnull_b);
+        let fp = self.fb.field_addr(bv, id, idx);
+        let v = self.fb.load(fp, fty);
+        let nn_end = self.fb.current_block();
+        self.fb.br(join_b);
+        self.switch(join_b);
+        let r = self
+            .fb
+            .phi(vec![(entry, zero_of(fty)), (nn_end, v)], fty);
+        (r, fty)
+    }
+
+    /// Read field `name` directly from an already-evaluated base value (used when
+    /// a `?.` base turns out to be non-null-able or the member isn't a field).
+    fn member_field_on(&mut self, bv: Value, bt: IrType, name: &str) -> (Value, IrType) {
+        let id = match bt {
+            IrType::Ref(id) | IrType::Struct(id) => id,
+            _ => return (undef(IrType::I64), IrType::I64),
+        };
+        let body = if matches!(bt, IrType::Ref(_)) {
+            bv
+        } else {
+            // A struct value has no address here; defaulting keeps the IR valid.
+            return (undef(IrType::I64), IrType::I64);
+        };
+        match self.structs.defs[id.0 as usize]
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+        {
+            Some(i) => {
+                let fty = self.structs.defs[id.0 as usize].fields[i].ty;
+                let fp = self.fb.field_addr(body, id, i as u32);
+                (self.fb.load(fp, fty), fty)
+            }
+            None => (undef(IrType::I64), IrType::I64),
+        }
     }
 
     fn lower_method_call(
