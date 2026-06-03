@@ -4564,24 +4564,56 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `new T[n]` → a length-prefixed heap block: `malloc(8 + n·sizeof(T))`, store
-    /// the length `n` in the first 8 bytes, and yield a pointer to the *elements*
-    /// (8 bytes past the block). So `a[i]` is an ordinary typed-pointer index and
-    /// `a.Count` reads `ptr[-1]`. Returns `(elements_ptr, Ptr)`.
-    fn lower_array_new(&mut self, elem: IrType, len: &Expr, src: &str) -> (Value, IrType) {
-        let (lv, lt) = self.expr(len, src);
-        let n = self.coerce(lv, lt, IrType::I64);
+    /// Allocate a length-prefixed array block of `count` elements of type `elem`:
+    /// `malloc(8 + count·sizeof(elem))`, store the length in the first 8 bytes,
+    /// and yield a pointer to the *elements* (8 bytes past the block). So `a[i]`
+    /// is an ordinary typed-pointer index and `a.Count` reads `ptr[-1]`.
+    fn alloc_array(&mut self, count: Value, elem: IrType) -> Value {
         let esz = self.size_of_ty(elem);
-        let bytes = self.fb.bin(IrBin::Mul, n.clone(), esz, IrType::I64);
+        let bytes = self.fb.bin(IrBin::Mul, count.clone(), esz, IrType::I64);
         let total = self
             .fb
             .bin(IrBin::Add, bytes, Value::int(8, IrType::I64), IrType::I64);
         let block = self.fb.call("malloc", vec![total], IrType::Ptr);
-        // Length header in the first 8 bytes, then the elements at block + 8.
-        self.fb.store(block.clone(), n);
-        let elems = self
-            .fb
-            .elem_addr(block, IrType::U8, Value::int(8, IrType::I64));
+        self.fb.store(block.clone(), count);
+        self.fb
+            .elem_addr(block, IrType::U8, Value::int(8, IrType::I64))
+    }
+
+    /// `new T[n]` → an `n`-element heap array (elements indeterminate).
+    fn lower_array_new(&mut self, elem: IrType, len: &Expr, src: &str) -> (Value, IrType) {
+        let (lv, lt) = self.expr(len, src);
+        let n = self.coerce(lv, lt, IrType::I64);
+        (self.alloc_array(n, elem), IrType::Ptr)
+    }
+
+    /// `new T[](v0, v1, …)` / `new T[N](v0, …)` — an array initializer. The count
+    /// is the explicit size if present, else the number of values; each value is
+    /// stored into its element slot (coerced to `T`). Slots past the value list
+    /// (when `N` exceeds the value count) are left indeterminate.
+    fn lower_array_new_init(
+        &mut self,
+        elem: IrType,
+        size: Option<&Expr>,
+        values: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        let count = match size {
+            Some(e) => {
+                let (v, t) = self.expr(e, src);
+                self.coerce(v, t, IrType::I64)
+            }
+            None => Value::int(values.len() as i128, IrType::I64),
+        };
+        let elems = self.alloc_array(count, elem);
+        for (i, val) in values.iter().enumerate() {
+            let (v, vt) = self.expr(val, src);
+            let cv = self.coerce(v, vt, elem);
+            let ep = self
+                .fb
+                .elem_addr(elems.clone(), elem, Value::int(i as i128, IrType::I64));
+            self.fb.store(ep, cv);
+        }
         (elems, IrType::Ptr)
     }
 
@@ -4612,6 +4644,18 @@ impl<'a> Lowerer<'a> {
             && let Some(elem) = self.array_elem_ty(base, src)
         {
             return self.lower_array_new(elem, len, src);
+        }
+        // Array initializer `new T[](v0, …)` / `new T[N](v0, …)`: a `Call` whose
+        // callee is the `T[size?]` index shape; the call args are the elements.
+        if let Expr::Call {
+            callee,
+            args: values,
+            ..
+        } = operand
+            && let Expr::Index { base, args: sz, .. } = &**callee
+            && let Some(elem) = self.array_elem_ty(base, src)
+        {
+            return self.lower_array_new_init(elem, sz.first(), values, src);
         }
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
