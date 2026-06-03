@@ -3282,6 +3282,14 @@ impl<'a> Lowerer<'a> {
                     .try_indexer_get(base, args, src)
                     .unwrap_or((undef(IrType::I64), IrType::I64)),
             },
+            // Explicit cast `(T)expr` — evaluate the operand and `coerce` it to
+            // the target type (the same machinery implicit coercions use:
+            // int↔int width changes, int↔float, float width changes).
+            Expr::Cast { ty, operand, .. } => {
+                let (v, vt) = self.expr(operand, src);
+                let to = lower_ty_env(ty, src, self.structs, self.env);
+                (self.coerce(v, vt, to), to)
+            }
             // Bare `.Case` (a `DotIdent`) — a payloadless payload-enum case
             // shorthand (`IntOpt x = .None`). Constructs the unique owning enum.
             Expr::DotIdent { name, .. } => self
