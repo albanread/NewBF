@@ -332,6 +332,13 @@ impl<'ctx> Codegen<'ctx, '_> {
     fn as_int(&self, v: BasicValueEnum<'ctx>) -> IntValue<'ctx> {
         if v.is_int_value() {
             v.into_int_value()
+        } else if v.is_pointer_value() {
+            // A pointer/reference compared or cast as an integer is its address
+            // (`ptrtoint`) — this is what makes `ref == null` and pointer
+            // equality work, not the bogus `undef` they used to fold to.
+            self.builder
+                .build_ptr_to_int(v.into_pointer_value(), self.ctx.i64_type(), "p2i")
+                .unwrap()
         } else {
             self.ctx.i64_type().get_undef()
         }

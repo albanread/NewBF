@@ -3076,6 +3076,12 @@ impl<'a> Lowerer<'a> {
                 rhs,
                 ..
             } => self.case_test(lhs, rhs, src),
+            Expr::Binary {
+                op: AstBin::NullCoalesce,
+                lhs,
+                rhs,
+                ..
+            } => self.null_coalesce(lhs, rhs, src),
             Expr::Binary { op, lhs, rhs, .. } => self.binary(*op, lhs, rhs, src),
             Expr::Ternary {
                 cond, then, els, ..
@@ -3314,6 +3320,37 @@ impl<'a> Lowerer<'a> {
 
         self.switch(join_b);
         let r = self.fb.phi(vec![(then_end, a2), (else_end, b2)], ty);
+        (r, ty)
+    }
+
+    /// `a ?? b` — null-coalescing: the value of `a` if it isn't null, else `b`.
+    /// Short-circuits (only evaluates `b` when `a` is null), so it's lowered like
+    /// a `?:` keyed on `a == null` rather than as an eager binary op. `a` is
+    /// evaluated once; both arms coerce to the common type and join via a phi.
+    fn null_coalesce(&mut self, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
+        let (lv, lt) = self.expr(lhs, src);
+        let lhs_b = self.fb.create_block("nc.lhs");
+        let rhs_b = self.fb.create_block("nc.rhs");
+        let join_b = self.fb.create_block("nc.join");
+        let is_null = self.fb.cmp(CmpPred::Eq, lv.clone(), zero_of(lt));
+        self.fb.cond_br(is_null, rhs_b, lhs_b);
+
+        // The fallback arm runs only when `a` was null.
+        self.switch(rhs_b);
+        let (rv, rt) = self.expr(rhs, src);
+        let rhs_end = self.fb.current_block();
+        let ty = common_type(lt, rt);
+        self.fb.switch_to(rhs_end);
+        let r2 = self.coerce(rv, rt, ty);
+        self.fb.br(join_b);
+
+        // The `a`-is-non-null arm: just coerce the already-computed `a`.
+        self.fb.switch_to(lhs_b);
+        let l2 = self.coerce(lv, lt, ty);
+        self.fb.br(join_b);
+
+        self.switch(join_b);
+        let r = self.fb.phi(vec![(lhs_b, l2), (rhs_end, r2)], ty);
         (r, ty)
     }
 
