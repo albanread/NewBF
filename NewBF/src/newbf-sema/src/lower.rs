@@ -656,6 +656,7 @@ fn record_method_inst(
             ret,
             params: psig,
             is_instance: false,
+            variadic: None,
         },
     );
     t.gen_method_monos.push((mangled, name.to_string(), env));
@@ -1457,6 +1458,7 @@ fn fill_members_at(
                         ret: IrType::Void,
                         params: ps,
                         is_instance: true,
+                        variadic: None,
                     });
                 }
             }
@@ -1521,11 +1523,18 @@ fn fill_members_at(
                     ps.push(IrType::Ref(id));
                 }
                 ps.extend(explicit.iter().copied());
+                // A trailing `params T[]` makes the method variadic: record the
+                // element type `T` so a call can pack its overflow args into a `T[]`.
+                let variadic = params
+                    .last()
+                    .filter(|p| matches!(p.modifier, Some((ParamModifier::Params, _))))
+                    .and_then(|p| pointer_elem_env(&p.ty, src, t, env));
                 let sig = MethodSig {
                     full_name,
                     ret: lower_ty_env(return_ty, src, t, env),
                     params: ps,
                     is_instance,
+                    variadic,
                 };
                 // A `virtual`/`override`/`abstract` instance method occupies a
                 // vtable slot; record it (in declaration order) for layout. A
@@ -1580,6 +1589,7 @@ fn fill_members_at(
                             ret: pty,
                             params: ps,
                             is_instance,
+                            variadic: None,
                         };
                         let bucket = t.methods[id.0 as usize]
                             .entry(format!("get_{nm}"))
@@ -1603,6 +1613,7 @@ fn fill_members_at(
                             ret: IrType::Void,
                             params: ps,
                             is_instance,
+                            variadic: None,
                         };
                         let bucket = t.methods[id.0 as usize]
                             .entry(format!("set_{nm}"))
@@ -2022,6 +2033,9 @@ struct MethodSig {
     /// explicit params.
     params: Vec<IrType>,
     is_instance: bool,
+    /// `Some(element type)` if the last explicit parameter is `params T[]`: the
+    /// call site packs the trailing arguments into a fresh `T[]` for it.
+    variadic: Option<IrType>,
 }
 
 /// Pick the best-matching overload from `cands` (all sharing a name) for the
@@ -2046,14 +2060,22 @@ fn pick_overload<'s>(
         } else {
             &c.params[..]
         };
-        if formal.len() != arg_tys.len() {
-            continue;
-        }
-        let score: u32 = formal
+        // A `params T[]` method matches any arg count at or above its fixed params
+        // (everything past them packs into the `T[]`); a normal one needs an exact
+        // count. Only the fixed leading params are scored, and a variadic match
+        // takes a flat penalty so an exact non-variadic overload wins a tie.
+        let (fixed, penalty) = match c.variadic {
+            Some(_) if arg_tys.len() + 1 >= formal.len() => (formal.len() - 1, 1),
+            Some(_) => continue,
+            None if formal.len() == arg_tys.len() => (formal.len(), 0),
+            None => continue,
+        };
+        let raw: u32 = formal[..fixed]
             .iter()
             .zip(arg_tys)
             .map(|(f, a)| type_affinity(*f, *a))
             .sum();
+        let score = raw.saturating_sub(penalty);
         if best.is_none_or(|(_, bs)| score > bs) {
             best = Some((c, score));
         }
@@ -3670,12 +3692,18 @@ impl<'a> Lowerer<'a> {
                         .and_then(|cands| pick_overload(cands, &arg_tys, false))
                         .cloned();
                     if let Some(sig) = resolved {
-                        // Same-type call (incl. recursion).
-                        let coerced: Vec<Value> = arg_vals
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
-                            .collect();
+                        // Same-type call (incl. recursion). A `params T[]` callee
+                        // packs the overflow args into a `T[]`; otherwise each arg
+                        // coerces to its param type positionally.
+                        let coerced: Vec<Value> = if let Some(elem) = sig.variadic {
+                            self.pack_variadic_args(&sig.params, elem, arg_vals)
+                        } else {
+                            arg_vals
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
+                                .collect()
+                        };
                         let r = self.fb.call(sig.full_name, coerced, sig.ret);
                         (r, sig.ret)
                     } else {
@@ -4773,6 +4801,38 @@ impl<'a> Lowerer<'a> {
             .elem_addr(block, IrType::U8, Value::int(8, IrType::I64))
     }
 
+    /// Build the argument list for a `params T[]` call: coerce the fixed leading
+    /// args to their param types, then pack every remaining arg into a fresh
+    /// `T[]`. `formal` is the callee's parameter types *without* `this`; its last
+    /// entry is the `T[]` slot. The result excludes `this` (the caller prepends it
+    /// for an instance method).
+    fn pack_variadic_args(
+        &mut self,
+        formal: &[IrType],
+        elem: IrType,
+        arg_vals: Vec<(Value, IrType)>,
+    ) -> Vec<Value> {
+        let fixed = formal.len().saturating_sub(1);
+        let mut out: Vec<Value> = Vec::with_capacity(formal.len());
+        let mut it = arg_vals.into_iter();
+        for ft in formal.iter().take(fixed) {
+            if let Some((v, t)) = it.next() {
+                out.push(self.coerce(v, t, *ft));
+            }
+        }
+        let rest: Vec<(Value, IrType)> = it.collect();
+        let arr = self.alloc_array(Value::int(rest.len() as i128, IrType::I64), elem);
+        for (i, (v, t)) in rest.into_iter().enumerate() {
+            let cv = self.coerce(v, t, elem);
+            let ep = self
+                .fb
+                .elem_addr(arr.clone(), elem, Value::int(i as i128, IrType::I64));
+            self.fb.store(ep, cv);
+        }
+        out.push(arr);
+        out
+    }
+
     /// `new T[n]` → an `n`-element heap array (elements indeterminate).
     fn lower_array_new(&mut self, elem: IrType, len: &Expr, src: &str) -> (Value, IrType) {
         let (lv, lt) = self.expr(len, src);
@@ -5210,12 +5270,16 @@ impl<'a> Lowerer<'a> {
                     .and_then(|cands| pick_overload(cands, &arg_tys, false))
                     .cloned()
             {
-                let call_args: Vec<Value> = arg_vals
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
-                    .collect();
+                let call_args: Vec<Value> = if let Some(elem) = sig.variadic {
+                    self.pack_variadic_args(&sig.params, elem, arg_vals.clone())
+                } else {
+                    arg_vals
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(i, (v, t))| self.coerce(v, t, sig.params[i]))
+                        .collect()
+                };
                 let r = self.fb.call(sig.full_name, call_args, sig.ret);
                 return (r, sig.ret);
             }
@@ -5229,15 +5293,25 @@ impl<'a> Lowerer<'a> {
                 .cloned()
         {
             let mut call_args = Vec::new();
-            let mut pidx = 0;
             if sig.is_instance {
                 call_args.push(body_ptr.clone());
-                pidx = 1;
             }
-            for (v, t) in arg_vals {
-                let pt = sig.params.get(pidx).copied().unwrap_or(t);
-                call_args.push(self.coerce(v, t, pt));
-                pidx += 1;
+            if let Some(elem) = sig.variadic {
+                // Pack overflow args into a `T[]` (formal params exclude `this`).
+                let formal = if sig.is_instance {
+                    &sig.params[1..]
+                } else {
+                    &sig.params[..]
+                };
+                let packed = self.pack_variadic_args(formal, elem, arg_vals);
+                call_args.extend(packed);
+            } else {
+                let mut pidx = if sig.is_instance { 1 } else { 0 };
+                for (v, t) in arg_vals {
+                    let pt = sig.params.get(pidx).copied().unwrap_or(t);
+                    call_args.push(self.coerce(v, t, pt));
+                    pidx += 1;
+                }
             }
             // Virtual dispatch: if the method occupies a vtable slot on the
             // receiver's static type, call through the object's `$header` vtable
