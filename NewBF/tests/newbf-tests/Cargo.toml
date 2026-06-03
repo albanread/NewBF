@@ -12,6 +12,7 @@ newbf-parser.workspace = true
 newbf-sema.workspace = true
 newbf-ir.workspace = true
 newbf-llvm.workspace = true
+newbf-comptime.workspace = true
 newbf-winapi.workspace = true
 
 [lints]
