@@ -2521,6 +2521,10 @@ struct Lowerer<'a> {
     /// whose slot 0 is the code pointer), not a bare code pointer. A call
     /// through one passes the env as a hidden first argument.
     closures: std::collections::HashSet<String>,
+    /// Names of heap-array locals (`T[] a = new T[n]`). The value is a pointer to
+    /// the elements; the length is stored in the 8 bytes just *before* it, so
+    /// `a[i]` reuses the typed-pointer index path and `a.Count` loads `ptr[-1]`.
+    array_locals: std::collections::HashSet<String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -2543,6 +2547,7 @@ impl<'a> Lowerer<'a> {
             env,
             fn_sigs: HashMap::new(),
             closures: std::collections::HashSet::new(),
+            array_locals: std::collections::HashSet::new(),
         }
     }
 
@@ -2648,6 +2653,11 @@ impl<'a> Lowerer<'a> {
                     .as_ref()
                     .and_then(|t| pointer_elem_env(t, src, self.structs, self.env));
                 self.bind(name.text(src), slot, slot_ty, elem);
+                // A heap-array local (`T[] a`): remember it's an array so `a.Count`
+                // reads the length header and `delete a` frees the real block base.
+                if matches!(ty, Some(AstType::Array { .. })) {
+                    self.array_locals.insert(name.text(src).to_string());
+                }
                 // A `function R(P)` local is a code pointer (slot type `Ptr`);
                 // record its signature so a later `name(args)` can lower to an
                 // indirect call with the right return type + arg coercions.
@@ -3198,15 +3208,7 @@ impl<'a> Lowerer<'a> {
             // reference is pointer-sized).
             Expr::SizeOf { ty, .. } => {
                 let it = lower_ty_env(ty, src, self.structs, self.env);
-                let sz = match it {
-                    IrType::Struct(id) => self.fb.size_of(id),
-                    IrType::Bool => Value::int(1, IrType::I64),
-                    IrType::Int { bits, .. } => Value::int((bits / 8) as i128, IrType::I64),
-                    IrType::Float { bits } => Value::int((bits / 8) as i128, IrType::I64),
-                    IrType::Ptr | IrType::Ref(_) => Value::int(8, IrType::I64),
-                    IrType::Void => Value::int(0, IrType::I64),
-                };
-                (sz, IrType::I64)
+                (self.size_of_ty(it), IrType::I64)
             }
             // An anonymous lambda lowers to the address of the free function it
             // was emitted as. If it captures outer locals it becomes a *closure*:
@@ -3410,9 +3412,14 @@ impl<'a> Lowerer<'a> {
             // Member read (`obj.field` / `ref.field`): load the resolved field;
             // degrade if the base isn't a known struct/reference place.
             Expr::Member { base, name, .. } => {
+                // An array's `Count`/`Length`: the length sits in the 8 bytes just
+                // before the elements pointer, so load `ptr[-1]` (an `int`).
+                if let Some(r) = self.try_array_count(base, name.text(src), src) {
+                    r
+                }
                 // A payloadless payload-enum case (`IntOpt.None`) constructs its
                 // tagged-union struct; a plain int-backed `Enum.Case` is a constant.
-                if let Some(r) = self.try_enum_construct(base, name.text(src), &[], src) {
+                else if let Some(r) = self.try_enum_construct(base, name.text(src), &[], src) {
                     r
                 } else if let Some(r) = self.try_enum_const(base, name.text(src), src) {
                     r
@@ -4420,7 +4427,82 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The byte size of an IR type as an `i64` — a value struct defers to the IR
+    /// `SizeOf` (LLVM DataLayout), scalars/refs are constant-sized.
+    fn size_of_ty(&mut self, ty: IrType) -> Value {
+        match ty {
+            IrType::Struct(id) => self.fb.size_of(id),
+            IrType::Bool => Value::int(1, IrType::I64),
+            IrType::Int { bits, .. } => Value::int((bits / 8) as i128, IrType::I64),
+            IrType::Float { bits } => Value::int((bits / 8) as i128, IrType::I64),
+            IrType::Ptr | IrType::Ref(_) => Value::int(8, IrType::I64),
+            IrType::Void => Value::int(0, IrType::I64),
+        }
+    }
+
+    /// The element IR type of an array-`new` size expression `T[n]` whose `base`
+    /// names the element type `T` (a primitive or registered type). `None` if the
+    /// base isn't a bare type name.
+    fn array_elem_ty(&self, base: &Expr, src: &str) -> Option<IrType> {
+        match base {
+            Expr::Paren { inner, .. } => self.array_elem_ty(inner, src),
+            Expr::Ident(s) => {
+                let name = s.text(src);
+                Some(self.structs.ty_of(name).unwrap_or_else(|| primitive(name)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `new T[n]` → a length-prefixed heap block: `malloc(8 + n·sizeof(T))`, store
+    /// the length `n` in the first 8 bytes, and yield a pointer to the *elements*
+    /// (8 bytes past the block). So `a[i]` is an ordinary typed-pointer index and
+    /// `a.Count` reads `ptr[-1]`. Returns `(elements_ptr, Ptr)`.
+    fn lower_array_new(&mut self, elem: IrType, len: &Expr, src: &str) -> (Value, IrType) {
+        let (lv, lt) = self.expr(len, src);
+        let n = self.coerce(lv, lt, IrType::I64);
+        let esz = self.size_of_ty(elem);
+        let bytes = self.fb.bin(IrBin::Mul, n.clone(), esz, IrType::I64);
+        let total = self
+            .fb
+            .bin(IrBin::Add, bytes, Value::int(8, IrType::I64), IrType::I64);
+        let block = self.fb.call("malloc", vec![total], IrType::Ptr);
+        // Length header in the first 8 bytes, then the elements at block + 8.
+        self.fb.store(block.clone(), n);
+        let elems = self
+            .fb
+            .elem_addr(block, IrType::U8, Value::int(8, IrType::I64));
+        (elems, IrType::Ptr)
+    }
+
+    /// `a.Count` / `a.Length` for a heap-array local → load the length header
+    /// stored at `elements_ptr - 8`. `None` unless `base` is a known array local
+    /// and `name` is `Count`/`Length`.
+    fn try_array_count(&mut self, base: &Expr, name: &str, src: &str) -> Option<(Value, IrType)> {
+        if !matches!(name, "Count" | "Length") {
+            return None;
+        }
+        let Expr::Ident(s) = base else { return None };
+        if !self.array_locals.contains(s.text(src)) {
+            return None;
+        }
+        let (ptr, _) = self.expr(base, src);
+        let hdr = self
+            .fb
+            .elem_addr(ptr, IrType::U8, Value::int(-8, IrType::I64));
+        Some((self.fb.load(hdr, IrType::I64), IrType::I64))
+    }
+
     fn lower_new(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
+        // Array allocation `new T[n]`: the operand is an `Index` whose base names
+        // the element type. (A user-indexer `new` would have a *value* base, not a
+        // type name, so `array_elem_ty` returning `Some` discriminates.)
+        if let Expr::Index { base, args, .. } = operand
+            && let Some(len) = args.first()
+            && let Some(elem) = self.array_elem_ty(base, src)
+        {
+            return self.lower_array_new(elem, len, src);
+        }
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
             let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
@@ -4470,6 +4552,18 @@ impl<'a> Lowerer<'a> {
 
     /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).
     fn lower_delete(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
+        // A heap array's allocation base is 8 bytes before its elements pointer
+        // (the length header), so free that, not the elements pointer.
+        if let Expr::Ident(s) = operand
+            && self.array_locals.contains(s.text(src))
+        {
+            let (ptr, _) = self.expr(operand, src);
+            let base = self
+                .fb
+                .elem_addr(ptr, IrType::U8, Value::int(-8, IrType::I64));
+            self.fb.call("free", vec![base], IrType::Void);
+            return (Value::Const(Const::Undef(IrType::Void)), IrType::Void);
+        }
         let (v, t) = self.expr(operand, src);
         // Run the destructor before freeing, if the type has one.
         if let IrType::Ref(id) = t
@@ -5094,6 +5188,9 @@ fn ctor_args(e: &Expr) -> &[Expr] {
 fn pointer_elem_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> Option<IrType> {
     match ty {
         AstType::Pointer { inner, .. } => Some(lower_ty_env(inner, src, structs, env)),
+        // A heap array `T[]` records its element type so `a[i]` indexes through
+        // the same typed-pointer path (the value is a pointer to the elements).
+        AstType::Array { inner, .. } => Some(lower_ty_env(inner, src, structs, env)),
         AstType::Nullable { inner, .. } => pointer_elem_env(inner, src, structs, env),
         _ => None,
     }
@@ -5170,6 +5267,8 @@ fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> I
             structs.ty_of(&mangled).unwrap_or(IrType::Ptr)
         }
         AstType::Pointer { .. } => IrType::Ptr,
+        // A heap array `T[]` is a pointer to its elements (length-prefixed block).
+        AstType::Array { .. } => IrType::Ptr,
         AstType::Nullable { inner, .. } => lower_ty_env(inner, src, structs, env),
         // A tuple resolves to its synthetic value struct (registered by the
         // pre-pass under the element `type_codes`). Unregistered ⇒ a pointer-
