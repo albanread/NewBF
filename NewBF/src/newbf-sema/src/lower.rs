@@ -168,6 +168,7 @@ impl StructTable {
                 &mut t,
                 &mut seen,
                 &mut monos,
+                &[],
             );
         }
         // 4. Fill ordinary types, then each monomorph's members with its env,
@@ -391,13 +392,16 @@ type GenericDecls<'a> = HashMap<String, (&'a TypeDecl, &'a str)>;
 
 /// Record the monomorphization a generic type reference demands (`Box<int>` →
 /// register `Box$i64`), then recurse into its arguments and any wrapped type.
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn use_in_type<'a>(
     ty: &AstType,
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     if let AstType::Path { segments, .. } = ty
         && segments.len() == 1
@@ -408,13 +412,15 @@ fn use_in_type<'a>(
             &segments[0].args,
             src,
             generics,
+            gmethods,
             t,
             seen,
             monos,
+            env,
         );
     }
     if let AstType::Pointer { inner, .. } | AstType::Nullable { inner, .. } = ty {
-        use_in_type(inner, src, generics, t, seen, monos);
+        use_in_type(inner, src, generics, gmethods, t, seen, monos, env);
     }
 }
 
@@ -423,34 +429,45 @@ fn use_in_type<'a>(
 /// then recurse into the type arguments for nested instantiations. Shared by
 /// type-position (`use_in_type`) and expression-position (`collect_insts_expr`)
 /// collection.
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn record_inst<'a>(
     name: &str,
     args: &[AstType],
     src: &'a str,
     generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     let Some(&(decl, decl_src)) = generics.get(name) else {
         return;
     };
-    let argtys: Vec<IrType> = args.iter().map(|a| lower_ty_env(a, src, t, &[])).collect();
+    // Resolve the type args through the *caller's* env, so a nested `List<T>`
+    // inside a `Stack<int32>` body resolves `T → int32` (→ `List$i32`), not the
+    // `Ptr` fallback. This is what makes transitive monomorphization correct.
+    let argtys: Vec<IrType> = args.iter().map(|a| lower_ty_env(a, src, t, env)).collect();
     let mangled = mangle_generic(name, &argtys);
     if !seen.iter().any(|s| s == &mangled) {
         seen.push(mangled.clone());
         let kind = struct_kind(decl).unwrap_or(StructKind::Value);
         let id = register_mono(t, &mangled, kind);
-        let env: Vec<(String, IrType)> = decl
+        let inst_env: Vec<(String, IrType)> = decl
             .generic_params
             .iter()
             .zip(&argtys)
             .map(|(gp, ty)| (gp.name.text(decl_src).to_string(), *ty))
             .collect();
-        monos.push((id, decl, decl_src, env));
+        // Transitively collect the instantiations this mono's *own body* needs,
+        // with its concrete env (so `Stack<int32>` drags in `List<int32>`).
+        collect_insts_type(
+            decl, decl_src, generics, gmethods, t, seen, monos, &inst_env,
+        );
+        monos.push((id, decl, decl_src, inst_env));
     }
     for a in args {
-        use_in_type(a, src, generics, t, seen, monos);
+        use_in_type(a, src, generics, gmethods, t, seen, monos, env);
     }
 }
 
@@ -462,6 +479,7 @@ fn record_method_inst(
     src: &str,
     gmethods: &GenMethodDecls,
     t: &mut StructTable,
+    env: &[(String, IrType)],
 ) {
     let Some(&(member, mdecl_src)) = gmethods.get(name) else {
         return;
@@ -475,7 +493,7 @@ fn record_method_inst(
     else {
         return;
     };
-    let argtys: Vec<IrType> = targs.iter().map(|a| lower_ty_env(a, src, t, &[])).collect();
+    let argtys: Vec<IrType> = targs.iter().map(|a| lower_ty_env(a, src, t, env)).collect();
     if argtys.len() != generic_params.len() {
         return;
     }
@@ -505,6 +523,7 @@ fn record_method_inst(
     t.gen_method_monos.push((mangled, name.to_string(), env));
 }
 
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn collect_insts_items<'a>(
     items: &'a [Item],
     src: &'a str,
@@ -513,18 +532,20 @@ fn collect_insts_items<'a>(
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     for item in items {
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => collect_insts_items(body, src, generics, gmethods, t, seen, monos),
-            Item::Type(td) => collect_insts_type(td, src, generics, gmethods, t, seen, monos),
+            } => collect_insts_items(body, src, generics, gmethods, t, seen, monos, env),
+            Item::Type(td) => collect_insts_type(td, src, generics, gmethods, t, seen, monos, env),
             _ => {}
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn collect_insts_type<'a>(
     td: &'a TypeDecl,
     src: &'a str,
@@ -533,33 +554,38 @@ fn collect_insts_type<'a>(
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     for m in &td.members {
         match m {
-            Member::Field { ty, .. } => use_in_type(ty, src, generics, t, seen, monos),
+            Member::Field { ty, .. } => {
+                use_in_type(ty, src, generics, gmethods, t, seen, monos, env)
+            }
             Member::Method {
                 params,
                 return_ty,
                 body,
                 ..
             } => {
-                use_in_type(return_ty, src, generics, t, seen, monos);
+                use_in_type(return_ty, src, generics, gmethods, t, seen, monos, env);
                 for p in params {
-                    use_in_type(&p.ty, src, generics, t, seen, monos);
+                    use_in_type(&p.ty, src, generics, gmethods, t, seen, monos, env);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
+                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env);
                 }
             }
             Member::Constructor { params, body, .. } => {
                 for p in params {
-                    use_in_type(&p.ty, src, generics, t, seen, monos);
+                    use_in_type(&p.ty, src, generics, gmethods, t, seen, monos, env);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
+                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env);
                 }
             }
-            Member::Nested(n) => collect_insts_type(n, src, generics, gmethods, t, seen, monos),
+            Member::Nested(n) => {
+                collect_insts_type(n, src, generics, gmethods, t, seen, monos, env)
+            }
             _ => {}
         }
     }
@@ -568,6 +594,7 @@ fn collect_insts_type<'a>(
 /// Walk statement bodies for generic instantiations in local-declaration types
 /// (`Box<int> b;`). Expression-position instantiations (`new Box<int>()`) arrive
 /// with the generic *class* slice.
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn collect_insts_stmt<'a>(
     stmt: &Stmt,
     src: &'a str,
@@ -576,46 +603,47 @@ fn collect_insts_stmt<'a>(
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     match stmt {
         Stmt::Block { stmts, .. } => {
             for s in stmts {
-                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos);
+                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env);
             }
         }
         Stmt::Local { ty, init, .. } => {
             if let Some(ty) = ty {
-                use_in_type(ty, src, generics, t, seen, monos);
+                use_in_type(ty, src, generics, gmethods, t, seen, monos, env);
             }
             if let Some(e) = init {
-                collect_insts_expr(e, src, generics, gmethods, t, seen, monos);
+                collect_insts_expr(e, src, generics, gmethods, t, seen, monos, env);
             }
         }
         Stmt::Expr { expr, .. } => {
-            collect_insts_expr(expr, src, generics, gmethods, t, seen, monos)
+            collect_insts_expr(expr, src, generics, gmethods, t, seen, monos, env)
         }
         Stmt::Return { value: Some(e), .. } => {
-            collect_insts_expr(e, src, generics, gmethods, t, seen, monos)
+            collect_insts_expr(e, src, generics, gmethods, t, seen, monos, env)
         }
         Stmt::If {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
-            collect_insts_stmt(then, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_stmt(then, src, generics, gmethods, t, seen, monos, env);
             if let Some(e) = els {
-                collect_insts_stmt(e, src, generics, gmethods, t, seen, monos);
+                collect_insts_stmt(e, src, generics, gmethods, t, seen, monos, env);
             }
         }
         Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env);
         }
         Stmt::ForEach { iter, body, .. } => {
-            collect_insts_expr(iter, src, generics, gmethods, t, seen, monos);
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(iter, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env);
         }
         Stmt::Defer { body, .. } => {
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos)
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env)
         }
         Stmt::For {
             init,
@@ -625,15 +653,15 @@ fn collect_insts_stmt<'a>(
             ..
         } => {
             if let Some(i) = init {
-                collect_insts_stmt(i, src, generics, gmethods, t, seen, monos);
+                collect_insts_stmt(i, src, generics, gmethods, t, seen, monos, env);
             }
             if let Some(c) = cond {
-                collect_insts_expr(c, src, generics, gmethods, t, seen, monos);
+                collect_insts_expr(c, src, generics, gmethods, t, seen, monos, env);
             }
             if let Some(u) = update {
-                collect_insts_expr(u, src, generics, gmethods, t, seen, monos);
+                collect_insts_expr(u, src, generics, gmethods, t, seen, monos, env);
             }
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos);
+            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env);
         }
         _ => {}
     }
@@ -642,6 +670,7 @@ fn collect_insts_stmt<'a>(
 /// Walk an expression for generic instantiations in expression position —
 /// chiefly `new Name<Args>(…)` (where the `Name<Args>` is an `Expr::Generic`),
 /// so an instantiation reaches monomorphization even without a typed local.
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn collect_insts_expr<'a>(
     e: &Expr,
     src: &'a str,
@@ -650,50 +679,61 @@ fn collect_insts_expr<'a>(
     t: &mut StructTable,
     seen: &mut Vec<String>,
     monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
 ) {
     match e {
         Expr::Generic { base, args, .. } => {
             if let Expr::Ident(s) = &**base {
-                record_inst(s.text(src), args, src, generics, t, seen, monos);
-                record_method_inst(s.text(src), args, src, gmethods, t);
+                record_inst(
+                    s.text(src),
+                    args,
+                    src,
+                    generics,
+                    gmethods,
+                    t,
+                    seen,
+                    monos,
+                    env,
+                );
+                record_method_inst(s.text(src), args, src, gmethods, t, env);
             }
         }
         Expr::Paren { inner, .. } => {
-            collect_insts_expr(inner, src, generics, gmethods, t, seen, monos)
+            collect_insts_expr(inner, src, generics, gmethods, t, seen, monos, env)
         }
         // `sizeof(List<int>)` instantiates the type it names.
-        Expr::SizeOf { ty, .. } => use_in_type(ty, src, generics, t, seen, monos),
+        Expr::SizeOf { ty, .. } => use_in_type(ty, src, generics, gmethods, t, seen, monos, env),
         Expr::Unary { operand, .. }
         | Expr::PostInc { operand, .. }
         | Expr::PostDec { operand, .. }
         | Expr::Prefix { operand, .. } => {
-            collect_insts_expr(operand, src, generics, gmethods, t, seen, monos)
+            collect_insts_expr(operand, src, generics, gmethods, t, seen, monos, env)
         }
         Expr::Member { base, .. } => {
-            collect_insts_expr(base, src, generics, gmethods, t, seen, monos)
+            collect_insts_expr(base, src, generics, gmethods, t, seen, monos, env)
         }
         Expr::Binary { lhs, rhs, .. } => {
-            collect_insts_expr(lhs, src, generics, gmethods, t, seen, monos);
-            collect_insts_expr(rhs, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(lhs, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_expr(rhs, src, generics, gmethods, t, seen, monos, env);
         }
         Expr::Assign { target, value, .. } => {
-            collect_insts_expr(target, src, generics, gmethods, t, seen, monos);
-            collect_insts_expr(value, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(target, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_expr(value, src, generics, gmethods, t, seen, monos, env);
         }
         Expr::Ternary {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos);
-            collect_insts_expr(then, src, generics, gmethods, t, seen, monos);
-            collect_insts_expr(els, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_expr(then, src, generics, gmethods, t, seen, monos, env);
+            collect_insts_expr(els, src, generics, gmethods, t, seen, monos, env);
         }
         Expr::Call { callee, args, .. }
         | Expr::Index {
             base: callee, args, ..
         } => {
-            collect_insts_expr(callee, src, generics, gmethods, t, seen, monos);
+            collect_insts_expr(callee, src, generics, gmethods, t, seen, monos, env);
             for a in args {
-                collect_insts_expr(a, src, generics, gmethods, t, seen, monos);
+                collect_insts_expr(a, src, generics, gmethods, t, seen, monos, env);
             }
         }
         _ => {}
