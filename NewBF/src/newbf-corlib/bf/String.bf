@@ -79,6 +79,41 @@ class String {
 		return r;
 	}
 
+	// Index of the first occurrence of `needle` (byte-for-byte), or -1. The empty
+	// needle matches at 0. Naive O(n*m) scan — fine for the corlib slice.
+	public int32 IndexOf(String needle) {
+		int32 n = needle.Length();
+		if (n == 0) { return 0; }
+		for (int32 i = 0; i + n <= this.mLength; i++) {
+			bool hit = true;
+			for (int32 j = 0; j < n; j++) {
+				if (this.mPtr[i + j] != needle.CharAt(j)) { hit = false; break; }
+			}
+			if (hit) { return i; }
+		}
+		return -1;
+	}
+
+	// A new String with ASCII letters upper-/lower-cased; other bytes pass through.
+	public String ToUpper() {
+		String r = new String();
+		for (int32 i = 0; i < this.mLength; i++) {
+			char8 c = this.mPtr[i];
+			if (c >= 'a' && c <= 'z') { c = c - 32; }
+			r.Append(c);
+		}
+		return r;
+	}
+	public String ToLower() {
+		String r = new String();
+		for (int32 i = 0; i < this.mLength; i++) {
+			char8 c = this.mPtr[i];
+			if (c >= 'A' && c <= 'Z') { c = c + 32; }
+			r.Append(c);
+		}
+		return r;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
