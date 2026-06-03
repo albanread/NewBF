@@ -120,6 +120,11 @@ struct StructTable {
     /// mutability, and read back when the lambda body is emitted. Empty (or
     /// absent) ⇒ a non-capturing lambda (a bare function pointer).
     lambda_captures: RefCell<HashMap<String, Vec<(String, IrType)>>>,
+    /// Anonymous tuple types → the synthetic value-struct id backing each
+    /// distinct shape, keyed by element `type_codes` (so `(int32, int32)`
+    /// everywhere is one struct, fields named "0", "1", …). A pre-pass over
+    /// type positions registers them; `lower_ty_env` resolves a `Tuple` here.
+    tuples: HashMap<String, StructId>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -170,6 +175,15 @@ impl StructTable {
                 &mut monos,
                 &[],
             );
+        }
+        // 3b. Register a synthetic value struct per distinct tuple shape used in a
+        //     type position. Must precede the field/member fill below: a method's
+        //     `(int32,int32)` return/param and a tuple field have to resolve to the
+        //     struct when their signatures are built, or they'd default to a
+        //     pointer. Element types need only names/kinds (step 1) and monos
+        //     (step 3), not filled fields, so here is early enough.
+        for f in files {
+            register_tuples(&f.unit.items, f.src, &mut t);
         }
         // 4. Fill ordinary types, then each monomorph's members with its env,
         //    and record the monomorphs so lowering can emit their method bodies.
@@ -297,6 +311,126 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     t.vimpls.push(Vec::new());
     t.by_name.insert(mangled.to_string(), id);
     id
+}
+
+/// Pre-pass: register a synthetic value struct for each distinct tuple shape
+/// that appears in a type position, so every `(int32, int32)` resolves to one
+/// `Struct(id)` whose fields are named "0", "1", … . Generic *templates* are
+/// skipped (their tuples carry unresolved `T`s; monomorphs would need their own
+/// registration — a follow-on).
+fn register_tuples(items: &[Item], src: &str, t: &mut StructTable) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => register_tuples(body, src, t),
+            Item::Type(td) if td.generic_params.is_empty() => register_tuples_in_type(td, src, t),
+            _ => {}
+        }
+    }
+}
+
+fn register_tuples_in_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
+    for m in &td.members {
+        match m {
+            Member::Field { ty, .. } => register_tuple_type(ty, src, t),
+            Member::Method {
+                params,
+                return_ty,
+                body,
+                generic_params,
+                ..
+            } if generic_params.is_empty() => {
+                register_tuple_type(return_ty, src, t);
+                for p in params {
+                    register_tuple_type(&p.ty, src, t);
+                }
+                if let MethodBody::Block(s) = body {
+                    register_tuples_in_stmt(s, src, t);
+                }
+            }
+            Member::Constructor { params, body, .. } => {
+                for p in params {
+                    register_tuple_type(&p.ty, src, t);
+                }
+                if let MethodBody::Block(s) = body {
+                    register_tuples_in_stmt(s, src, t);
+                }
+            }
+            Member::Property {
+                ty, index_params, ..
+            } => {
+                register_tuple_type(ty, src, t);
+                for p in index_params {
+                    register_tuple_type(&p.ty, src, t);
+                }
+            }
+            Member::Nested(n) if n.generic_params.is_empty() => register_tuples_in_type(n, src, t),
+            _ => {}
+        }
+    }
+}
+
+/// Walk a statement body for tuple types in local declarations (`(int,int) t;`).
+fn register_tuples_in_stmt(stmt: &Stmt, src: &str, t: &mut StructTable) {
+    match stmt {
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                register_tuples_in_stmt(s, src, t);
+            }
+        }
+        Stmt::Local { ty: Some(ty), .. } => register_tuple_type(ty, src, t),
+        Stmt::If { then, els, .. } => {
+            register_tuples_in_stmt(then, src, t);
+            if let Some(e) = els {
+                register_tuples_in_stmt(e, src, t);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            register_tuples_in_stmt(body, src, t)
+        }
+        Stmt::ForEach { body, .. } => register_tuples_in_stmt(body, src, t),
+        Stmt::For { init, body, .. } => {
+            if let Some(i) = init {
+                register_tuples_in_stmt(i, src, t);
+            }
+            register_tuples_in_stmt(body, src, t);
+        }
+        Stmt::Defer { body, .. } => register_tuples_in_stmt(body, src, t),
+        _ => {}
+    }
+}
+
+/// Register the tuple shapes inside `ty` (inner tuples first, so an outer
+/// tuple's element type resolves to a concrete `Struct(id)`). A non-tuple
+/// composite (`(int,int)*`, `(int,int)[]`) is followed to its element.
+fn register_tuple_type(ty: &AstType, src: &str, t: &mut StructTable) {
+    match ty {
+        AstType::Tuple { elems, .. } => {
+            for e in elems {
+                register_tuple_type(e, src, t);
+            }
+            let etys: Vec<IrType> = elems.iter().map(|e| lower_ty_env(e, src, t, &[])).collect();
+            let key = type_codes(&etys);
+            if t.tuples.contains_key(&key) {
+                return;
+            }
+            let id = register_mono(t, &format!("$tuple${key}"), StructKind::Value);
+            for (i, ety) in etys.iter().enumerate() {
+                t.defs[id.0 as usize].fields.push(FieldDef {
+                    name: i.to_string(),
+                    ty: *ety,
+                });
+                t.field_elems[id.0 as usize].push(None);
+            }
+            t.tuples.insert(key, id);
+        }
+        AstType::Pointer { inner, .. }
+        | AstType::Nullable { inner, .. }
+        | AstType::Array { inner, .. }
+        | AstType::Sized { inner, .. } => register_tuple_type(inner, src, t),
+        _ => {}
+    }
 }
 
 /// Compose single inheritance across the table: each class with a base gains
@@ -2489,7 +2623,10 @@ impl<'a> Lowerer<'a> {
                 let (init_val, init_ty) = match init {
                     Some(e) => {
                         let (v, t) = declared
-                            .and_then(|target| self.try_target_typed_enum(target, e, src))
+                            .and_then(|target| {
+                                self.try_target_typed_enum(target, e, src)
+                                    .or_else(|| self.try_target_typed_tuple(target, e, src))
+                            })
                             .unwrap_or_else(|| self.expr(e, src));
                         (Some(v), Some(t))
                     }
@@ -3114,6 +3251,13 @@ impl<'a> Lowerer<'a> {
                 (env, IrType::Ptr)
             }
             Expr::Paren { inner, .. } => self.expr(inner, src),
+            // A tuple literal `(a, b, …)` builds its synthetic value struct. With
+            // no target the shape is inferred from the element types; a tuple-typed
+            // local/return target-types it (so `(int32,int32) t = (3,4)` coerces the
+            // i64 literals to the i32 fields) via the `Stmt::Local`/`Return` paths.
+            Expr::Tuple { elems, .. } => self
+                .build_tuple(None, elems, src)
+                .unwrap_or((undef(IrType::I64), IrType::I64)),
             Expr::Ident(s) => match self.lookup(s.text(src)) {
                 Some((slot, ty)) => (self.fb.load(slot, ty), ty),
                 None => (undef(IrType::I64), IrType::I64),
@@ -4341,6 +4485,70 @@ impl<'a> Lowerer<'a> {
     /// type, looks up the method (this-aware), and emits a direct call — passing
     /// the receiver as `this` for an instance method. Degrades (evaluating args
     /// for their effects) when the method can't be resolved.
+    /// Whether `id` names a synthetic tuple struct (so `(a, b)` against it builds
+    /// a tuple rather than being mistaken for a named-struct target).
+    fn is_tuple_struct(&self, id: StructId) -> bool {
+        self.structs.defs[id.0 as usize].name.starts_with("$tuple$")
+    }
+
+    /// A tuple-typed local/field target (`(int32,int32) t = (3,4)`) builds the
+    /// tuple with element coercion to the declared field types. `None` if the
+    /// target isn't a tuple struct or the initializer isn't a tuple literal.
+    fn try_target_typed_tuple(
+        &mut self,
+        target: IrType,
+        e: &Expr,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let IrType::Struct(id) = target else {
+            return None;
+        };
+        if !self.is_tuple_struct(id) {
+            return None;
+        }
+        let Expr::Tuple { elems, .. } = e else {
+            return None;
+        };
+        self.build_tuple(Some(id), elems, src)
+    }
+
+    /// Build a tuple value: a synthetic value struct whose fields "0".."n-1" hold
+    /// the elements. With a `target` (from a tuple-typed annotation) each element
+    /// coerces to its declared field type; without one the shape is inferred from
+    /// the element types and matched against a registered tuple. `None` if no
+    /// matching tuple struct exists or the arity differs.
+    fn build_tuple(
+        &mut self,
+        target: Option<StructId>,
+        elems: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let vals: Vec<(Value, IrType)> = elems.iter().map(|e| self.expr(e, src)).collect();
+        let id = match target {
+            Some(id) => id,
+            None => {
+                let etys: Vec<IrType> = vals.iter().map(|(_, t)| *t).collect();
+                *self.structs.tuples.get(&type_codes(&etys))?
+            }
+        };
+        let ftys: Vec<IrType> = self.structs.defs[id.0 as usize]
+            .fields
+            .iter()
+            .map(|f| f.ty)
+            .collect();
+        if ftys.len() != vals.len() {
+            return None;
+        }
+        let ty = IrType::Struct(id);
+        let slot = self.fb.alloca(ty);
+        for (i, (v, vt)) in vals.into_iter().enumerate() {
+            let cv = self.coerce(v, vt, ftys[i]);
+            let fp = self.fb.field_addr(slot.clone(), id, i as u32);
+            self.fb.store(fp, cv);
+        }
+        Some((self.fb.load(slot, ty), ty))
+    }
+
     /// Lower a call argument. A `ref`/`out` argument is passed *by address*: the
     /// operand's lvalue (a pointer to its storage) becomes the argument value
     /// (typed `Ptr`), so the callee — whose matching param is also `Ptr` — can
@@ -4963,6 +5171,20 @@ fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> I
         }
         AstType::Pointer { .. } => IrType::Ptr,
         AstType::Nullable { inner, .. } => lower_ty_env(inner, src, structs, env),
+        // A tuple resolves to its synthetic value struct (registered by the
+        // pre-pass under the element `type_codes`). Unregistered ⇒ a pointer-
+        // sized fallback (only reached for tuples in positions the pass skips).
+        AstType::Tuple { elems, .. } => {
+            let etys: Vec<IrType> = elems
+                .iter()
+                .map(|e| lower_ty_env(e, src, structs, env))
+                .collect();
+            structs
+                .tuples
+                .get(&type_codes(&etys))
+                .map(|&id| IrType::Struct(id))
+                .unwrap_or(IrType::Ptr)
+        }
         _ => IrType::Ptr,
     }
 }
