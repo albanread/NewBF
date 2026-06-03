@@ -4996,11 +4996,22 @@ impl<'a> Lowerer<'a> {
             return (Value::Const(Const::Undef(IrType::Void)), IrType::Void);
         }
         let (v, t) = self.expr(operand, src);
-        // Run the destructor before freeing, if the type has one.
-        if let IrType::Ref(id) = t
-            && let Some(dtor) = self.structs.dtor_of(id)
-        {
-            self.fb.call(dtor, vec![v.clone()], IrType::Void);
+        // Run destructors down the inheritance chain before freeing: the derived
+        // dtor first, then each base's, root last (reverse of construction order).
+        // Inheritance composes a base dtor into a derived that doesn't declare its
+        // own, so the same symbol can repeat down the chain — dedup to call once.
+        if let IrType::Ref(id) = t {
+            let mut seen: Vec<String> = Vec::new();
+            let mut cur = Some(id);
+            while let Some(cid) = cur {
+                if let Some(dtor) = self.structs.dtor_of(cid)
+                    && !seen.contains(&dtor)
+                {
+                    self.fb.call(dtor.clone(), vec![v.clone()], IrType::Void);
+                    seen.push(dtor);
+                }
+                cur = self.structs.bases[cid.0 as usize];
+            }
         }
         self.fb.call("free", vec![v], IrType::Void);
         (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
