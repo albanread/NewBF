@@ -3399,6 +3399,20 @@ impl<'a> Lowerer<'a> {
                 rhs,
                 ..
             } => self.null_coalesce(lhs, rhs, src),
+            // `obj is T` / `obj as T`: the RHS names a *type*, not a value, so they
+            // must be handled before the generic `binary` (which would evaluate it).
+            Expr::Binary {
+                op: AstBin::Is,
+                lhs,
+                rhs,
+                ..
+            } => self.lower_is(lhs, rhs, src),
+            Expr::Binary {
+                op: AstBin::As,
+                lhs,
+                rhs,
+                ..
+            } => self.lower_as(lhs, rhs, src),
             Expr::Binary { op, lhs, rhs, .. } => self.binary(*op, lhs, rhs, src),
             Expr::Ternary {
                 cond, then, els, ..
@@ -4826,6 +4840,83 @@ impl<'a> Lowerer<'a> {
             return (addr, IrType::Ptr);
         }
         self.expr(a, src)
+    }
+
+    /// Whether class `c` is `t` or a transitive subclass of it (walks `bases`).
+    fn is_subtype_of(&self, c: StructId, t: StructId) -> bool {
+        let mut cur = Some(c);
+        while let Some(id) = cur {
+            if id == t {
+                return true;
+            }
+            cur = self.structs.bases[id.0 as usize];
+        }
+        false
+    }
+
+    /// The runtime type test behind `is`/`as`: true iff `obj`'s `$header` (its
+    /// runtime vtable pointer) equals the vtable of `tid` or of any class derived
+    /// from it — the set is fixed at compile time. Emitted as an OR-chain of
+    /// pointer equalities. `None` if no class in `tid`'s subtree carries a vtable
+    /// (e.g. a non-virtual class), since the header tag isn't available then.
+    fn type_test(&mut self, obj: Value, oid: StructId, tid: StructId) -> Option<Value> {
+        let targets: Vec<StructId> = (0..self.structs.defs.len() as u32)
+            .map(StructId)
+            .filter(|&c| self.is_subtype_of(c, tid) && !self.structs.vimpls[c.0 as usize].is_empty())
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let hdr_addr = self.fb.field_addr(obj, oid, 0);
+        let hdr = self.fb.load(hdr_addr, IrType::Ptr);
+        let mut acc: Option<Value> = None;
+        for c in targets {
+            let vt = self
+                .fb
+                .global_addr(vtable_name(&self.structs.prefixes[c.0 as usize]));
+            let eq = self.fb.cmp(CmpPred::Eq, hdr.clone(), vt);
+            acc = Some(match acc {
+                None => eq,
+                Some(a) => self.fb.bin(IrBin::Or, a, eq, IrType::Bool),
+            });
+        }
+        acc
+    }
+
+    /// Resolve a type-name expression (the RHS of `is`/`as`) to a class id.
+    fn type_id_of(&self, ty_expr: &Expr, src: &str) -> Option<StructId> {
+        match ty_expr {
+            Expr::Ident(s) => self.structs.by_name.get(s.text(src)).copied(),
+            Expr::Paren { inner, .. } => self.type_id_of(inner, src),
+            _ => None,
+        }
+    }
+
+    /// `obj is T` → a `bool`. False when `obj` isn't a reference, `T` isn't a
+    /// known class, or the test can't be expressed via vtable tags.
+    fn lower_is(&mut self, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
+        let (ov, ot) = self.expr(lhs, src);
+        if let IrType::Ref(oid) = ot
+            && let Some(tid) = self.type_id_of(rhs, src)
+            && let Some(test) = self.type_test(ov, oid, tid)
+        {
+            return (test, IrType::Bool);
+        }
+        (Value::bool(false), IrType::Bool)
+    }
+
+    /// `obj as T` → `obj` typed as `T` when the runtime type matches, else `null`.
+    fn lower_as(&mut self, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
+        let (ov, ot) = self.expr(lhs, src);
+        if let IrType::Ref(oid) = ot
+            && let Some(tid) = self.type_id_of(rhs, src)
+            && let Some(test) = self.type_test(ov.clone(), oid, tid)
+        {
+            let null = Value::Const(Const::Null);
+            let r = self.fb.select(test, ov, null, IrType::Ref(tid));
+            return (r, IrType::Ref(tid));
+        }
+        (Value::Const(Const::Null), IrType::Ptr)
     }
 
     /// `a?.field` — evaluate `a` once; if it's null the result is the field's
