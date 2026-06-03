@@ -895,6 +895,52 @@ fn enum_is_layoutable(td: &TypeDecl) -> bool {
         })
 }
 
+/// Static byte size of a scalar / pointer / reference IR type, for sizing a
+/// heterogeneous payload-enum union slot. `None` for aggregates (`struct`) and
+/// `void`, whose size needs the target DataLayout.
+fn scalar_size(t: IrType) -> Option<u32> {
+    match t {
+        IrType::Bool => Some(1),
+        IrType::Int { bits, .. } => Some(u32::from(bits) / 8),
+        IrType::Float { bits } => Some(u32::from(bits) / 8),
+        IrType::Ptr | IrType::Ref(_) => Some(8),
+        IrType::Struct(_) | IrType::Void => None,
+    }
+}
+
+/// The union slot types for a payload enum's cases: max arity across cases, each
+/// slot the agreed type (homogeneous position) or the widest scalar member (a
+/// heterogeneous position — each case stores/loads its own type, the slot just
+/// reserves bytes). `None` if a heterogeneous position holds a `struct` payload,
+/// which can't be sized without the target DataLayout (such enums stay int-backed).
+fn payload_enum_slots(cases: &[(String, i64, Vec<IrType>)]) -> Option<Vec<IrType>> {
+    let maxf = cases.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
+    let mut slots = Vec::with_capacity(maxf);
+    for i in 0..maxf {
+        let tys: Vec<IrType> = cases
+            .iter()
+            .filter_map(|(_, _, p)| p.get(i).copied())
+            .collect();
+        let Some(&first) = tys.first() else {
+            slots.push(IrType::I64);
+            continue;
+        };
+        if tys.iter().all(|&t| t == first) {
+            slots.push(first);
+        } else if tys.iter().all(|&t| scalar_size(t).is_some()) {
+            slots.push(
+                tys.iter()
+                    .copied()
+                    .max_by_key(|&t| scalar_size(t).unwrap())
+                    .unwrap(),
+            );
+        } else {
+            return None;
+        }
+    }
+    Some(slots)
+}
+
 fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
     if td.kind == TypeKind::Enum
         && enum_has_payload(td)
@@ -935,28 +981,10 @@ fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
                 cases.push((name.text(src).to_string(), disc, ptys));
             }
         }
-        // Payload slot layout: max arity across cases; slot `i`'s type must be
-        // agreed by every case that fills it. A *heterogeneous* position (e.g.
-        // `A(int), B(float)`) can't share one typed slot, so such an enum isn't
-        // reclassified — it stays int-backed (registered in `enums`). A real
-        // size-based union (reinterpreting a byte blob per case) is a follow-on.
-        let maxf = cases.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
-        let mut slots: Vec<IrType> = Vec::with_capacity(maxf);
-        let mut homogeneous = true;
-        for i in 0..maxf {
-            let mut slot: Option<IrType> = None;
-            for (_, _, p) in &cases {
-                if let Some(&ft) = p.get(i) {
-                    match slot {
-                        None => slot = Some(ft),
-                        Some(prev) if prev == ft => {}
-                        Some(_) => homogeneous = false,
-                    }
-                }
-            }
-            slots.push(slot.unwrap_or(IrType::I64));
-        }
-        if homogeneous {
+        // Payload slot layout (`payload_enum_slots`): each position is the agreed
+        // type, or the widest scalar for a heterogeneous one. `None` ⇒ a
+        // heterogeneous *struct* payload we can't size — keep the enum int-backed.
+        if let Some(slots) = payload_enum_slots(&cases) {
             let mut fields = vec![FieldDef {
                 name: "$disc".to_string(),
                 ty: IrType::Int {
@@ -1043,26 +1071,11 @@ fn register_payload_enum_mono(
             cases.push((name.text(src).to_string(), disc, ptys));
         }
     }
-    // Homogeneity check (slot `i` agreed by every case that fills it).
-    let maxf = cases.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
-    let mut slots: Vec<IrType> = Vec::with_capacity(maxf);
-    let mut homogeneous = true;
-    for i in 0..maxf {
-        let mut slot: Option<IrType> = None;
-        for (_, _, p) in &cases {
-            if let Some(&ft) = p.get(i) {
-                match slot {
-                    None => slot = Some(ft),
-                    Some(prev) if prev == ft => {}
-                    Some(_) => homogeneous = false,
-                }
-            }
-        }
-        slots.push(slot.unwrap_or(IrType::I64));
-    }
-    if !homogeneous {
+    // Union slot layout — each position the agreed type or the widest scalar (see
+    // `payload_enum_slots`); `None` ⇒ a heterogeneous struct payload (kept int-backed).
+    let Some(slots) = payload_enum_slots(&cases) else {
         return;
-    }
+    };
     let mut fields = vec![FieldDef {
         name: "$disc".to_string(),
         ty: IrType::Int {
