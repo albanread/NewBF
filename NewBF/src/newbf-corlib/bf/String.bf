@@ -136,6 +136,28 @@ class String {
 		return this.Substring(0, hi);
 	}
 
+	// Split into substrings on each occurrence of `sep`. Always returns
+	// (separator count + 1) parts; adjacent separators yield empty parts. The
+	// caller owns the returned `String[]` and each `String` in it. Builds the
+	// result through `Substring`, so each part is its own owned buffer.
+	public String[] Split(char8 sep) {
+		int32 count = 1;
+		for (int32 i = 0; i < this.mLength; i++) {
+			if (this.mPtr[i] == sep) { count = count + 1; }
+		}
+		String[] parts = new String[count];
+		int32 idx = 0;
+		int32 start = 0;
+		for (int32 i = 0; i <= this.mLength; i++) {
+			if (i == this.mLength || this.mPtr[i] == sep) {
+				parts[idx] = this.Substring(start, i - start);
+				idx = idx + 1;
+				start = i + 1;
+			}
+		}
+		return parts;
+	}
+
 	public void Append(char8 c) {
 		if (this.mLength >= this.mCapacity) { this.Grow(); }
 		this.mPtr[this.mLength] = c;
