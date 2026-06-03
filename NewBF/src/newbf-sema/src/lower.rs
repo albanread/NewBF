@@ -4207,16 +4207,25 @@ impl<'a> Lowerer<'a> {
                 IrType::Struct(id) | IrType::Ref(id) => id,
                 _ => continue,
             };
+            // Among this type's `operator<sym>` overloads, pick the one whose two
+            // parameters best fit the operand types — so `String + String` and
+            // `String + char8` resolve to their respective overloads instead of
+            // whichever was registered first (which would coerce a `char8` into a
+            // `String` reference and dereference garbage).
+            let mut best: Option<(MethodSig, u32)> = None;
             for (key, sigs) in &self.structs.methods[id.0 as usize] {
                 if key.split_whitespace().collect::<String>() != want {
                     continue;
                 }
-                if let Some(sig) = sigs.iter().find(|s| !s.is_instance && s.params.len() == 2) {
-                    found = Some(sig.clone());
-                    break;
+                for s in sigs.iter().filter(|s| !s.is_instance && s.params.len() == 2) {
+                    let score = type_affinity(s.params[0], lt) + type_affinity(s.params[1], rt);
+                    if best.as_ref().is_none_or(|(_, bs)| score > *bs) {
+                        best = Some((s.clone(), score));
+                    }
                 }
             }
-            if found.is_some() {
+            if let Some((sig, _)) = best {
+                found = Some(sig);
                 break;
             }
         }

@@ -28,6 +28,22 @@ class String {
 	// The raw buffer, for length-based I/O (e.g. Console.Write over WriteFile).
 	public char8* Ptr() { return this.mPtr; }
 
+	// Concatenation: `a + b` builds a new owned String of a's bytes then b's.
+	// Selected over any other `+` because both operands are String.
+	public static String operator+(String a, String b) {
+		String r = new String();
+		r.Append(a);
+		r.Append(b);
+		return r;
+	}
+	// `a + c` appends a single char to a copy of `a`.
+	public static String operator+(String a, char8 c) {
+		String r = new String();
+		r.Append(a);
+		r.Append(c);
+		return r;
+	}
+
 	// Value equality: same length and same bytes.
 	public bool Equals(String other) {
 		if (this.mLength != other.Length()) { return false; }
