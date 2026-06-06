@@ -89,11 +89,13 @@ struct StructTable {
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
     /// name and lowers its methods at the mono id/prefix with the env.
     monos: Vec<MonoRecord>,
-    /// Generic-method monomorphs: mangled symbol -> lowered signature, so a call
-    /// site `Identity<int>(x)` resolves to a direct call.
-    gen_method_sigs: HashMap<String, MethodSig>,
-    /// (mangled symbol, method name, type-param env) per generic-method
-    /// instantiation, so lowering re-finds the decl and emits its body.
+    /// Generic-method monomorphs: composite key `(owner, name, type_codes)` ->
+    /// lowered signature, so a call site `Identity<int>(x)` resolves to a direct
+    /// call. Keyed by the triple (not the mangled string) so two owners can't
+    /// alias; in GM-A1 `owner` is always `None`.
+    gen_method_sigs: HashMap<GenMKey, MethodSig>,
+    /// One `GenMethodMono` per generic-method instantiation, so lowering
+    /// re-finds the decl and emits its body.
     gen_method_monos: Vec<GenMethodMono>,
     /// Int-backed enums: enum name -> (case name -> value). An enum type lowers to
     /// `int32`; `Enum.Case` is the constant. Only enums whose cases ALL lack a
@@ -140,9 +142,28 @@ struct StructTable {
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
 type MonoRecord = (StructId, String, Vec<(String, IrType)>);
 
-/// A generic-method monomorph to lower: `(mangled symbol, method name,
-/// type-param env)`. `lower_program` re-finds the decl by name and emits it.
-type GenMethodMono = (String, String, Vec<(String, IrType)>);
+/// Composite resolution key for a generic-method monomorph:
+/// `(owner, method name, type_codes(args))`. Keying by the triple (rather than
+/// the mangled symbol) means resolution never re-parses a symbol and two owners
+/// can never alias. In task GM-A1 the `owner` slot is always `None` (so the
+/// produced key/symbol is byte-identical to the old name-only mangling); later
+/// tasks fill it from the enclosing/receiver type.
+type GenMKey = (Option<StructId>, String, String);
+
+/// A generic-method monomorph to lower. `lower_program` re-finds the decl via
+/// `(owner, name)` and emits its body with `env` (its type-param bindings).
+/// `sym` is the owner-mangled IR symbol used as the function name and call
+/// target. In task GM-A1 `owner` is always `None`, so `sym` equals the old
+/// name-only `mangle_generic` output.
+struct GenMethodMono {
+    owner: Option<StructId>,
+    /// Owner-mangled IR symbol (the lowered function's name / call target).
+    sym: String,
+    /// Template method name (used to re-find the decl for emission).
+    name: String,
+    /// The method's own type-parameter bindings.
+    env: Vec<(String, IrType)>,
+}
 
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
@@ -273,7 +294,12 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
     }
 }
 
-type GenMethodDecls<'a> = HashMap<String, (&'a Member, &'a str)>;
+/// Generic-method decl index: `(owner, name)` -> the overloads declared under
+/// that owner+name (each `(member, src)`). The value is a `Vec` so a single
+/// owner can carry multiple same-named overloads. In GM-A1 every entry is keyed
+/// under `(None, name)` — the bare-cross-class fallback bucket — so behavior is
+/// unchanged; later tasks add `(Some(owner), name)` entries.
+type GenMethodDecls<'a> = HashMap<(Option<StructId>, String), Vec<(&'a Member, &'a str)>>;
 
 /// Index generic methods (those with type parameters) by name, paired with the
 /// owning file's `src`.
@@ -292,7 +318,12 @@ fn index_generic_methods<'a>(items: &'a [Item], src: &'a str, out: &mut GenMetho
                     } = m
                         && !generic_params.is_empty()
                     {
-                        out.entry(name.text(src).to_string()).or_insert((m, src));
+                        // GM-A1: owner hardcoded `None`. The `Vec` preserves the
+                        // old first-writer-wins behavior because every lookup
+                        // takes `.first()`.
+                        out.entry((None, name.text(src).to_string()))
+                            .or_default()
+                            .push((m, src));
                     }
                 }
             }
@@ -638,7 +669,10 @@ fn record_method_inst(
     t: &mut StructTable,
     env: &[(String, IrType)],
 ) {
-    let Some(&(member, mdecl_src)) = gmethods.get(name) else {
+    // GM-A1: owner hardcoded `None`. Look up the `(None, name)` bucket and take
+    // the first overload (preserves the old first-writer-wins behavior).
+    let Some(&(member, mdecl_src)) = gmethods.get(&(None, name.to_string())).and_then(|v| v.first())
+    else {
         return;
     };
     let Member::Method {
@@ -654,8 +688,13 @@ fn record_method_inst(
     if argtys.len() != generic_params.len() {
         return;
     }
-    let mangled = mangle_generic(name, &argtys);
-    if t.gen_method_sigs.contains_key(&mangled) {
+    // GM-A1: owner is `None`, so the composite key's type-codes component and the
+    // mangled symbol both match the old name-only mangling exactly.
+    let owner: Option<StructId> = None;
+    let codes = type_codes(&argtys);
+    let mangled = mangle_generic_method(owner, name, &argtys, t);
+    let key: GenMKey = (owner, name.to_string(), codes);
+    if t.gen_method_sigs.contains_key(&key) {
         return;
     }
     let env: Vec<(String, IrType)> = generic_params
@@ -669,7 +708,7 @@ fn record_method_inst(
         .collect();
     let ret = lower_ty_env(return_ty, mdecl_src, t, &env);
     t.gen_method_sigs.insert(
-        mangled.clone(),
+        key,
         MethodSig {
             full_name: mangled.clone(),
             ret,
@@ -678,7 +717,12 @@ fn record_method_inst(
             variadic: None,
         },
     );
-    t.gen_method_monos.push((mangled, name.to_string(), env));
+    t.gen_method_monos.push(GenMethodMono {
+        owner,
+        sym: mangled,
+        name: name.to_string(),
+        env,
+    });
 }
 
 #[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
@@ -1984,6 +2028,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 None,
                 &[],
                 &extra,
+                None,
             )
         } else {
             // Capturing → a closure function taking the env as `$self`.
@@ -2010,6 +2055,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             None,
             &[],
             &[],
+            None,
         ) {
             m.add_function(func);
         }
@@ -2033,8 +2079,12 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     for f in &all {
         index_generic_methods(&f.unit.items, f.src, &mut gmethods);
     }
-    for (mangled, name, env) in &structs.gen_method_monos {
-        if let Some(&(member, mdecl_src)) = gmethods.get(name)
+    for mono in &structs.gen_method_monos {
+        // GM-A1: re-find the decl via `(owner, name)` (owner is always `None`);
+        // take the first overload (preserves first-writer-wins).
+        if let Some(&(member, mdecl_src)) = gmethods
+            .get(&(mono.owner, mono.name.clone()))
+            .and_then(|v| v.first())
             && let Member::Method {
                 return_ty,
                 params,
@@ -2042,10 +2092,10 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 ..
             } = member
         {
-            let ret = lower_ty_env(return_ty, mdecl_src, &structs, env);
+            let ret = lower_ty_env(return_ty, mdecl_src, &structs, &mono.env);
             let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
             if let Some(func) = lower_method(
-                mangled.clone(),
+                mono.sym.clone(),
                 ret,
                 params,
                 body,
@@ -2053,8 +2103,10 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 &empty,
                 &structs,
                 None,
-                env,
+                &mono.env,
                 &[],
+                // GM-A1: always `None` (the gen-method monos carry no owner yet).
+                mono.owner,
             ) {
                 m.add_function(func);
             }
@@ -2316,6 +2368,7 @@ fn lower_type_at(
                     this_ty,
                     env,
                     &[],
+                    owner_id,
                 ) {
                     m.add_function(func);
                 }
@@ -2339,6 +2392,7 @@ fn lower_type_at(
                         this,
                         env,
                         &[],
+                        owner_id,
                     ) {
                         m.add_function(func);
                     }
@@ -2359,6 +2413,7 @@ fn lower_type_at(
                         this,
                         env,
                         &[],
+                        owner_id,
                     ) {
                         m.add_function(func);
                     }
@@ -2416,6 +2471,7 @@ fn lower_type_at(
                             this_ty,
                             env,
                             &[],
+                            owner_id,
                         ) {
                             m.add_function(func);
                         }
@@ -2458,6 +2514,7 @@ fn lower_type_at(
                             this_ty,
                             env,
                             &[("value", pty)],
+                            owner_id,
                         ) {
                             m.add_function(func);
                         }
@@ -2498,7 +2555,7 @@ fn lower_type_at(
 
 // Threads the per-type method table + program struct table alongside the
 // signature; a context struct is a future cleanup, not worth the churn now.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // lowering entry: threaded method context
 fn lower_method(
     full_name: String,
     ret: IrType,
@@ -2510,6 +2567,7 @@ fn lower_method(
     this_ty: Option<IrType>,
     env: TyEnv,
     extra: &[(&str, IrType)],
+    cur_type: Option<StructId>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -2538,7 +2596,7 @@ fn lower_method(
     }));
 
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
-    let mut lw = Lowerer::new(fb, ret, methods, structs, env);
+    let mut lw = Lowerer::new(fb, ret, methods, structs, env, cur_type);
 
     // Spill `this` into a slot at entry, recorded for `Expr::This`.
     let base = if this_ty.is_some() { 1 } else { 0 };
@@ -2655,7 +2713,7 @@ fn emit_closure(
     }));
     let fb = FunctionBuilder::new(name.to_string(), ir_params, ret);
     let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
-    let mut lw = Lowerer::new(fb, ret, &empty, structs, &[]);
+    let mut lw = Lowerer::new(fb, ret, &empty, structs, &[], None);
 
     // Captures: bind each name to its env address `$self[i+1]`.
     let self_env = Value::Param(0);
@@ -2716,6 +2774,13 @@ struct Lowerer<'a> {
     /// The `this` slot in an instance method / ctor / dtor: a stack slot
     /// holding the `Ref` to the instance body. `None` in static contexts.
     this_slot: Option<(Value, IrType)>,
+    /// The enclosing type being lowered (the owner of the current method/ctor/
+    /// dtor), for *both* static and instance contexts — distinct from
+    /// `this_slot`, which governs whether to prepend a `this`. Populated in
+    /// GM-A1 (threaded from `lower_type_at`'s `owner_id`) but **not yet read**;
+    /// GM-A2 uses it to resolve the owner of a bare generic-method call.
+    #[allow(dead_code)] // GM-A1: populated now, first read in GM-A2.
+    cur_type: Option<StructId>,
     /// Generic type-parameter env when lowering a monomorph's body (so a `T`
     /// local declaration resolves to its concrete type). Empty otherwise.
     env: TyEnv<'a>,
@@ -2761,6 +2826,7 @@ impl<'a> Lowerer<'a> {
         methods: &'a HashMap<String, Vec<MethodSig>>,
         structs: &'a StructTable,
         env: TyEnv<'a>,
+        cur_type: Option<StructId>,
     ) -> Self {
         Self {
             fb,
@@ -2771,6 +2837,7 @@ impl<'a> Lowerer<'a> {
             structs,
             loops: Vec::new(),
             this_slot: None,
+            cur_type,
             env,
             fn_sigs: HashMap::new(),
             closures: std::collections::HashSet::new(),
@@ -3778,8 +3845,10 @@ impl<'a> Lowerer<'a> {
                         .iter()
                         .map(|a| lower_ty_env(a, src, self.structs, self.env))
                         .collect();
-                    let mangled = mangle_generic(mname, &argtys);
-                    if let Some(sig) = self.structs.gen_method_sigs.get(&mangled).cloned()
+                    // GM-A1: owner hardcoded `None`. The composite key matches
+                    // the old name-only key exactly (codes == old mangling tail).
+                    let key: GenMKey = (None, mname.to_string(), type_codes(&argtys));
+                    if let Some(sig) = self.structs.gen_method_sigs.get(&key).cloned()
                         && sig.params.len() == args.len()
                     {
                         let call_args: Vec<Value> = args
@@ -6431,6 +6500,29 @@ fn param_ir_ty(p: &AstParam, src: &str, structs: &StructTable, env: TyEnv) -> Ir
 /// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
 fn mangle_generic(name: &str, args: &[IrType]) -> String {
     format!("{name}${}", type_codes(args))
+}
+
+/// The owner-qualified symbol of a generic-*method* monomorph.
+/// `Some(id)` → `"{prefixes[id]}{name}${codes}"` (e.g. `"Box.Get$i32"`),
+/// `None`    → `"{name}${codes}"` (free / bare-cross-class static — identical to
+/// the old name-only `mangle_generic` output). `prefixes[id]` already encodes
+/// the owner's full path *and* its monomorph args (`"List$i64."`), and
+/// `type_codes` never emits `.`, so the dot is a safe owner separator.
+///
+/// GM-A1 always passes `None`, so the produced symbol is byte-identical to
+/// today's; later tasks pass `Some(owner)` to disambiguate same-named methods
+/// in different types.
+fn mangle_generic_method(
+    owner: Option<StructId>,
+    name: &str,
+    args: &[IrType],
+    t: &StructTable,
+) -> String {
+    let codes = type_codes(args);
+    match owner {
+        Some(id) => format!("{}{name}${codes}", t.prefixes[id.0 as usize]),
+        None => format!("{name}${codes}"),
+    }
 }
 
 /// The method name of a generic-call callee base — `Name` for a bare
