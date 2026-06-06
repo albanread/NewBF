@@ -5061,8 +5061,11 @@ impl<'a> Lowerer<'a> {
                             let w = self.coerce(v, t, IrType::I64);
                             self.append_to_string(s.clone(), id, w, IrType::I64);
                         }
-                        // No matching Append overload (bool, float, refs…): the
-                        // value was evaluated above for its effects; skip it.
+                        IrType::Bool => {
+                            self.append_to_string(s.clone(), id, v, IrType::Bool);
+                        }
+                        // No matching Append overload (float, refs…): the value
+                        // was evaluated above for its effects; skip it.
                         _ => {}
                     }
                 }

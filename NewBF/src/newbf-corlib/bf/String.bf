@@ -224,6 +224,16 @@ class String {
 			this.AppendDigits(n);
 		}
 	}
+	// Append `true`/`false`. Selected over the other overloads by argument type;
+	// useful for interpolation holes (`$"ok={flag}"`).
+	public void Append(bool b) {
+		if (b) {
+			this.Append('t'); this.Append('r'); this.Append('u'); this.Append('e');
+		} else {
+			this.Append('f'); this.Append('a'); this.Append('l');
+			this.Append('s'); this.Append('e');
+		}
+	}
 	// Append n's decimal digits most-significant-first: recurse on the high
 	// digits before appending the current low one. Assumes n >= 0.
 	void AppendDigits(int n) {
