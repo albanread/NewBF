@@ -108,30 +108,25 @@ struct StructTable {
     // declared (and kept in lockstep) here in IT-T1.
     /// Per class id: the interfaces it implements, transitively flattened and
     /// dedup'd, deterministic order. Empty for value structs and interfaces.
-    /// Populated in IT-T2 (`collect_iface_bases`).
-    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
+    /// Populated in IT-T2 (`collect_iface_bases`); read in IT-T3 (`apply_itables`).
     iface_bases: Vec<Vec<StructId>>,
     /// Per interface id: its instance, NON-GENERIC method slot signature,
     /// (name, sig) in declaration order (base-interface methods first). Drives
     /// slot layout and the method->index lookup at dispatch. Populated in IT-T2
-    /// (`fill_iface_members`).
-    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
+    /// (`fill_iface_members`); read in IT-T3 (`apply_itables`).
     imethods: Vec<Vec<(String, MethodSig)>>,
     /// Per interface id: a default-body symbol per slot (`Some` for a default
     /// interface method, `None` for an abstract one), parallel to `imethods`.
-    /// Populated in IT-T2.
-    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
+    /// Populated in IT-T2; read in IT-T3 (`apply_itables`, resolution step 3).
     idefaults: Vec<Vec<Option<String>>>,
     /// Explicit interface implementations: (class id, iface id, method name)
     /// -> the impl MethodSig. Consulted by `apply_itables` before the implicit
     /// same-name `pick_overload`. Filled from `Member::Method.explicit_iface`
-    /// in IT-T2.
-    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
+    /// in IT-T2; read in IT-T3.
     explicit_impls: HashMap<(StructId, StructId, String), MethodSig>,
     /// Global per-interface vtable slot base: interface id -> first vtable slot
     /// every implementer reserves for it. Stable across all implementers.
     /// Computed in IT-T3 (`apply_itables`).
-    #[allow(dead_code)] // populated in IT-T2/T3
     iface_slot_base: HashMap<StructId, usize>,
     /// Monomorphized generic instantiations to lower: `(mono id, generic type
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
@@ -371,6 +366,15 @@ impl StructTable {
         //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
         apply_vtables(&mut t);
+        // 5b. Itables (IT-T3): compose each implemented interface's methods into
+        //     the class vtables at a globally-fixed per-interface slot base. Runs
+        //     immediately after `apply_vtables` so every class's `vimpls` length
+        //     is final (including generic-class monomorphs) and `methods[class]`
+        //     already includes inherited methods (`apply_inheritance` ran). After
+        //     this, a class implementing an interface has the impl symbol sitting
+        //     in its (grown, null-padded) vtable at the interface's slot base; the
+        //     call site does not dispatch through it yet (that is IT-T5).
+        apply_itables(&mut t);
         // Default-id hazard guard: `func_struct` must genuinely be the `$Func`
         // value-struct (registered first, at `StructId(0)`), with exactly two
         // `Ptr` fields. If this ever fails, an unset/aliased `func_struct` would
@@ -831,6 +835,177 @@ fn compose_vtable(id: StructId, t: &mut StructTable, done: &mut [bool]) {
             t.vimpls[i].push(full);
         }
     }
+}
+
+/// Whether two IR types are ABI-compatible for an itable slot (itables.md §5 T3):
+/// equal types match, and any two pointer-likes match (all pointers/refs lower to
+/// the same LLVM `ptr`, so a concrete impl may legitimately name a different
+/// nominal id than the interface slot signature — e.g. `Ref(square)` vs
+/// `Ref(ishape)` for `this`, or a `Ref(class)` arg vs an `Ref(iface)` formal).
+/// A non-pointer scalar (int/float width, struct id) must match exactly, or
+/// `call_indirect` through the slot would read/write the wrong ABI.
+fn abi_compatible(a: IrType, b: IrType) -> bool {
+    a == b || (a.is_pointer() && b.is_pointer())
+}
+
+/// IT-T3 — Compose itables into the class vtables (itables.md §4/§5/§9 T3).
+///
+/// For every CLASS, each implemented interface's methods are appended to the
+/// class vtable at a **globally-fixed per-interface slot base**, so the concrete
+/// class is not needed at a dispatch site (IT-T5): the slot for `(I, method k)`
+/// is `iface_slot_base[I] + k` in every implementer.
+///
+/// Slot-base assignment (itables.md §4, exact): `N = max over ALL ids of
+/// vimpls[c].len()` (the longest class vtable across the whole table, monomorphs
+/// included). Walk interfaces in `StructId` order with cursor `base = N`; each
+/// interface `I` gets `iface_slot_base[I] = base`, then `base += imethods[I]`.
+/// Because every class's class block is `[0, vimpls[c].len()) ⊆ [0, N)`, no
+/// interface block ever overlaps a class block or another interface block — so
+/// growing each implementer's `vimpls` to cover its used iface slots (null-padding
+/// any gap) is bounds-safe.
+///
+/// Per-class impl resolution for slot `(name, isig)` at index `k` of interface
+/// `iface`: (1) `explicit_impls[(class, iface, name)]`; else (2) `pick_overload`
+/// over `methods[class]` (which includes INHERITED methods — `apply_inheritance`
+/// ran first); else (3) the interface default `idefaults[iface][k]`; else (4) an
+/// empty-string placeholder (→ `const_null` slot via `emit_vtables`). Before
+/// wiring a chosen impl its non-pointer param/return types are asserted equal to
+/// the slot signature's (`abi_compatible`); a mismatch falls back to the null
+/// placeholder rather than an ill-typed `call_indirect` target.
+///
+/// Value structs and interfaces themselves get no itable slots (a value struct
+/// listing an interface base is boxing, out of scope — and has no vtable to
+/// dispatch through). This composes only the slot tables; it changes no call site
+/// (IT-T5) and emits no default-method body (IT-T6).
+fn apply_itables(t: &mut StructTable) {
+    let nids = t.vimpls.len();
+    // (2) N = the longest class vtable across the WHOLE table (monomorphs
+    // included), so every interface block sits strictly after every class block.
+    let n = t.vimpls.iter().map(|v| v.len()).max().unwrap_or(0);
+    // (2) Global per-interface slot base: walk interfaces in StructId order from
+    // cursor `N`, reserving `imethods[I].len()` slots for each.
+    let mut base = n;
+    for i in 0..nids {
+        let id = StructId(i as u32);
+        if is_interface(t, id) {
+            t.iface_slot_base.insert(id, base);
+            base += t.imethods[i].len();
+        }
+    }
+    // (3) Per-class composition. Iterate classes only; value structs/interfaces
+    // are skipped (their `iface_bases` is empty by construction in IT-T2, but the
+    // kind guard makes the intent explicit and tolerates a stray entry).
+    for i in 0..nids {
+        let class = StructId(i as u32);
+        if !matches!(t.kinds[i], StructKind::Ref) {
+            continue;
+        }
+        // Clone the per-class iface list so the loop body can borrow `t` mutably.
+        let ifaces = t.iface_bases[i].clone();
+        for iface in ifaces {
+            let slot_base = t.iface_slot_base[&iface];
+            // Bounds keystone (itables.md §4): the interface block starts at or
+            // beyond this class's class block, so no interface slot overwrites a
+            // class virtual slot (or another interface's block).
+            debug_assert!(
+                slot_base >= t.vimpls[i].len(),
+                "iface block (base {slot_base}) overlaps class block (len {}) for class {i}",
+                t.vimpls[i].len()
+            );
+            let slots = t.imethods[iface.0 as usize].clone();
+            for (k, (name, isig)) in slots.iter().enumerate() {
+                let target_slot = slot_base + k;
+                // Resolve the impl symbol in priority order.
+                let sym = resolve_itable_impl(t, class, iface, name, isig, k);
+                // Grow `vimpls[class]` so `target_slot` is in range, null-padding
+                // the gap (between the class block and the first iface block, and
+                // between non-contiguous iface blocks) with empty strings —
+                // `emit_vtables` lowers an empty entry to `const_null`.
+                if t.vimpls[i].len() <= target_slot {
+                    t.vimpls[i].resize(target_slot + 1, String::new());
+                }
+                t.vimpls[i][target_slot] = sym;
+            }
+        }
+    }
+}
+
+/// Resolve the implementing symbol for interface slot `(name, isig)` (index `k`
+/// of `iface`) on `class`, per itables.md §5 T3: explicit impl → same-name
+/// overload (incl. inherited) → interface default → null placeholder. Returns the
+/// impl symbol, or an empty string (→ null slot) when unresolved or ABI-mismatched.
+fn resolve_itable_impl(
+    t: &StructTable,
+    class: StructId,
+    iface: StructId,
+    name: &str,
+    isig: &MethodSig,
+    k: usize,
+) -> String {
+    // The interface slot's formal params past the leading `this`.
+    let formals: &[IrType] = if isig.params.is_empty() {
+        &[]
+    } else {
+        &isig.params[1..]
+    };
+    // (1) Explicit interface implementation `Ret IFace.Member(…)`.
+    if let Some(sig) = t
+        .explicit_impls
+        .get(&(class, iface, name.to_string()))
+        .filter(|sig| itable_abi_matches(sig, isig))
+    {
+        return sig.full_name.clone();
+    }
+    // (2) Implicit same-name method on the class (incl. INHERITED methods —
+    // `apply_inheritance` already merged the base's methods into `methods[class]`).
+    if let Some(sig) = t.methods[class.0 as usize]
+        .get(name)
+        .and_then(|cands| pick_overload(cands, formals, /*members=*/ true))
+        .filter(|sig| itable_abi_matches(sig, isig))
+    {
+        return sig.full_name.clone();
+    }
+    // (3) The interface's own default-body symbol, if this is a default method.
+    if let Some(Some(default_sym)) = t.idefaults[iface.0 as usize].get(k) {
+        return default_sym.clone();
+    }
+    // (4) Unresolved required slot → null placeholder. v1 policy (itables.md §4,
+    // §10): a null slot segfaults cleanly if ever called, paired with a
+    // composition-time diagnostic. `StructTable::build` has no diagnostic sink
+    // (diagnostics live in the separate model-graph `resolve_and_check` pass), so
+    // this surfaces as a `debug_assert!` — loud in test/debug builds, a graceful
+    // null slot in release. Routing a real `Diagnostic` would require threading a
+    // sink through `build` and every call site (out of IT-T3 scope).
+    debug_assert!(
+        false,
+        "class {} (id {}) does not implement {}.{name}",
+        t.prefixes[class.0 as usize],
+        class.0,
+        t.prefixes[iface.0 as usize],
+    );
+    String::new()
+}
+
+/// ABI assertion (itables.md §5 T3): a chosen impl's non-pointer param/return IR
+/// types must equal the interface slot signature's; pointer-likes are
+/// ABI-identical and may differ in nominal id (the leading `this` always does:
+/// `Ref(class)` impl vs `Ref(iface)` slot). Arity must match too. A mismatch
+/// (a sema/typing inconsistency) is logged loud in debug and rejected so the slot
+/// falls back to the null placeholder instead of a wrong-typed `call_indirect`.
+fn itable_abi_matches(sig: &MethodSig, isig: &MethodSig) -> bool {
+    let ok = sig.params.len() == isig.params.len()
+        && abi_compatible(sig.ret, isig.ret)
+        && sig
+            .params
+            .iter()
+            .zip(&isig.params)
+            .all(|(&a, &b)| abi_compatible(a, b));
+    debug_assert!(
+        ok,
+        "itable ABI mismatch: impl {} {:?}->{:?} vs slot {:?}->{:?}",
+        sig.full_name, sig.params, sig.ret, isig.params, isig.ret
+    );
+    ok
 }
 
 // --- itables: interface members & bases (itables.md §5 T2) ---------------------
@@ -8381,5 +8556,116 @@ mod tests {
                 .contains_key(&(c, igreet, "Explicit".to_string())),
             "explicit interface impl recorded in explicit_impls"
         );
+    }
+
+    /// IT-T3 composition gate (itables.md §8): `apply_itables` lays each
+    /// implemented interface's methods into the class vtable at the global
+    /// per-interface slot base.
+    ///   - `Square` (no `virtual` of its own) gets a NON-EMPTY `vimpls` with its
+    ///     `Area` impl symbol at `iface_slot_base[IShape]` (so a vtable global is
+    ///     emitted for an otherwise-vtableless interface-only class);
+    ///   - `iface_slot_base[I] >= N` (the global class-vtable max) — the bounds
+    ///     keystone that keeps no interface block overlapping a class block;
+    ///   - `class C : Base, IFace` whose `IFace.M` is satisfied PURELY by an
+    ///     inherited `Base.M` resolves the slot to Base's symbol;
+    ///   - each implementer's `vimpls` is grown to cover its highest used slot.
+    #[test]
+    fn it_t3_compose_itables() {
+        let src = r#"
+            interface IShape { int32 Area(); }
+            class Square : IShape { public int32 Area() { return 9; } }
+
+            interface IFace { int32 M(); }
+            class Base { public int32 M() { return 5; } }
+            class Derived : Base, IFace { }
+
+            // A class with REAL virtual slots, so the global class-vtable max N is
+            // non-zero — forcing every interface block strictly beyond it.
+            class Animal { public virtual int32 Speak() { return 1; } }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+        let id = |n: &str| *t.by_name.get(n).unwrap_or_else(|| panic!("{n} must register"));
+        let ishape = id("IShape");
+        let square = id("Square");
+        let iface = id("IFace");
+        let derived = id("Derived");
+
+        // The global class-vtable max N is the longest CLASS VIRTUAL block. After
+        // `apply_itables` grows `vimpls` with appended interface slots, the
+        // pre-itable class block length is recoverable as `vslots[c].len()`
+        // (`apply_itables` only ever grows `vimpls`, never `vslots`). Every
+        // interface slot base must sit at or beyond this N (the bounds keystone).
+        let n = t.vslots.iter().map(|m| m.len()).max().unwrap_or(0);
+        assert!(n >= 1, "Animal contributes at least one virtual slot, so N >= 1");
+        for (&i, &b) in &t.iface_slot_base {
+            assert!(
+                b >= n,
+                "iface_slot_base[{}] = {b} must be >= N = {n} (class-block bound)",
+                i.0
+            );
+        }
+
+        // Square has NO virtual of its own, yet `apply_itables` gives it a
+        // non-empty vimpls — so `emit_vtables` emits a `Square$vtable` global.
+        let sq_base = t.iface_slot_base[&ishape];
+        assert!(
+            !t.vimpls[square.0 as usize].is_empty(),
+            "interface-only class Square gets a non-empty vimpls (vtable global emitted)"
+        );
+        // The `Area` slot is the first (only) `imethods[IShape]` entry, at base+0.
+        let area_idx = t.imethods[ishape.0 as usize]
+            .iter()
+            .position(|(n, _)| n == "Area")
+            .expect("IShape has an Area slot");
+        assert_eq!(
+            t.vimpls[square.0 as usize][sq_base + area_idx],
+            "Square.Area",
+            "Square.Area impl symbol sits at iface_slot_base[IShape] + Area index"
+        );
+        // The vimpls is grown to cover that slot (and any null-padded gap below it).
+        assert!(
+            t.vimpls[square.0 as usize].len() > sq_base + area_idx,
+            "Square.vimpls grown to cover its highest used iface slot"
+        );
+
+        // `Derived : Base, IFace` — IFace.M is satisfied by INHERITED Base.M
+        // (apply_inheritance ran first), so the slot resolves to Base's symbol.
+        let if_base = t.iface_slot_base[&iface];
+        let m_idx = t.imethods[iface.0 as usize]
+            .iter()
+            .position(|(n, _)| n == "M")
+            .expect("IFace has an M slot");
+        // The symbol Base.M lowered to (inherited into Derived's methods table).
+        let base_m_sym = t.methods[derived.0 as usize]
+            .get("M")
+            .and_then(|c| c.first())
+            .map(|s| s.full_name.clone())
+            .expect("Derived inherits Base.M into its methods table");
+        assert_eq!(base_m_sym, "Base.M", "inherited method keeps Base's symbol");
+        assert_eq!(
+            t.vimpls[derived.0 as usize][if_base + m_idx],
+            base_m_sym,
+            "Derived's IFace.M slot resolves to the inherited Base.M symbol"
+        );
+
+        // No interface block overlaps a class virtual block: every used iface
+        // slot index is >= the class's own virtual-slot count (`vslots.len()`),
+        // so an interface impl never overwrites a class virtual slot.
+        for &cls in &[square, derived] {
+            let class_block = t.vslots[cls.0 as usize].len();
+            for ifid in &t.iface_bases[cls.0 as usize] {
+                assert!(
+                    t.iface_slot_base[ifid] >= class_block,
+                    "iface block for class {} sits beyond its virtual block",
+                    cls.0
+                );
+            }
+        }
     }
 }
