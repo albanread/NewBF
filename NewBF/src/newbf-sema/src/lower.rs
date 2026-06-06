@@ -6315,14 +6315,22 @@ impl<'a> Lowerer<'a> {
     fn struct_base(&mut self, base: &Expr, src: &str) -> Option<(Value, StructId)> {
         match self.lvalue(base, src) {
             Some((place, IrType::Struct(id))) => Some((place, id)),
+            // IT-T4: the `Ref` arm returns `(body, id)` for BOTH class and
+            // interface receivers (an interface-typed value is `Ref(iface_id)`,
+            // IT-T1) — no gating on class-ness. So an interface lvalue's body
+            // pointer reaches the interface-dispatch branch in `lower_method_call`.
             Some((place, IrType::Ref(id))) => {
                 let body = self.fb.load(place, IrType::Ptr);
                 Some((body, id))
             }
+            // A non-pointer lvalue (a scalar); an interface lvalue is `Ref`, so
+            // it never lands here.
             Some(_) => None,
             None => {
                 // Non-lvalue base (e.g. `new C().x`): a reference rvalue is
-                // itself the body pointer.
+                // itself the body pointer. Also covers an interface-typed rvalue
+                // (e.g. a method returning `IShape`) — its `Ref(iface_id)` flows
+                // straight through as the body pointer.
                 let (v, t) = self.expr(base, src);
                 if let IrType::Ref(id) = t {
                     Some((v, id))
@@ -7360,6 +7368,52 @@ impl<'a> Lowerer<'a> {
                 let r = self.fb.call(sig.full_name, call_args, sig.ret);
                 return (r, sig.ret);
             }
+        }
+        // Interface dispatch (IT-T5, itables.md §5/§5.6). A SEPARATE branch that
+        // MUST come BEFORE the methods-keyed block below: an abstract interface
+        // method is recorded in `imethods` but NOT in `methods` (it has no body),
+        // so the methods-keyed `pick_overload` would fail and the call would fall
+        // to the undef catch-all. Here the receiver's *static* type is an
+        // interface (`struct_base` yields `(body_ptr, owner_id)` with
+        // `kinds[owner_id] == Interface`, since IT-T1 makes interface types
+        // `Ref(iface_id)` and `struct_base`'s `Ref` arm returns `(body, id)`
+        // regardless of class-ness — see IT-T4). The slot is globally fixed for
+        // `(interface, method)` (IT-T3's `iface_slot_base[iface] + midx`), so the
+        // concrete class is never needed: load the vtable from the object header,
+        // index the slot, and `call_indirect`. The whole sequence is emitted
+        // inline in the current block (like the existing virtual call), so every
+        // value dominates its use trivially (no new block, no phi — R8-safe).
+        if let Some((body_ptr, owner_id)) = self.struct_base(base, src)
+            && matches!(self.structs.kinds[owner_id.0 as usize], StructKind::Interface)
+            && let Some(midx) = self.structs.imethods[owner_id.0 as usize]
+                .iter()
+                .position(|(n, _)| n == mname)
+        {
+            let sig = self.structs.imethods[owner_id.0 as usize][midx].1.clone();
+            let base_slot = self.structs.iface_slot_base[&owner_id];
+            let slot = base_slot + midx;
+            // Header is at offset 0. An interface has an EMPTY StructDef (no
+            // `$header` field), so use a RAW pointer-indexed GEP (`elem_addr`
+            // body_ptr[0] : Ptr), NOT `field_addr` through the interface id.
+            let hdr = self
+                .fb
+                .elem_addr(body_ptr.clone(), IrType::Ptr, Value::int(0, IrType::I64));
+            let vtbl = self.fb.load(hdr, IrType::Ptr);
+            let slotp =
+                self.fb
+                    .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
+            let fnptr = self.fb.load(slotp, IrType::Ptr);
+            // `this`-leading; coerce each arg to the slot sig's param type
+            // (params[0] is `this : Ref(iface_id)`; formals start at index 1).
+            let mut call_args = vec![body_ptr];
+            let mut pidx = 1;
+            for (v, t) in arg_vals {
+                let pt = sig.params.get(pidx).copied().unwrap_or(t);
+                call_args.push(self.coerce(v, t, pt));
+                pidx += 1;
+            }
+            let r = self.fb.call_indirect(fnptr, call_args, sig.ret);
+            return (r, sig.ret);
         }
         // Instance call `obj.Method(args)` / `this.Method(args)`. `members: true`
         // admits instance overloads (matched past `this`) and statics.
