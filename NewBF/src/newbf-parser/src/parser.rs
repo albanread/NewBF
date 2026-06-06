@@ -1571,26 +1571,47 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // Multiple declarators: `int a, b = 2, c;` — keep first, consume rest.
+        let first = Stmt::Local {
+            span: self.finish(lo),
+            is_let: false,
+            ty: Some(ty.clone()),
+            name,
+            init,
+        };
+        // Multiple declarators: `int a, b = 2, c;` — each re-uses the leading
+        // type, becoming a scope-transparent `Stmt::Locals` group. (Only in
+        // statement context; a for-init handles its own commas.)
         if consume_semi {
+            let mut decls = vec![first];
             while self.eat(TokenKind::Comma) {
                 if !self.at(TokenKind::Ident) {
                     break;
                 }
-                self.bump(); // name
-                if self.eat(TokenKind::Assign) {
-                    let _ = self.expr();
-                }
+                let dlo = self.start();
+                let dname = self.bump().span;
+                let dinit = if self.eat(TokenKind::Assign) {
+                    Some(self.expr())
+                } else {
+                    None
+                };
+                decls.push(Stmt::Local {
+                    span: self.finish(dlo),
+                    is_let: false,
+                    ty: Some(ty.clone()),
+                    name: dname,
+                    init: dinit,
+                });
             }
             self.expect(TokenKind::Semicolon, "`;` after local variable");
+            if decls.len() == 1 {
+                return decls.pop();
+            }
+            return Some(Stmt::Locals {
+                span: self.finish(lo),
+                decls,
+            });
         }
-        Some(Stmt::Local {
-            span: self.finish(lo),
-            is_let: false,
-            ty: Some(ty),
-            name,
-            init,
-        })
+        Some(first)
     }
 
     fn switch_stmt(&mut self) -> Stmt {

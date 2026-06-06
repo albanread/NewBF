@@ -390,6 +390,11 @@ fn register_tuples_in_stmt(stmt: &Stmt, src: &str, t: &mut StructTable) {
             }
         }
         Stmt::Local { ty: Some(ty), .. } => register_tuple_type(ty, src, t),
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                register_tuples_in_stmt(d, src, t);
+            }
+        }
         Stmt::If { then, els, .. } => {
             register_tuples_in_stmt(then, src, t);
             if let Some(e) = els {
@@ -770,6 +775,11 @@ fn collect_insts_stmt<'a>(
             }
             if let Some(e) = init {
                 collect_insts_expr(e, src, generics, gmethods, t, seen, monos, env);
+            }
+        }
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                collect_insts_stmt(d, src, generics, gmethods, t, seen, monos, env);
             }
         }
         Stmt::Expr { expr, .. } => {
@@ -1784,6 +1794,11 @@ fn collect_lambdas_stmt<'a>(
         | Stmt::For { body, .. }
         | Stmt::ForEach { body, .. }
         | Stmt::Defer { body, .. } => collect_lambdas_stmt(body, src, structs, emits),
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                collect_lambdas_stmt(d, src, structs, emits);
+            }
+        }
         _ => {}
     }
 }
@@ -2877,6 +2892,16 @@ impl<'a> Lowerer<'a> {
                 self.expr(expr, src);
             }
             Stmt::Empty(_) => {}
+            // A multi-declarator group `int a = 1, b = 2;` — lower each in the
+            // *current* scope (it's scope-transparent, unlike a block).
+            Stmt::Locals { decls, .. } => {
+                for d in decls {
+                    self.stmt(d, src);
+                    if self.terminated {
+                        break;
+                    }
+                }
+            }
             Stmt::Local { ty, name, init, .. } => {
                 // Resolve the declared slot type up front so a target-typed enum
                 // initializer (`Option<int32> a = .Some(40);`) can pick the right
@@ -3498,6 +3523,11 @@ impl<'a> Lowerer<'a> {
                     self.caps_expr(e, src, bound, seen, caps);
                 }
                 bound.insert(name.text(src).to_string());
+            }
+            Stmt::Locals { decls, .. } => {
+                for d in decls {
+                    self.caps_stmt(d, src, bound, seen, caps);
+                }
             }
             Stmt::Expr { expr, .. } => self.caps_expr(expr, src, bound, seen, caps),
             Stmt::Return { value: Some(e), .. } => self.caps_expr(e, src, bound, seen, caps),

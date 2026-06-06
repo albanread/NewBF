@@ -417,6 +417,11 @@ pub enum Stmt {
         name: Span,
         init: Option<Expr>,
     },
+    /// A multi-declarator local statement `int a = 1, b = 2;` — a *scope-
+    /// transparent* group of [`Stmt::Local`]s (each declarator after the first
+    /// re-uses the leading type). Unlike a `Block`, it introduces no new scope:
+    /// every declared name belongs to the enclosing block.
+    Locals { span: Span, decls: Vec<Stmt> },
     /// `if (cond) then [else els]`
     If {
         span: Span,
@@ -508,6 +513,7 @@ impl Stmt {
             Stmt::Block { span, .. }
             | Stmt::Expr { span, .. }
             | Stmt::Local { span, .. }
+            | Stmt::Locals { span, .. }
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
             | Stmt::DoWhile { span, .. }

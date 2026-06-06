@@ -259,6 +259,15 @@ mod tests {
                     None => format!("({} {})", kw, name.text(src)),
                 }
             }
+            Stmt::Locals { decls, .. } => {
+                let mut s = String::from("(locals");
+                for d in decls {
+                    s.push(' ');
+                    s.push_str(&sxs(src, d));
+                }
+                s.push(')');
+                s
+            }
             Stmt::If {
                 cond, then, els, ..
             } => match els {
@@ -1245,6 +1254,18 @@ namespace Demo {
         assert_eq!(ok(r#"$"{a.b(c)}""#), "(interp (call (. a b) c))");
         // No holes → a single literal run.
         assert_eq!(ok(r#"$"plain""#), r#"(interp "plain")"#);
+    }
+
+    #[test]
+    fn multi_declarator_local() {
+        // `int a = 1, b, c = 3;` → a scope-transparent group; each declarator
+        // re-uses the leading type. (`b` has no initializer.)
+        assert_eq!(
+            ok_stmt("int32 a = 1, b, c = 3;"),
+            "(locals (var a 1) (var b) (var c 3))"
+        );
+        // A single declarator stays a plain local (no group).
+        assert_eq!(ok_stmt("int32 x = 5;"), "(var x 5)");
     }
 
     #[test]

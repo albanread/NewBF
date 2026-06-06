@@ -732,6 +732,12 @@ impl Printer<'_> {
                     self.labeled_expr(d + 1, "init", e);
                 }
             }
+            Stmt::Locals { decls, .. } => {
+                self.line(d, "Locals");
+                for s in decls {
+                    self.stmt(s, d + 1);
+                }
+            }
             Stmt::If {
                 cond, then, els, ..
             } => {
