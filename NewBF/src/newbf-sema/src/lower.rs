@@ -2701,6 +2701,15 @@ struct Lowerer<'a> {
     /// In-scope local (nested) functions: name → (emitted symbol, return type,
     /// parameter types). A bare call to one lowers to a direct call to its symbol.
     local_fns: HashMap<String, (String, IrType, Vec<IrType>)>,
+    /// Per-block stacks of `scope`-allocated class instances: each frame is
+    /// `(entry block, [(pointer, class id), …])`. Heap allocations with the
+    /// lifetime of the enclosing block. Parallel to `defers`; each block frees
+    /// its own (dtor + free) on normal exit, and a `return` frees every open
+    /// frame. Only allocations made in the frame's *entry* block are tracked, so
+    /// the freed value provably dominates the exit (SSA-safe); a `scope` in a
+    /// conditional sub-expression isn't tracked and leaks (a follow-on). (Like
+    /// `defer`, `break`/`continue` out of a block doesn't yet run cleanup.)
+    scope_allocs: Vec<(BlockId, Vec<(Value, StructId)>)>,
     /// Locals/params whose declared type is an int-backed `enum`: name → enum
     /// name. Int-backed enums lower to `int32`, losing their identity, so this
     /// recovers it — letting a bare `.Case` pattern in `switch (x)` resolve
@@ -2731,7 +2740,33 @@ impl<'a> Lowerer<'a> {
             array_locals: std::collections::HashSet::new(),
             defers: vec![Vec::new()],
             local_fns: HashMap::new(),
+            scope_allocs: vec![(BlockId(0), Vec::new())],
             enum_locals: HashMap::new(),
+        }
+    }
+
+    /// Free the current block's `scope`-allocated instances (dtor + free), in
+    /// reverse allocation order. Called on a block's normal fall-through exit.
+    fn free_scope_top(&mut self) {
+        if let Some((_, frame)) = self.scope_allocs.last() {
+            let allocs: Vec<(Value, StructId)> = frame.iter().rev().cloned().collect();
+            for (v, id) in allocs {
+                self.emit_destroy(v, id);
+            }
+        }
+    }
+
+    /// Free every open frame's `scope`-allocated instances — innermost first,
+    /// reverse within each — before a `return` unwinds the function.
+    fn free_all_scopes(&mut self) {
+        let allocs: Vec<(Value, StructId)> = self
+            .scope_allocs
+            .iter()
+            .rev()
+            .flat_map(|(_, frame)| frame.iter().rev().cloned())
+            .collect();
+        for (v, id) in allocs {
+            self.emit_destroy(v, id);
         }
     }
 
@@ -2804,18 +2839,21 @@ impl<'a> Lowerer<'a> {
             Stmt::Block { stmts, .. } => {
                 self.scopes.push(HashMap::new());
                 self.defers.push(Vec::new());
+                self.scope_allocs.push((self.fb.current_block(), Vec::new()));
                 for st in stmts {
                     self.stmt(st, src);
                     if self.terminated {
                         break;
                     }
                 }
-                // Normal exit (fall-through): run this block's `defer`s in reverse.
-                // If a `return`/`break` already terminated the block, it ran the
-                // defers itself, so skip here.
+                // Normal exit (fall-through): run this block's `defer`s in reverse,
+                // then free its `scope` allocations. If a `return`/`break` already
+                // terminated the block, it ran its own cleanup, so skip here.
                 if !self.terminated {
                     self.run_block_defers(src);
+                    self.free_scope_top();
                 }
+                self.scope_allocs.pop();
                 self.defers.pop();
                 self.scopes.pop();
             }
@@ -2917,8 +2955,9 @@ impl<'a> Lowerer<'a> {
                 };
                 // The return value is captured (above) *before* `defer`s run, so a
                 // deferred mutation can't change it — then unwind every pending
-                // defer (LIFO) before the actual `ret`.
+                // defer (LIFO) and free every open scope allocation before `ret`.
                 self.run_all_defers(src);
+                self.free_all_scopes();
                 self.ret(v);
             }
             Stmt::If {
@@ -3800,6 +3839,31 @@ impl<'a> Lowerer<'a> {
                 operand,
                 ..
             } => self.lower_new(operand, src),
+            // `scope T(args)` — allocate with the enclosing block's lifetime:
+            // heap-allocate like `new` (ctor + field defaults run), then register
+            // the instance for an automatic dtor+free at scope exit, so it's
+            // freed without a manual `delete`.
+            Expr::Prefix {
+                kw: PrefixKw::Scope,
+                operand,
+                ..
+            } => {
+                let (v, t) = self.lower_new(operand, src);
+                // Auto-free at scope exit only when the allocation is at statement
+                // level (its def block dominates the block's exit). A `scope` in a
+                // conditional sub-expression (ternary/short-circuit branch) is
+                // *not* tracked — freeing it at block exit would reference a value
+                // that doesn't dominate the exit (an SSA violation) — so it leaks
+                // for now (a documented follow-on needing real lifetime analysis).
+                let cur = self.fb.current_block();
+                if let IrType::Ref(id) = t
+                    && let Some((entry, frame)) = self.scope_allocs.last_mut()
+                    && cur == *entry
+                {
+                    frame.push((v.clone(), id));
+                }
+                (v, t)
+            }
             Expr::Prefix {
                 kw: PrefixKw::Delete,
                 operand,
@@ -5190,25 +5254,32 @@ impl<'a> Lowerer<'a> {
             return (Value::Const(Const::Undef(IrType::Void)), IrType::Void);
         }
         let (v, t) = self.expr(operand, src);
-        // Run destructors down the inheritance chain before freeing: the derived
-        // dtor first, then each base's, root last (reverse of construction order).
-        // Inheritance composes a base dtor into a derived that doesn't declare its
-        // own, so the same symbol can repeat down the chain — dedup to call once.
         if let IrType::Ref(id) = t {
-            let mut seen: Vec<String> = Vec::new();
-            let mut cur = Some(id);
-            while let Some(cid) = cur {
-                if let Some(dtor) = self.structs.dtor_of(cid)
-                    && !seen.contains(&dtor)
-                {
-                    self.fb.call(dtor.clone(), vec![v.clone()], IrType::Void);
-                    seen.push(dtor);
-                }
-                cur = self.structs.bases[cid.0 as usize];
+            self.emit_destroy(v, id);
+        } else {
+            self.fb.call("free", vec![v], IrType::Void);
+        }
+        (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
+    }
+
+    /// Run a class instance's destructor chain then free it: the derived dtor
+    /// first, each base's next, root last (reverse of construction order), then
+    /// `free`. Inheritance composes a base dtor into a derived that declares
+    /// none, so the same symbol can repeat down the chain — dedup to call once.
+    /// Shared by `delete` and `scope`-lifetime cleanup.
+    fn emit_destroy(&mut self, v: Value, id: StructId) {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cur = Some(id);
+        while let Some(cid) = cur {
+            if let Some(dtor) = self.structs.dtor_of(cid)
+                && !seen.contains(&dtor)
+            {
+                self.fb.call(dtor.clone(), vec![v.clone()], IrType::Void);
+                seen.push(dtor);
             }
+            cur = self.structs.bases[cid.0 as usize];
         }
         self.fb.call("free", vec![v], IrType::Void);
-        (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
     }
 
     /// Lower a method call `receiver.Method(args)`. Resolves the receiver's
