@@ -2819,6 +2819,7 @@ impl<'a> Lowerer<'a> {
                             .and_then(|target| {
                                 self.try_target_typed_enum(target, e, src)
                                     .or_else(|| self.try_target_typed_tuple(target, e, src))
+                                    .or_else(|| self.try_target_typed_ctor(target, e, src))
                                     .or_else(|| self.try_target_typed_initializer(target, e, src))
                             })
                             .unwrap_or_else(|| self.expr(e, src));
@@ -2888,10 +2889,11 @@ impl<'a> Lowerer<'a> {
                     None
                 } else {
                     value.as_ref().map(|e| {
-                        // Target-type a `.Some(x)` return against the function's
-                        // return type before falling back to a plain eval.
+                        // Target-type a `.Some(x)` / `.(args)` return against the
+                        // function's return type before falling back to a plain eval.
                         let (v, t) = self
                             .try_target_typed_enum(self.ret_ty, e, src)
+                            .or_else(|| self.try_target_typed_ctor(self.ret_ty, e, src))
                             .unwrap_or_else(|| self.expr(e, src));
                         self.coerce(v, t, self.ret_ty)
                     })
@@ -5255,6 +5257,50 @@ impl<'a> Lowerer<'a> {
             self.fb.store(fp, cv);
         }
         Some((self.fb.load(slot, ty), ty))
+    }
+
+    /// A target-typed `.(args)` constructor-invocation shorthand against a
+    /// value-struct `target` (e.g. `Vec2 v = .(2, 3)` / `return .(x, y)`).
+    /// `None` unless `target` is a value struct and `e` is the `.( … )` form
+    /// (a `Call` whose callee is a bare-`.` `DotIdent`, distinct from a named
+    /// `.Case(...)` enum constructor).
+    fn try_target_typed_ctor(
+        &mut self,
+        target: IrType,
+        e: &Expr,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let IrType::Struct(id) = target else {
+            return None;
+        };
+        let Expr::Call { callee, args, .. } = e else {
+            return None;
+        };
+        let Expr::DotIdent { name, .. } = &**callee else {
+            return None;
+        };
+        if name.text(src) != "." {
+            return None; // `.Case(args)` is an enum constructor, not this
+        }
+        Some(self.construct_value_struct(id, args, src))
+    }
+
+    /// Stack-construct a value struct: alloca a slot, run the arity-matched
+    /// constructor through it (`this` is a pointer to the body), and load the
+    /// initialized value. With no matching ctor the slot is left as-is.
+    fn construct_value_struct(&mut self, id: StructId, args: &[Expr], src: &str) -> (Value, IrType) {
+        let ty = IrType::Struct(id);
+        let slot = self.fb.alloca(ty);
+        if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
+            let mut call_args = vec![slot.clone()];
+            for (i, a) in args.iter().enumerate() {
+                let (v, t) = self.expr(a, src);
+                let pt = ctor.params.get(i + 1).copied().unwrap_or(t);
+                call_args.push(self.coerce(v, t, pt));
+            }
+            self.fb.call(ctor.full_name, call_args, IrType::Void);
+        }
+        (self.fb.load(slot, ty), ty)
     }
 
     /// A target-typed `.{ field = value }` initializer on a `Stmt::Local` whose
