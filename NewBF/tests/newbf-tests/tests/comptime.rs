@@ -9,8 +9,9 @@
 //! literals in the surrounding program is the next increment — this nails the
 //! evaluation half end-to-end on real source first.
 
-use newbf_comptime::eval_const_i64;
+use newbf_comptime::{eval_const_i64, fold_comptime};
 use newbf_lexer::FileId;
+use newbf_llvm::OrcJit;
 use newbf_parser::parse_file;
 use newbf_sema::{SourceFile, analyze, lower_program};
 
@@ -62,4 +63,52 @@ fn comptime_recursion_evaluates_at_compile_time() {
     "#;
     // fib(20) = 6765.
     assert_eq!(eval_comptime(src, "Program.Fib"), 6765);
+}
+
+#[test]
+fn comptime_call_folds_into_caller() {
+    // `Main` calls a `[Comptime]` function. After folding, the call site is the
+    // computed literal and the comptime function is *gone* from the module — yet
+    // `Main` still runs and returns the value. That a now-removed symbol's result
+    // survives is the proof the call was folded at compile time, not called at
+    // run time (an un-folded call would dangle and fail to JIT-resolve).
+    let src = r#"
+        class Program {
+            [Comptime]
+            public static int Sum() {
+                int s = 0;
+                for (int i = 1; i <= 100; i++) { s = s + i; }
+                return s;
+            }
+            public static int32 Main() { return (int32)Sum(); }
+        }
+    "#;
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let program = analyze(&files);
+    let mut module = lower_program(&files, &program);
+
+    // Pre-fold: sema marked the comptime symbol and the function exists.
+    assert!(module.comptime.iter().any(|s| s == "Program.Sum"));
+    assert!(module.funcs.iter().any(|f| f.name == "Program.Sum"));
+
+    fold_comptime(&mut module).expect("comptime fold succeeds");
+
+    // Post-fold: the compile-time-only function is dropped.
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "Program.Sum"),
+        "comptime function should be removed after folding"
+    );
+
+    // And `Main` still returns the folded value — JIT-resolving a module that no
+    // longer contains `Program.Sum` only succeeds because the call was folded.
+    let jit = OrcJit::from_ir(&module).expect("jit builds");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 5050);
 }

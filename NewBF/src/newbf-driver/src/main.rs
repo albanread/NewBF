@@ -287,7 +287,13 @@ fn dump_ir(input: &str) {
         .collect();
 
     let program = newbf_sema::analyze(&files);
-    let module = newbf_sema::lower_program(&files, &program);
+    let mut module = newbf_sema::lower_program(&files, &program);
+    // Fold comptime call sites so the IR report reflects the real compiled
+    // output (a no-op for programs without `[Comptime]`).
+    if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
+        eprintln!("dump-ir: comptime evaluation failed: {e}");
+        std::process::exit(1);
+    }
     print!("{}", newbf_ir::format_ir(&module));
 
     if parse_diags > 0 {
@@ -340,7 +346,13 @@ fn dump_llvm(input: &str) {
         .collect();
 
     let program = newbf_sema::analyze(&files);
-    let module = newbf_sema::lower_program(&files, &program);
+    let mut module = newbf_sema::lower_program(&files, &program);
+    // Fold comptime call sites so the LLVM report reflects the real compiled
+    // output (a no-op for programs without `[Comptime]`).
+    if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
+        eprintln!("dump-llvm: comptime evaluation failed: {e}");
+        std::process::exit(1);
+    }
     print!("{}", newbf_llvm::lower_to_string(&module));
 
     if parse_diags > 0 {
@@ -394,6 +406,13 @@ fn compile(input: &str, output: Option<&str>) {
 
     let program = newbf_sema::analyze(&files);
     let mut module = newbf_sema::lower_program(&files, &program);
+
+    // Evaluate `[Comptime]` functions and fold their call sites into literals
+    // (then drop them) before codegen — they are compile-time-only.
+    if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
+        eprintln!("compile: comptime evaluation failed: {e}");
+        std::process::exit(1);
+    }
 
     // Discover the Win32 APIs the program imports, resolve them against the
     // oracle, and collect the import libs the linker needs for the IAT.

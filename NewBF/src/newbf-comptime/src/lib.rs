@@ -23,5 +23,7 @@
 //! Sprints 19–21. Reference: `E:\beef\IDEHelper\Compiler\CeMachine.cpp`.
 
 mod eval;
+mod fold;
 
 pub use eval::eval_const_i64;
+pub use fold::fold_comptime;

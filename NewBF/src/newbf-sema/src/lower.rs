@@ -2207,6 +2207,7 @@ fn lower_type_at(
                 body,
                 modifiers,
                 generic_params,
+                attributes,
                 ..
             } => {
                 // A generic method is emitted only as monomorphs (step 7); its
@@ -2244,6 +2245,12 @@ fn lower_type_at(
                     Some(id) if !is_static => Some(IrType::Ref(id)),
                     _ => None,
                 };
+                // A `[Comptime]` method is compile-time-only: record its symbol so
+                // the comptime fold pass JIT-evaluates it and folds its call sites
+                // into literals (then drops the function from the final program).
+                if has_comptime_attr(attributes, src) {
+                    m.comptime.push(full_name.clone());
+                }
                 if let Some(func) = lower_method(
                     full_name,
                     ret,
@@ -5948,6 +5955,17 @@ fn ctor_class_name<'s>(e: &Expr, src: &'s str) -> Option<&'s str> {
 /// The external symbol a body-less `[Intrinsic("sym")]` / `[LinkName("sym")]`
 /// method binds to (so `Internal.MemCpy` calls `memcpy`). `None` if the method
 /// has no such attribute.
+/// Whether a member carries the `[Comptime]` attribute — marking it as
+/// compile-time-only code that the comptime evaluator JIT-runs and folds into
+/// literals at its call sites (rather than emitting into the final program).
+fn has_comptime_attr(attrs: &[Attribute], src: &str) -> bool {
+    attrs.iter().any(|a| {
+        matches!(&a.name,
+            AstType::Path { segments, .. }
+                if segments.last().map(|s| s.name.text(src)) == Some("Comptime"))
+    })
+}
+
 fn extern_symbol(attrs: &[Attribute], src: &str) -> Option<String> {
     for a in attrs {
         let aname = match &a.name {

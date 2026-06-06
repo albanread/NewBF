@@ -51,6 +51,12 @@ pub struct Module {
     pub funcs: Vec<Function>,
     pub vtables: Vec<VtableDef>,
     pub globals: Vec<GlobalDef>,
+    /// Mangled symbols of `[Comptime]` functions — code meant to run *at compile
+    /// time*, not in the final program. The comptime evaluator JIT-evaluates each
+    /// and folds its call sites into literals (then drops the function), so this
+    /// list is what tells the fold pass which functions are compile-time only.
+    /// Empty for any module without `[Comptime]` methods.
+    pub comptime: Vec<String>,
 }
 
 impl Module {
@@ -61,6 +67,7 @@ impl Module {
             funcs: Vec::new(),
             vtables: Vec::new(),
             globals: Vec::new(),
+            comptime: Vec::new(),
         }
     }
 

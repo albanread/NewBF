@@ -313,6 +313,7 @@ name = "newbf-driver"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "newbf-comptime",
  "newbf-ir",
  "newbf-lexer",
  "newbf-llvm",
