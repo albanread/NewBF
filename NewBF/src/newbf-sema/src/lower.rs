@@ -7012,15 +7012,37 @@ impl<'a> Lowerer<'a> {
     /// from it — the set is fixed at compile time. Emitted as an OR-chain of
     /// pointer equalities. `None` if no class in `tid`'s subtree carries a vtable
     /// (e.g. a non-virtual class), since the header tag isn't available then.
-    fn type_test(&mut self, obj: Value, oid: StructId, tid: StructId) -> Option<Value> {
+    ///
+    /// `tid` may be a CLASS or an INTERFACE: for a class the target set is the
+    /// subtree under `tid` (`is_subtype_of`); for an interface it is every class
+    /// whose transitively-flattened `iface_bases` contains `tid` (so `x is IA`
+    /// holds for a class implementing only `IB : IA`). The source value `obj`
+    /// may itself be interface-typed — its `$header` is read via a RAW
+    /// pointer-indexed GEP (offset 0), never `field_addr`, because an interface
+    /// id has an empty `StructDef` and would make `field_addr` invalid.
+    fn type_test(&mut self, obj: Value, tid: StructId) -> Option<Value> {
+        let tid_is_iface = is_interface(&self.structs, tid);
         let targets: Vec<StructId> = (0..self.structs.defs.len() as u32)
             .map(StructId)
-            .filter(|&c| self.is_subtype_of(c, tid) && !self.structs.vimpls[c.0 as usize].is_empty())
+            .filter(|&c| {
+                if self.structs.vimpls[c.0 as usize].is_empty() {
+                    return false;
+                }
+                if tid_is_iface {
+                    self.structs.iface_bases[c.0 as usize].contains(&tid)
+                } else {
+                    self.is_subtype_of(c, tid)
+                }
+            })
             .collect();
         if targets.is_empty() {
             return None;
         }
-        let hdr_addr = self.fb.field_addr(obj, oid, 0);
+        // Read `$header` (offset 0) via a raw pointer-indexed GEP, so the test
+        // works even when the SOURCE value is interface-typed (empty StructDef).
+        let hdr_addr = self
+            .fb
+            .elem_addr(obj, IrType::Ptr, Value::int(0, IrType::I64));
         let hdr = self.fb.load(hdr_addr, IrType::Ptr);
         let mut acc: Option<Value> = None;
         for c in targets {
@@ -7049,9 +7071,11 @@ impl<'a> Lowerer<'a> {
     /// known class, or the test can't be expressed via vtable tags.
     fn lower_is(&mut self, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
         let (ov, ot) = self.expr(lhs, src);
-        if let IrType::Ref(oid) = ot
+        // `ot` may be `Ref(class)` or `Ref(iface)` — both are pointer-like and
+        // carry a `$header` at offset 0; `type_test` reads it via a raw GEP.
+        if let IrType::Ref(_) = ot
             && let Some(tid) = self.type_id_of(rhs, src)
-            && let Some(test) = self.type_test(ov, oid, tid)
+            && let Some(test) = self.type_test(ov, tid)
         {
             return (test, IrType::Bool);
         }
@@ -7061,9 +7085,11 @@ impl<'a> Lowerer<'a> {
     /// `obj as T` → `obj` typed as `T` when the runtime type matches, else `null`.
     fn lower_as(&mut self, lhs: &Expr, rhs: &Expr, src: &str) -> (Value, IrType) {
         let (ov, ot) = self.expr(lhs, src);
-        if let IrType::Ref(oid) = ot
+        // `ot` may be `Ref(class)` or `Ref(iface)`. `as IFace` returns
+        // `Ref(iface_id)` (pointer-like; the typed-null `select` verifies).
+        if let IrType::Ref(_) = ot
             && let Some(tid) = self.type_id_of(rhs, src)
-            && let Some(test) = self.type_test(ov.clone(), oid, tid)
+            && let Some(test) = self.type_test(ov.clone(), tid)
         {
             let null = Value::Const(Const::Null);
             let r = self.fb.select(test, ov, null, IrType::Ref(tid));
