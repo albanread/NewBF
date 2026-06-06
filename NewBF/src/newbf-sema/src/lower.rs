@@ -5707,6 +5707,22 @@ impl<'a> Lowerer<'a> {
     }
 
     fn assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, src: &str) -> (Value, IrType) {
+        // Plain `=` to a known place: resolve the place first so the RHS can be
+        // target-typed against it (`.(args)`/`.Case`/`.{ }`/tuple construct
+        // against the field/local type, exactly as a typed local-init does).
+        if matches!(op, AssignOp::Assign)
+            && let Some((slot, ty)) = self.lvalue(target, src)
+        {
+            let (rhs, rhs_ty) = self
+                .try_target_typed_enum(ty, value, src)
+                .or_else(|| self.try_target_typed_ctor(ty, value, src))
+                .or_else(|| self.try_target_typed_tuple(ty, value, src))
+                .or_else(|| self.try_target_typed_initializer(ty, value, src))
+                .unwrap_or_else(|| self.expr(value, src));
+            let rhs = self.coerce(rhs, rhs_ty, ty);
+            self.fb.store(slot, rhs.clone());
+            return (rhs, ty);
+        }
         let (rhs, rhs_ty) = self.expr(value, src);
         // Resolve the target to a place (local slot or struct field). The
         // stored value takes the place's type so later loads stay consistent.
