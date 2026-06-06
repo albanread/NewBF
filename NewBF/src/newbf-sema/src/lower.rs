@@ -31,19 +31,25 @@ use newbf_parser::{
 use crate::Program;
 use crate::build::SourceFile;
 
-/// Whether a registered type is a value `struct` (inline aggregate) or a
-/// `class` (heap object referenced by pointer).
+/// Whether a registered type is a value `struct` (inline aggregate), a `class`
+/// (heap object referenced by pointer), or an `interface` (a nominal,
+/// pointer-like type with no layout — no `$header`, no fields; never `new`'d).
+/// An interface-typed value is an `IrType::Ref(iface_id)`: a plain pointer to
+/// *some* object body, carrying the interface's nominal id at the sema level
+/// (see itables.md §4).
 #[derive(Clone, Copy)]
 enum StructKind {
     Value,
     Ref,
+    Interface,
 }
 
 fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
     match td.kind {
         TypeKind::Struct => Some(StructKind::Value),
         TypeKind::Class => Some(StructKind::Ref),
-        _ => None, // interface / enum / extension — not yet
+        TypeKind::Interface => Some(StructKind::Interface),
+        _ => None, // enum / extension — not yet
     }
 }
 
@@ -94,6 +100,39 @@ struct StructTable {
     /// Per-id composed vtable: slot → implementing symbol. Emitted as the
     /// class's vtable global; non-empty only for classes with virtual methods.
     vimpls: Vec<Vec<String>>,
+    // --- itables (dynamic interface dispatch, itables.md §4) ---
+    // The HashMaps default-construct via `#[derive(Default)]`; the per-id Vec
+    // fields (`iface_bases`/`imethods`/`idefaults`) are pushed in lockstep at
+    // every id-minting site (register_func_struct/register_mono/
+    // register_type_struct + the payload-enum site). Populated by IT-T2/T3;
+    // declared (and kept in lockstep) here in IT-T1.
+    /// Per class id: the interfaces it implements, transitively flattened and
+    /// dedup'd, deterministic order. Empty for value structs and interfaces.
+    /// Populated in IT-T2 (`collect_iface_bases`).
+    #[allow(dead_code)] // populated in IT-T2/T3
+    iface_bases: Vec<Vec<StructId>>,
+    /// Per interface id: its instance, NON-GENERIC method slot signature,
+    /// (name, sig) in declaration order (base-interface methods first). Drives
+    /// slot layout and the method->index lookup at dispatch. Populated in IT-T2
+    /// (`fill_iface_members`).
+    #[allow(dead_code)] // populated in IT-T2/T3
+    imethods: Vec<Vec<(String, MethodSig)>>,
+    /// Per interface id: a default-body symbol per slot (`Some` for a default
+    /// interface method, `None` for an abstract one), parallel to `imethods`.
+    /// Populated in IT-T2.
+    #[allow(dead_code)] // populated in IT-T2/T3
+    idefaults: Vec<Vec<Option<String>>>,
+    /// Explicit interface implementations: (class id, iface id, method name)
+    /// -> the impl MethodSig. Consulted by `apply_itables` before the implicit
+    /// same-name `pick_overload`. Filled from `Member::Method.explicit_iface`
+    /// in IT-T2.
+    #[allow(dead_code)] // populated in IT-T2/T3
+    explicit_impls: HashMap<(StructId, StructId, String), MethodSig>,
+    /// Global per-interface vtable slot base: interface id -> first vtable slot
+    /// every implementer reserves for it. Stable across all implementers.
+    /// Computed in IT-T3 (`apply_itables`).
+    #[allow(dead_code)] // populated in IT-T2/T3
+    iface_slot_base: HashMap<StructId, usize>,
     /// Monomorphized generic instantiations to lower: `(mono id, generic type
     /// name, type-parameter env)`. `lower_program` re-finds each generic decl by
     /// name and lowers its methods at the mono id/prefix with the env.
@@ -337,13 +376,17 @@ impl StructTable {
     }
 
     /// The IR type naming `name`: a value struct → `Struct(id)`, a class →
-    /// `Ref(id)`. `None` if `name` isn't a registered type.
+    /// `Ref(id)`, an interface → `Ref(id)` (pointer-like; the nominal id carries
+    /// the interface identity). `None` if `name` isn't a registered type.
     fn ty_of(&self, name: &str) -> Option<IrType> {
         self.by_name
             .get(name)
             .map(|&id| match self.kinds[id.0 as usize] {
                 StructKind::Value => IrType::Struct(id),
-                StructKind::Ref => IrType::Ref(id),
+                // An interface-typed value is a plain pointer to some object
+                // body (itables.md §4); it lowers to `Ref(iface_id)` just like
+                // a class so coercion/ABI treat it uniformly as `ptr`.
+                StructKind::Ref | StructKind::Interface => IrType::Ref(id),
             })
     }
 
@@ -372,8 +415,14 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
             // Generic value structs / classes — and generic *simple payload enums*
             // (`Option<T>`), which monomorphize into tagged-union structs the same
             // way (their `struct_kind` is `None`, so name them explicitly).
+            // Generic *interfaces* are EXCLUDED (itables.md §6/§10): they stay on
+            // the generic-constraint static path and are never monomorphized in
+            // v1, so `IFaceD<int16>` must resolve to `Ptr` (the unregistered
+            // fallback), not `Ref(mono_id)`. (Now that `struct_kind` returns
+            // `Some(Interface)`, this exclusion must be explicit.)
             Item::Type(td)
                 if !td.generic_params.is_empty()
+                    && td.kind != TypeKind::Interface
                     && (struct_kind(td).is_some()
                         || (td.kind == TypeKind::Enum
                             && enum_has_payload(td)
@@ -519,6 +568,10 @@ fn register_func_struct(t: &mut StructTable) -> StructId {
     t.virtuals.push(Vec::new());
     t.vslots.push(HashMap::new());
     t.vimpls.push(Vec::new());
+    // itables (IT-T1): keep the per-id Vec fields in lockstep.
+    t.iface_bases.push(Vec::new());
+    t.imethods.push(Vec::new());
+    t.idefaults.push(Vec::new());
     t.by_name.insert("$Func".into(), id);
     id
 }
@@ -541,6 +594,10 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     t.virtuals.push(Vec::new());
     t.vslots.push(HashMap::new());
     t.vimpls.push(Vec::new());
+    // itables (IT-T1): keep the per-id Vec fields in lockstep.
+    t.iface_bases.push(Vec::new());
+    t.imethods.push(Vec::new());
+    t.idefaults.push(Vec::new());
     t.by_name.insert(mangled.to_string(), id);
     id
 }
@@ -1530,8 +1587,11 @@ fn register_struct_names(items: &[Item], prefix: &str, src: &str, t: &mut Struct
 
 fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTable) {
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
-    // Register non-generic value `struct`s (inline) and `class`es (referenced);
-    // generics await monomorphization, interfaces/enums are separate.
+    // Register non-generic value `struct`s (inline), `class`es (referenced), and
+    // `interface`s (pointer-like, no layout — itables.md §4/§5 T1); generics
+    // await monomorphization, enums are separate. An interface gets an EMPTY
+    // `StructDef` (no `$header`, no fields; it is never instantiated) — IT-T2
+    // fills its method slots into `imethods`, not into `defs`/`methods`.
     if let Some(kind) = struct_kind(td)
         && td.generic_params.is_empty()
     {
@@ -1552,6 +1612,10 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.virtuals.push(Vec::new());
             t.vslots.push(HashMap::new());
             t.vimpls.push(Vec::new());
+            // itables (IT-T1): keep the per-id Vec fields in lockstep.
+            t.iface_bases.push(Vec::new());
+            t.imethods.push(Vec::new());
+            t.idefaults.push(Vec::new());
             t.by_name.insert(name, id);
         }
     }
@@ -1830,6 +1894,10 @@ fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
             t.virtuals.push(Vec::new());
             t.vslots.push(HashMap::new());
             t.vimpls.push(Vec::new());
+            // itables (IT-T1): keep the per-id Vec fields in lockstep.
+            t.iface_bases.push(Vec::new());
+            t.imethods.push(Vec::new());
+            t.idefaults.push(Vec::new());
             t.by_name.insert(enum_name.clone(), id);
             t.payload_enums.insert(enum_name, id);
             t.enum_cases.insert(id, cases);
@@ -2071,12 +2139,22 @@ fn fill_members_at(
     if fill_layout {
         fill_fields_at(td, id, kind, env, src, t);
 
-        // Single inheritance: record the first base that resolves to a class.
+        // Single inheritance: record the first base that resolves to a *class*.
         // `apply_inheritance` later composes its fields/methods into this type.
+        // BASE-ROUTING GUARD (itables.md §5 T1 / R6): an interface is now a
+        // registered type, so `lower_ty_env` resolves an interface base to
+        // `Ref(iface_id)`. Without the `matches!(kinds[bid], Ref)` guard, a
+        // class listing an interface base (`class X : IFace, Base`) would record
+        // the INTERFACE as its single inheritance base — corrupting
+        // `apply_inheritance`. Only a class-kind base may be the inheritance
+        // base here; interface-kind bases are routed into `iface_bases` by
+        // IT-T2's `collect_iface_bases`. This guard ships atomically with the
+        // type-flip so registration is safe.
         if matches!(kind, StructKind::Ref) {
             for b in &td.bases {
                 if let IrType::Ref(bid) = lower_ty_env(b, src, t, env)
                     && bid != id
+                    && matches!(t.kinds[bid.0 as usize], StructKind::Ref)
                 {
                     t.bases[id.0 as usize] = Some(bid);
                     break;
@@ -2281,7 +2359,15 @@ fn fill_members_at(
 }
 
 fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
-    let kind = struct_kind(td).filter(|_| td.generic_params.is_empty());
+    // Interfaces are registered (empty `StructDef`) in IT-T1 but their members
+    // are filled separately by IT-T2's `fill_iface_members` (into `imethods`,
+    // NOT `methods`/`defs`), so skip the ordinary member-fill here: an interface
+    // has no `$header`, no instance fields, and its default-bodied methods must
+    // NOT land in `methods[iface]` (itables.md §5 T2). Excluding `Interface`
+    // keeps T1's StructDef genuinely empty.
+    let kind = struct_kind(td)
+        .filter(|k| !matches!(k, StructKind::Interface))
+        .filter(|_| td.generic_params.is_empty());
     let id = kind.and_then(|_| t.by_name.get(td.name.text(src)).copied());
     if let (Some(kind), Some(id)) = (kind, id) {
         fill_members_at(td, id, kind, &[], src, t, true);
@@ -2909,7 +2995,18 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
         return;
     }
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
-    let owner_id = structs.by_name.get(td.name.text(src)).copied();
+    // An interface is now a registered type (IT-T1), but its members are NOT
+    // lowered here as instance methods of the interface id: T1 keeps interface
+    // emission byte-identical to the pre-registration behavior (owner_id was
+    // `None`), so a default-bodied interface method emits exactly as before
+    // (no `this`, empty `sigs`). IT-T6 takes over default-body emission with
+    // `this: Ref(iface_id)`. Resolving the interface id here would silently
+    // flip `this_ty`/`sigs` and change the IR — out of scope for T1.
+    let owner_id = structs
+        .by_name
+        .get(td.name.text(src))
+        .copied()
+        .filter(|&id| !matches!(structs.kinds[id.0 as usize], StructKind::Interface));
     lower_type_at(td, owner_id, &new_prefix, &[], src, structs, m);
 }
 
