@@ -109,24 +109,24 @@ struct StructTable {
     /// Per class id: the interfaces it implements, transitively flattened and
     /// dedup'd, deterministic order. Empty for value structs and interfaces.
     /// Populated in IT-T2 (`collect_iface_bases`).
-    #[allow(dead_code)] // populated in IT-T2/T3
+    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
     iface_bases: Vec<Vec<StructId>>,
     /// Per interface id: its instance, NON-GENERIC method slot signature,
     /// (name, sig) in declaration order (base-interface methods first). Drives
     /// slot layout and the method->index lookup at dispatch. Populated in IT-T2
     /// (`fill_iface_members`).
-    #[allow(dead_code)] // populated in IT-T2/T3
+    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
     imethods: Vec<Vec<(String, MethodSig)>>,
     /// Per interface id: a default-body symbol per slot (`Some` for a default
     /// interface method, `None` for an abstract one), parallel to `imethods`.
     /// Populated in IT-T2.
-    #[allow(dead_code)] // populated in IT-T2/T3
+    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
     idefaults: Vec<Vec<Option<String>>>,
     /// Explicit interface implementations: (class id, iface id, method name)
     /// -> the impl MethodSig. Consulted by `apply_itables` before the implicit
     /// same-name `pick_overload`. Filled from `Member::Method.explicit_iface`
     /// in IT-T2.
-    #[allow(dead_code)] // populated in IT-T2/T3
+    #[allow(dead_code)] // populated in IT-T2; read in IT-T3 (apply_itables)
     explicit_impls: HashMap<(StructId, StructId, String), MethodSig>,
     /// Global per-interface vtable slot base: interface id -> first vtable slot
     /// every implementer reserves for it. Stable across all implementers.
@@ -355,6 +355,18 @@ impl StructTable {
             "second collection pass registered {} unexpected type monomorphs",
             monos2.len()
         );
+        // 4e. Itables (IT-T2): populate the interface data tables now that every
+        //     type's name/id and member layout exist, and BEFORE inheritance /
+        //     vtable composition (so IT-T3's `apply_itables` can read `imethods`
+        //     and `iface_bases` after `apply_vtables`). `fill_iface_members`
+        //     records each interface's instance/non-generic method slots (base-
+        //     interface methods first, transitively flattened) into
+        //     `imethods`/`idefaults`; `collect_iface_bases` routes each class's
+        //     interface bases into `iface_bases` (transitively flattened, value
+        //     structs and interfaces skipped). `explicit_impls` was filled by the
+        //     `Member::Method` arm during the member fill above.
+        fill_iface_members(files, &mut t);
+        collect_iface_bases(files, &mut t);
         // 5. Compose single inheritance once every type's own layout is filled,
         //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
@@ -818,6 +830,325 @@ fn compose_vtable(id: StructId, t: &mut StructTable, done: &mut [bool]) {
             t.vslots[i].insert(name, slot);
             t.vimpls[i].push(full);
         }
+    }
+}
+
+// --- itables: interface members & bases (itables.md §5 T2) ---------------------
+
+/// An interface's OWN (non-flattened) method slots, keyed by interface id: each
+/// entry is `(method name, this-leading slot sig, default-body symbol)` where
+/// the default symbol is `Some` for a bodied (default) method, `None` for an
+/// abstract one. Built by `collect_iface_own`, consumed by
+/// `compose_iface_members`.
+type IfaceOwn = HashMap<StructId, Vec<(String, MethodSig, Option<String>)>>;
+
+/// The transitively-flattened (base-first) interface slots per id: the
+/// `(name, sig)` slot list paired with the parallel `idefaults` list. Produced
+/// by `compose_iface_members`.
+type IfaceComposed = HashMap<StructId, (Vec<(String, MethodSig)>, Vec<Option<String>>)>;
+
+/// Per interface id: its direct interface-kind base ids (`interface IB : IA`).
+type IfaceLinks = HashMap<StructId, Vec<StructId>>;
+
+/// Whether `id` names an `interface`-kind registered type.
+fn is_interface(t: &StructTable, id: StructId) -> bool {
+    matches!(t.kinds[id.0 as usize], StructKind::Interface)
+}
+
+/// Populate `imethods`/`idefaults` for every interface: each interface's
+/// **instance, NON-GENERIC** methods become its slot signature, in declaration
+/// order, with **base-interface methods first** (transitive flattening). An
+/// abstract (body-less) interface method is recorded directly — it does NOT go
+/// through the class-method registration gate (which drops body-less members),
+/// so a slot exists for dispatch even though no `full_name` is ever emitted. A
+/// default (bodied) method is recorded too, with its default-body symbol in
+/// `idefaults[id][k] = Some({IFace.prefix}{Method})`; an abstract one →
+/// `None`. `static` and generic interface methods are filtered out so they
+/// never consume a slot index (every implementer's layout must agree).
+///
+/// Defaults are deliberately NOT added to `methods[iface]` (itables.md §5 T2):
+/// a class calling a default it overrides would otherwise resolve to a wrong
+/// direct call. Defaults reach a class only through the itable slot (IT-T3/T6).
+fn fill_iface_members(files: &[SourceFile<'_>], t: &mut StructTable) {
+    // Collect each interface's own (non-flattened) method slots + its base
+    // interface ids first, reading the AST. Keyed by interface id.
+    let mut own: IfaceOwn = HashMap::new();
+    let mut bases: IfaceLinks = HashMap::new();
+    for f in files {
+        collect_iface_own(&f.unit.items, f.src, t, &mut own, &mut bases);
+    }
+    // Flatten transitively (base-interface methods first), memoized by id.
+    let ids: Vec<StructId> = own.keys().copied().collect();
+    let mut composed: IfaceComposed = HashMap::new();
+    for id in &ids {
+        compose_iface_members(*id, &own, &bases, &mut composed);
+    }
+    for (id, (methods, defaults)) in composed {
+        t.imethods[id.0 as usize] = methods;
+        t.idefaults[id.0 as usize] = defaults;
+    }
+}
+
+/// Walk all type decls (namespaces + nested), recording each interface's OWN
+/// instance/non-generic method slots and its base-interface ids.
+fn collect_iface_own(
+    items: &[Item],
+    src: &str,
+    t: &StructTable,
+    own: &mut IfaceOwn,
+    bases: &mut IfaceLinks,
+) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_iface_own(body, src, t, own, bases),
+            Item::Type(td) => collect_iface_own_type(td, src, t, own, bases),
+            _ => {}
+        }
+    }
+}
+
+fn collect_iface_own_type(
+    td: &TypeDecl,
+    src: &str,
+    t: &StructTable,
+    own: &mut IfaceOwn,
+    bases: &mut IfaceLinks,
+) {
+    if td.kind == TypeKind::Interface
+        && td.generic_params.is_empty()
+        && let Some(&id) = t.by_name.get(td.name.text(src))
+    {
+        // Base interfaces (`interface IB : IA`): only interface-kind bases.
+        let mut bvec = Vec::new();
+        for b in &td.bases {
+            if let IrType::Ref(bid) = lower_ty_env(b, src, t, &[])
+                && bid != id
+                && is_interface(t, bid)
+                && !bvec.contains(&bid)
+            {
+                bvec.push(bid);
+            }
+        }
+        bases.insert(id, bvec);
+
+        let mut slots: Vec<(String, MethodSig, Option<String>)> = Vec::new();
+        for m in &td.members {
+            if let Member::Method {
+                return_ty,
+                name,
+                params,
+                body,
+                modifiers,
+                generic_params,
+                ..
+            } = m
+            {
+                // Filter OUT static and generic interface methods: they stay on
+                // the static/constraint path and must NOT consume slot indices.
+                let is_static = modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static));
+                if is_static || !generic_params.is_empty() {
+                    continue;
+                }
+                let nm = name.text(src).to_string();
+                // Full this-leading MethodSig: `this : Ref(iface_id)`, then the
+                // explicit params; ret/params via lower_ty_env (Func$-widened in
+                // value positions, matching the class-method path).
+                let mut ps = vec![IrType::Ref(id)];
+                for p in params {
+                    ps.push(param_ir_ty(p, src, t, &[]));
+                }
+                let variadic = params
+                    .last()
+                    .filter(|p| matches!(p.modifier, Some((ParamModifier::Params, _))))
+                    .and_then(|p| pointer_elem_env(&p.ty, src, t, &[]));
+                // A default (bodied) interface method carries a symbol so the
+                // itable slot can resolve to it; an abstract (body-less) one has
+                // no emitted symbol and dispatches only through the slot.
+                let default_sym = if matches!(body, MethodBody::None) {
+                    None
+                } else {
+                    Some(format!("{}{}", t.prefixes[id.0 as usize], nm))
+                };
+                let sig = MethodSig {
+                    // An abstract interface method's `full_name` is never emitted
+                    // (it dispatches only via the slot); a default's matches the
+                    // symbol IT-T6 will emit.
+                    full_name: default_sym
+                        .clone()
+                        .unwrap_or_else(|| format!("{}{}", t.prefixes[id.0 as usize], nm)),
+                    ret: lower_value_ty(return_ty, src, t, &[]),
+                    params: ps,
+                    is_instance: true,
+                    variadic,
+                };
+                slots.push((nm, sig, default_sym));
+            }
+        }
+        own.insert(id, slots);
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            collect_iface_own_type(n, src, t, own, bases);
+        }
+    }
+}
+
+/// Transitively compose an interface's flattened method slots: base-interface
+/// methods first (in base-list order, each base recursively composed), then the
+/// interface's own slots. Memoized by id (mirrors `compose_vtable`). A method
+/// name already contributed by a base is NOT re-added (the base slot is reused),
+/// so `interface IB : IA` with its own override of an `IA` method keeps a single
+/// slot.
+fn compose_iface_members(id: StructId, own: &IfaceOwn, bases: &IfaceLinks, out: &mut IfaceComposed) {
+    if out.contains_key(&id) {
+        return;
+    }
+    // Insert a placeholder first to guard against cyclic interface bases.
+    out.insert(id, (Vec::new(), Vec::new()));
+    let mut methods: Vec<(String, MethodSig)> = Vec::new();
+    let mut defaults: Vec<Option<String>> = Vec::new();
+    if let Some(bvec) = bases.get(&id) {
+        for &b in bvec {
+            compose_iface_members(b, own, bases, out);
+            let (bm, bd) = out.get(&b).cloned().unwrap_or_default();
+            for ((bn, bs), bdf) in bm.into_iter().zip(bd) {
+                if !methods.iter().any(|(n, _)| *n == bn) {
+                    methods.push((bn, bs));
+                    defaults.push(bdf);
+                }
+            }
+        }
+    }
+    if let Some(slots) = own.get(&id) {
+        for (nm, sig, df) in slots {
+            if let Some(pos) = methods.iter().position(|(n, _)| n == nm) {
+                // Own declaration overrides a base slot (keeps the same index).
+                methods[pos].1 = sig.clone();
+                defaults[pos] = df.clone();
+            } else {
+                methods.push((nm.clone(), sig.clone()));
+                defaults.push(df.clone());
+            }
+        }
+    }
+    out.insert(id, (methods, defaults));
+}
+
+/// Route each **class**'s interface bases into `iface_bases[class]`, transitively
+/// flattened (each interface base contributes its own transitive interface
+/// bases first) and dedup'd in a deterministic order. A `Ref`-kind (class) base
+/// is the single inheritance base (already recorded by the guarded loop in
+/// `fill_members_at`) — not an iface base. **Value structs and interfaces
+/// themselves are SKIPPED**: a value struct listing an interface base has no
+/// `$header`/vtable (boxing is out of scope) and must not enter `iface_bases`.
+///
+/// Interface→interface base links (`interface IB : IA`) are needed for the
+/// transitive flatten; they are derived from the AST here (`iface_links`),
+/// keyed by interface id, so no extra `StructTable` field is required.
+fn collect_iface_bases(files: &[SourceFile<'_>], t: &mut StructTable) {
+    // Per interface id: its direct interface-kind bases (from the AST), so a
+    // class implementing `IB` drags in `IA` (`IB : IA`) transitively.
+    let mut iface_links: IfaceLinks = HashMap::new();
+    for f in files {
+        collect_iface_links(&f.unit.items, f.src, t, &mut iface_links);
+    }
+    for f in files {
+        collect_iface_bases_items(&f.unit.items, f.src, t, &iface_links);
+    }
+}
+
+/// Record each interface's direct interface-kind base ids (`interface IB : IA`).
+fn collect_iface_links(items: &[Item], src: &str, t: &StructTable, links: &mut IfaceLinks) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_iface_links(body, src, t, links),
+            Item::Type(td) => collect_iface_links_type(td, src, t, links),
+            _ => {}
+        }
+    }
+}
+
+fn collect_iface_links_type(td: &TypeDecl, src: &str, t: &StructTable, links: &mut IfaceLinks) {
+    if td.kind == TypeKind::Interface
+        && td.generic_params.is_empty()
+        && let Some(&id) = t.by_name.get(td.name.text(src))
+    {
+        let mut bvec = Vec::new();
+        for b in &td.bases {
+            if let IrType::Ref(bid) = lower_ty_env(b, src, t, &[])
+                && bid != id
+                && is_interface(t, bid)
+                && !bvec.contains(&bid)
+            {
+                bvec.push(bid);
+            }
+        }
+        links.insert(id, bvec);
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            collect_iface_links_type(n, src, t, links);
+        }
+    }
+}
+
+fn collect_iface_bases_items(items: &[Item], src: &str, t: &mut StructTable, links: &IfaceLinks) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_iface_bases_items(body, src, t, links),
+            Item::Type(td) => collect_iface_bases_type(td, src, t, links),
+            _ => {}
+        }
+    }
+}
+
+fn collect_iface_bases_type(td: &TypeDecl, src: &str, t: &mut StructTable, links: &IfaceLinks) {
+    // Only classes get itable slots: value structs (boxing out of scope) and
+    // interfaces themselves are skipped.
+    if td.kind == TypeKind::Class
+        && td.generic_params.is_empty()
+        && let Some(&id) = t.by_name.get(td.name.text(src))
+    {
+        let mut flat: Vec<StructId> = Vec::new();
+        for b in &td.bases {
+            if let IrType::Ref(bid) = lower_ty_env(b, src, t, &[])
+                && bid != id
+                && is_interface(t, bid)
+            {
+                add_iface_flat(bid, links, &mut flat);
+            }
+        }
+        t.iface_bases[id.0 as usize] = flat;
+    }
+    for m in &td.members {
+        if let Member::Nested(n) = m {
+            collect_iface_bases_type(n, src, t, links);
+        }
+    }
+}
+
+/// Add interface `iid` and all its transitive interface bases to `flat`
+/// (dedup'd, base-first): transitive bases first, then `iid` itself, so a class
+/// implementing `IB : IA` orders `IA` before `IB`. Cycle-safe.
+fn add_iface_flat(iid: StructId, links: &IfaceLinks, flat: &mut Vec<StructId>) {
+    if flat.contains(&iid) {
+        return;
+    }
+    if let Some(bvec) = links.get(&iid) {
+        for &b in bvec {
+            add_iface_flat(b, links, flat);
+        }
+    }
+    if !flat.contains(&iid) {
+        flat.push(iid);
     }
 }
 
@@ -2199,6 +2530,7 @@ fn fill_members_at(
                 modifiers,
                 attributes,
                 generic_params,
+                explicit_iface,
                 ..
             } => {
                 // A generic method is emitted only as monomorphs (its `T` is
@@ -2277,6 +2609,19 @@ fn fill_members_at(
                 });
                 if is_virtual && is_instance && (is_abstract || !matches!(body, MethodBody::None)) {
                     t.virtuals[id.0 as usize].push((nm.clone(), sig.full_name.clone()));
+                }
+                // IT-T2: an explicit interface implementation
+                // (`Ret IFace.Member(…)`) registers under its bare name in
+                // `methods[id]` as usual, but is ALSO recorded in `explicit_impls`
+                // keyed by `(class, iface, name)` so `apply_itables` (IT-T3) can
+                // disambiguate the itable slot when the class has a same-named
+                // regular method. Only an interface-resolving qualifier is kept.
+                if let Some(iface_ty) = explicit_iface
+                    && let IrType::Ref(iface_id) = lower_ty_env(iface_ty, src, t, env)
+                    && is_interface(t, iface_id)
+                {
+                    t.explicit_impls
+                        .insert((id, iface_id, nm.clone()), sig.clone());
                 }
                 let bucket = t.methods[id.0 as usize].entry(nm).or_default();
                 if !bucket.iter().any(|s| s.params == sig.params) {
@@ -7845,5 +8190,196 @@ mod tests {
         }
         assert!(saw_lambda, "expected at least one $lambda* function");
         assert!(saw_mref, "expected the $mref$ thunk for Mathx.Square");
+    }
+
+    /// IT-T2 data-shape gate (itables.md §8): `fill_iface_members` /
+    /// `collect_iface_bases` populate the interface tables correctly.
+    ///   - `imethods[IShape]` lists exactly its one instance slot `("Area", _)`;
+    ///   - a class implementing `IShape` has `IShape` in `iface_bases`;
+    ///   - a VALUE STRUCT listing an interface base has EMPTY `iface_bases`
+    ///     (boxing out of scope — it gets no itable slots);
+    ///   - `interface IB : IA` yields `imethods[IB]` starting with IA's methods,
+    ///     and a class implementing IB has IA flattened into its `iface_bases`;
+    ///   - `static` and generic interface methods do NOT consume a slot.
+    #[test]
+    fn it_t2_iface_tables_shape() {
+        let src = r#"
+            interface IA { int32 Ay(); }
+            interface IShape : IA {
+                int32 Area();
+                static int32 Sides();
+                T Cast<T>();
+            }
+            interface IB : IA { int32 Bee(); }
+            class Square : IShape {
+                public int32 Ay() { return 1; }
+                public int32 Area() { return 9; }
+            }
+            class Both : IB {
+                public int32 Ay() { return 2; }
+                public int32 Bee() { return 3; }
+            }
+            struct V : IShape {
+                public int32 Ay() { return 4; }
+                public int32 Area() { return 5; }
+            }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+        let id = |n: &str| *t.by_name.get(n).unwrap_or_else(|| panic!("{n} must register"));
+        let ia = id("IA");
+        let ishape = id("IShape");
+        let ib = id("IB");
+        let square = id("Square");
+        let both = id("Both");
+        let v = id("V");
+
+        // Interfaces register as `Interface`-kind, classes as `Ref`, value
+        // struct as `Value`.
+        assert!(matches!(t.kinds[ishape.0 as usize], StructKind::Interface));
+        assert!(matches!(t.kinds[square.0 as usize], StructKind::Ref));
+        assert!(matches!(t.kinds[v.0 as usize], StructKind::Value));
+
+        // `imethods[IShape]` = base-first: IA's "Ay" then own "Area". The
+        // `static Sides()` and generic `Cast<T>()` are filtered out (no slot).
+        let ishape_m: Vec<&str> = t.imethods[ishape.0 as usize]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            ishape_m,
+            vec!["Ay", "Area"],
+            "IShape slots: base IA.Ay first, then own Area; static/generic excluded"
+        );
+        // The slot sig is this-leading on the interface id, returning int32.
+        let area_sig = &t.imethods[ishape.0 as usize]
+            .iter()
+            .find(|(n, _)| n == "Area")
+            .unwrap()
+            .1;
+        assert_eq!(area_sig.params.first().copied(), Some(IrType::Ref(ishape)));
+        assert!(area_sig.is_instance);
+        assert_eq!(area_sig.ret, IrType::I32);
+
+        // `imethods[IA]` is just its own "Ay" slot.
+        let ia_m: Vec<&str> = t.imethods[ia.0 as usize]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(ia_m, vec!["Ay"]);
+
+        // `imethods[IB]` (IB : IA) starts with IA's methods, then its own.
+        let ib_m: Vec<&str> = t.imethods[ib.0 as usize]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(ib_m, vec!["Ay", "Bee"], "IB lists base IA.Ay first");
+
+        // All these interface methods are abstract → `idefaults` all `None`.
+        assert!(
+            t.idefaults[ishape.0 as usize].iter().all(|d| d.is_none()),
+            "abstract interface methods have no default symbol"
+        );
+        assert_eq!(
+            t.idefaults[ishape.0 as usize].len(),
+            t.imethods[ishape.0 as usize].len(),
+            "idefaults parallels imethods"
+        );
+
+        // A class implementing IShape has IShape (and its base IA) flattened in.
+        assert!(
+            t.iface_bases[square.0 as usize].contains(&ishape),
+            "Square.iface_bases must contain IShape"
+        );
+        assert!(
+            t.iface_bases[square.0 as usize].contains(&ia),
+            "IShape : IA ⇒ IA flattened into Square.iface_bases"
+        );
+        // Base-first ordering: IA before IShape.
+        let sq_pos_ia = t.iface_bases[square.0 as usize]
+            .iter()
+            .position(|x| *x == ia);
+        let sq_pos_ishape = t.iface_bases[square.0 as usize]
+            .iter()
+            .position(|x| *x == ishape);
+        assert!(sq_pos_ia < sq_pos_ishape, "IA flattened before IShape");
+
+        // A class implementing IB (IB : IA) has IA flattened into iface_bases.
+        assert!(
+            t.iface_bases[both.0 as usize].contains(&ib)
+                && t.iface_bases[both.0 as usize].contains(&ia),
+            "Both.iface_bases must contain IB and (flattened) IA"
+        );
+
+        // A VALUE STRUCT listing an interface base has EMPTY iface_bases.
+        assert!(
+            t.iface_bases[v.0 as usize].is_empty(),
+            "value struct V gets no itable iface_bases (boxing out of scope)"
+        );
+    }
+
+    /// IT-T2: a default (bodied) interface method is recorded in `imethods` with
+    /// a non-`None` `idefaults` symbol, an abstract one with `None`; and defaults
+    /// must NOT leak into `methods[iface]` (a class calling a default it overrides
+    /// would otherwise resolve to a wrong direct call). Explicit interface impls
+    /// land in `explicit_impls`.
+    #[test]
+    fn it_t2_defaults_and_explicit_impls() {
+        let src = r#"
+            interface IGreet {
+                int32 Abstract();
+                int32 Default() { return 100; }
+            }
+            class C : IGreet {
+                public int32 Abstract() { return 1; }
+                int32 IGreet.Explicit() { return 7; }
+            }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+        let igreet = *t.by_name.get("IGreet").expect("IGreet registers");
+        let c = *t.by_name.get("C").expect("C registers");
+
+        // Both methods take a slot; abstract → None, default → Some(symbol).
+        let names: Vec<&str> = t.imethods[igreet.0 as usize]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(names.contains(&"Abstract") && names.contains(&"Default"));
+        for (k, (n, _)) in t.imethods[igreet.0 as usize].iter().enumerate() {
+            let df = &t.idefaults[igreet.0 as usize][k];
+            if n == "Abstract" {
+                assert!(df.is_none(), "abstract method has no default symbol");
+            } else if n == "Default" {
+                assert_eq!(
+                    df.as_deref(),
+                    Some("IGreet.Default"),
+                    "default method records its {{prefix}}{{name}} symbol"
+                );
+            }
+        }
+
+        // Defaults must NOT be in `methods[iface]` (kept empty for interfaces).
+        assert!(
+            t.methods[igreet.0 as usize].is_empty(),
+            "interface methods (incl. defaults) must not enter methods[iface]"
+        );
+
+        // The explicit impl `IGreet.Explicit` is recorded for (C, IGreet, name).
+        assert!(
+            t.explicit_impls
+                .contains_key(&(c, igreet, "Explicit".to_string())),
+            "explicit interface impl recorded in explicit_impls"
+        );
     }
 }
