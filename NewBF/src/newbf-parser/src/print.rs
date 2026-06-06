@@ -219,6 +219,15 @@ impl Printer<'_> {
                 self.line(d, &format!("Named {}", self.txt(*name)));
                 self.expr(value, d + 1);
             }
+            Expr::Interp { parts, .. } => {
+                self.line(d, "Interp");
+                for part in parts {
+                    match part {
+                        InterpPart::Lit(s) => self.line(d + 1, &format!("Lit {s:?}")),
+                        InterpPart::Hole(e) => self.expr(e, d + 1),
+                    }
+                }
+            }
         }
     }
 

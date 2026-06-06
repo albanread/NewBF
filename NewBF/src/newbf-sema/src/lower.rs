@@ -23,9 +23,9 @@ use newbf_ir::{
 };
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
-    AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, Item, Member, MethodBody,
-    Modifier, Param as AstParam, ParamModifier, PrefixKw, Stmt, SwitchArm, Type as AstType,
-    TypeDecl, TypeKind, UnOp, parse_file,
+    AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, InterpPart, Item, Member,
+    MethodBody, Modifier, Param as AstParam, ParamModifier, PrefixKw, Stmt, SwitchArm,
+    Type as AstType, TypeDecl, TypeKind, UnOp, parse_file,
 };
 
 use crate::Program;
@@ -3488,6 +3488,9 @@ impl<'a> Lowerer<'a> {
             ),
             Expr::Null(_) => (Value::Const(Const::Null), IrType::Ptr),
             Expr::Str(s) => (Value::str(decode_string_literal(s.text(src))), IrType::Ptr),
+            // `$"…{expr}…"` → a freshly-`new`'d `String` with each literal run and
+            // each hole's value appended (via the type-matched `String.Append`).
+            Expr::Interp { parts, .. } => self.lower_interp(parts, src),
             // `sizeof(T)` → the type's byte size, an `int` (I64). A value struct
             // defers to the IR `SizeOf` (LLVM's DataLayout — the same size `new`
             // allocates); scalars and references are constant-sized (a class
@@ -5013,6 +5016,71 @@ impl<'a> Lowerer<'a> {
                 .call(ctor.full_name, vec![p.clone(), cstr], IrType::Void);
         }
         p
+    }
+
+    /// Lower an interpolated string `$"…{expr}…"` to a freshly-allocated
+    /// `String`: `new String()`, then append each literal run (byte-by-byte) and
+    /// each hole's value through the type-matched `String.Append` overload —
+    /// `Append(String)` for a `String`, `Append(char8)` for a `char8`,
+    /// `Append(int)` for any integer (widened to `int`). Other hole types are
+    /// evaluated for effect and skipped (no `Append` overload yet). The result is
+    /// a `String` reference the caller owns (must `delete`), like a target-typed
+    /// string literal.
+    fn lower_interp(&mut self, parts: &[InterpPart], src: &str) -> (Value, IrType) {
+        let Some(id) = self.structs.by_name.get("String").copied() else {
+            return (undef(IrType::Ptr), IrType::Ptr);
+        };
+        // new String(): malloc the body, null the header, run the 0-arg ctor.
+        let size = self.fb.size_of(id);
+        let s = self.fb.call("malloc", vec![size], IrType::Ref(id));
+        let hdr = self.fb.field_addr(s.clone(), id, 0);
+        self.fb.store(hdr, Value::Const(Const::Null));
+        if let Some(ctor) = self.structs.ctor_for(id, 0) {
+            self.fb.call(ctor.full_name, vec![s.clone()], IrType::Void);
+        }
+
+        for part in parts {
+            match part {
+                InterpPart::Lit(text) => {
+                    // Append each UTF-8 byte as a char8 (the corlib String is
+                    // byte-based), so multibyte text round-trips like a `char8*`.
+                    for &byte in text.as_bytes() {
+                        self.append_to_string(s.clone(), id, Value::int(byte as i128, IrType::U8), IrType::U8);
+                    }
+                }
+                InterpPart::Hole(e) => {
+                    let (v, t) = self.expr(e, src);
+                    match t {
+                        IrType::Ref(rid) if rid == id => {
+                            self.append_to_string(s.clone(), id, v, IrType::Ref(id));
+                        }
+                        IrType::U8 => {
+                            self.append_to_string(s.clone(), id, v, IrType::U8);
+                        }
+                        IrType::Int { .. } => {
+                            let w = self.coerce(v, t, IrType::I64);
+                            self.append_to_string(s.clone(), id, w, IrType::I64);
+                        }
+                        // No matching Append overload (bool, float, refs…): the
+                        // value was evaluated above for its effects; skip it.
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (s, IrType::Ref(id))
+    }
+
+    /// Call the `String.Append` overload whose argument type is `arg_ty`,
+    /// passing `s` as the receiver. A no-op if no such overload exists.
+    fn append_to_string(&mut self, s: Value, id: StructId, arg: Value, arg_ty: IrType) {
+        let sig = self.structs.methods[id.0 as usize]
+            .get("Append")
+            .and_then(|cands| cands.iter().find(|m| m.params.get(1) == Some(&arg_ty)))
+            .cloned();
+        if let Some(sig) = sig {
+            self.fb.call(sig.full_name, vec![s, arg], IrType::Void);
+        }
     }
 
     /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).

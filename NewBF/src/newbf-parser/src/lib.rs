@@ -17,8 +17,8 @@ mod print;
 
 pub use ast::{
     Accessor, AccessorKind, AssignOp, Attribute, BinOp, CompUnit, ComputedKind, Expr, GenericParam,
-    Item, Member, MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm, Type,
-    TypeDecl, TypeKind, TypeSeg, UnOp, WhereClause,
+    InterpPart, Item, Member, MethodBody, Modifier, Param, ParamModifier, PrefixKw, Stmt, SwitchArm,
+    Type, TypeDecl, TypeKind, TypeSeg, UnOp, WhereClause,
 };
 pub use parser::{
     Diagnostic, parse_expr, parse_file, parse_file_with_trivia, parse_fragment, parse_type,
@@ -149,6 +149,20 @@ mod tests {
             Expr::Lambda { body, .. } => format!("(lambda {})", sxs(src, body)),
             Expr::Named { name, value, .. } => {
                 format!("(named {} {})", name.text(src), sx(src, value))
+            }
+            Expr::Interp { parts, .. } => {
+                let mut s = String::from("(interp");
+                for part in parts {
+                    match part {
+                        InterpPart::Lit(t) => s.push_str(&format!(" {t:?}")),
+                        InterpPart::Hole(e) => {
+                            s.push(' ');
+                            s.push_str(&sx(src, e));
+                        }
+                    }
+                }
+                s.push(')');
+                s
             }
         }
     }
@@ -1202,5 +1216,29 @@ namespace Demo {
             let _ = parse_expr(&s, FileId(0));
             let _ = parse_fragment(&s, FileId(0));
         }
+    }
+
+    #[test]
+    fn string_interpolation() {
+        // Literal runs alternate with `{ expr }` holes; each hole is sub-parsed
+        // as a full expression with spans into the original source.
+        assert_eq!(ok(r#"$"hi {who}!""#), r#"(interp "hi " who "!")"#);
+        assert_eq!(ok(r#"$"{a}{b}""#), "(interp a b)");
+        assert_eq!(ok(r#"$"n={x + 1}""#), r#"(interp "n=" (+ x 1))"#);
+        // `{{`/`}}` are literal braces, not holes.
+        assert_eq!(ok(r#"$"{{x}}""#), r#"(interp "{x}")"#);
+        // A hole can hold a call/member chain.
+        assert_eq!(ok(r#"$"{a.b(c)}""#), "(interp (call (. a b) c))");
+        // No holes → a single literal run.
+        assert_eq!(ok(r#"$"plain""#), r#"(interp "plain")"#);
+    }
+
+    #[test]
+    fn string_interpolation_format_spec_is_stripped() {
+        // A top-level `:` (format) / `,` (alignment) ends the hole expression;
+        // the spec itself is dropped. An unparenthesized ternary keeps its `:`.
+        assert_eq!(ok(r#"$"{x:X}""#), "(interp x)");
+        assert_eq!(ok(r#"$"{x,5}""#), "(interp x)");
+        assert_eq!(ok(r#"$"{c ? a : b}""#), "(interp (?: c a b))");
     }
 }

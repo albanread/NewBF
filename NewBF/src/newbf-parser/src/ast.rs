@@ -341,8 +341,25 @@ pub enum Expr {
         name: Span,
         value: Box<Expr>,
     },
+    /// An interpolated string `$"…{expr}…"`: alternating literal runs and
+    /// expression holes. Lowered to a `String` built by appending each part.
+    Interp {
+        span: Span,
+        parts: Vec<InterpPart>,
+    },
     /// recovery placeholder for a malformed expression
     Error(Span),
+}
+
+/// One piece of an interpolated string [`Expr::Interp`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum InterpPart {
+    /// A literal text run, with escapes already decoded and `{{`/`}}`
+    /// un-doubled to single braces.
+    Lit(String),
+    /// A `{ expr }` hole, parsed (from the hole's source slice) as an
+    /// expression with spans pointing into the original file.
+    Hole(Box<Expr>),
 }
 
 impl Expr {
@@ -376,7 +393,8 @@ impl Expr {
             | Expr::Tuple { span, .. }
             | Expr::Initializer { span, .. }
             | Expr::Lambda { span, .. }
-            | Expr::Named { span, .. } => *span,
+            | Expr::Named { span, .. }
+            | Expr::Interp { span, .. } => *span,
         }
     }
 }

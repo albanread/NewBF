@@ -865,9 +865,13 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Char(span)
             }
-            TokenKind::Str | TokenKind::VerbatimStr | TokenKind::InterpStr => {
+            TokenKind::Str | TokenKind::VerbatimStr => {
                 self.bump();
                 Expr::Str(span)
+            }
+            TokenKind::InterpStr => {
+                self.bump();
+                self.parse_interp(span)
             }
             TokenKind::Ident => {
                 self.bump();
@@ -3691,6 +3695,208 @@ impl<'a> Parser<'a> {
     fn skip_to_member_boundary(&mut self) {
         self.skip_to_item_boundary();
     }
+
+    /// Parse an interpolated-string token (`$"…{expr}…"`) into an
+    /// [`Expr::Interp`]: alternating literal runs and `{ expr }` holes. The
+    /// lexer captured the whole thing as one token; here we split the body and
+    /// sub-parse each hole's source slice (with spans kept absolute, so sema can
+    /// read identifiers via `span.text(src)`). `{{`/`}}` are literal braces.
+    fn parse_interp(&mut self, span: Span) -> Expr {
+        let raw = span.text(self.src);
+        let bytes = raw.as_bytes();
+        let base = span.lo as usize;
+
+        // Skip the `$`/`@` prefix, then the opening quote run (1 or 3).
+        let mut i = 0;
+        while i < bytes.len() && (bytes[i] == b'$' || bytes[i] == b'@') {
+            i += 1;
+        }
+        let verbatim = raw[..i].contains('@');
+        let triple = bytes[i..].starts_with(b"\"\"\"");
+        let qlen = if triple { 3 } else { 1 };
+        i += qlen;
+        let body_start = i;
+        let body_end = bytes.len().saturating_sub(qlen).max(body_start);
+
+        let mut parts: Vec<InterpPart> = Vec::new();
+        let mut lit = String::new();
+        i = body_start;
+        while i < body_end {
+            let c = bytes[i];
+            match c {
+                b'{' if i + 1 < body_end && bytes[i + 1] == b'{' => {
+                    lit.push('{');
+                    i += 2;
+                }
+                b'}' if i + 1 < body_end && bytes[i + 1] == b'}' => {
+                    lit.push('}');
+                    i += 2;
+                }
+                b'{' => {
+                    // A hole: scan to its matching `}` (brace-balanced, skipping
+                    // nested string literals so `{f("}")}` isn't cut short).
+                    let hole_start = i + 1;
+                    let mut depth = 1u32;
+                    let mut j = hole_start;
+                    while j < body_end && depth > 0 {
+                        match bytes[j] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            b'"' => {
+                                j += 1;
+                                while j < body_end {
+                                    match bytes[j] {
+                                        b'\\' => j += 2,
+                                        b'"' => break,
+                                        _ => j += 1,
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if !lit.is_empty() {
+                        parts.push(InterpPart::Lit(std::mem::take(&mut lit)));
+                    }
+                    let hole_text = &raw[hole_start..j.min(body_end)];
+                    let abs = (base + hole_start) as u32;
+                    let e = self.parse_interp_hole(abs, hole_text);
+                    parts.push(InterpPart::Hole(Box::new(e)));
+                    i = j + 1; // skip past the closing `}`
+                }
+                b'\\' if !verbatim && i + 1 < body_end => {
+                    let next = bytes[i + 1];
+                    let decoded = match next {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'0' => '\0',
+                        b'\\' => '\\',
+                        b'"' => '"',
+                        b'\'' => '\'',
+                        // Unknown escape: keep the char after the backslash.
+                        _ => next as char,
+                    };
+                    lit.push(decoded);
+                    i += 2;
+                }
+                _ => {
+                    // Advance by a whole UTF-8 char so multibyte text survives.
+                    let ch = raw[i..].chars().next().unwrap_or('\u{FFFD}');
+                    lit.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(InterpPart::Lit(lit));
+        }
+        Expr::Interp { span, parts }
+    }
+
+    /// Parse one interpolation hole's source slice into an expression. The slice
+    /// is lexed standalone, then each token's span is shifted by `abs_start` (the
+    /// hole's byte offset in the file) so the resulting `Expr` spans point into
+    /// the original source — exactly what sema's `span.text(src)` expects.
+    fn parse_interp_hole(&mut self, abs_start: u32, hole_text: &str) -> Expr {
+        // Strip any Beef format specifier: at hole top level (outside
+        // parens/brackets and string/char literals) a `:` introduces a format
+        // string and a `,` an alignment — neither is part of the expression. A
+        // conditional therefore must be parenthesized (`{(c ? a : b)}`), exactly
+        // as Beef/C# require, so the top-level `:` is unambiguously the spec.
+        let expr_len = interp_expr_len(hole_text);
+        let hole_text = &hole_text[..expr_len];
+        let toks: Vec<Token> = lex(hole_text, self.file)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .map(|mut t| {
+                t.span.lo += abs_start;
+                t.span.hi += abs_start;
+                t
+            })
+            .collect();
+        let mut sub = Parser {
+            src: self.src,
+            toks,
+            file: self.file,
+            pos: 0,
+            diagnostics: Vec::new(),
+            splits: Vec::new(),
+            suppress_init: false,
+            trivia: Vec::new(),
+        };
+        let e = sub.expr();
+        if !sub.at(TokenKind::Eof) {
+            sub.error("trailing tokens in interpolation hole");
+        }
+        self.diagnostics.extend(sub.diagnostics);
+        e
+    }
+}
+
+/// The byte length of the *expression* part of an interpolation hole — i.e. up
+/// to the first top-level `:` (format string) or `,` (alignment), skipping
+/// nested `()`/`[]`/`{}` and string/char literals. The whole hole when neither
+/// appears.
+///
+/// A top-level `:` is a format separator only when no ternary `?` is pending —
+/// Beef allows an unparenthesized conditional in a hole (`{c ? a : b}`), whose
+/// `:` belongs to the ternary, not a format spec. We track pending `?`,
+/// ignoring `?.` (null-conditional) and `??` (null-coalescing), which aren't
+/// ternary openers.
+fn interp_expr_len(hole: &str) -> usize {
+    let b = hole.as_bytes();
+    let mut depth = 0i32;
+    let mut pending_q = 0i32; // unmatched top-level ternary `?`
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'\'' => break,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'?' if depth == 0 => match b.get(i + 1) {
+                Some(b'?') => i += 1,    // `??` — skip both bytes
+                Some(b'.') => {}         // `?.` — not a ternary opener
+                _ => pending_q += 1,
+            },
+            b':' if depth == 0 => {
+                if pending_q > 0 {
+                    pending_q -= 1; // ternary colon
+                } else {
+                    return i; // format separator
+                }
+            }
+            b',' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
 }
 
 /// Parse a single type reference from `src`.
