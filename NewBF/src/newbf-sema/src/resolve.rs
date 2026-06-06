@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use newbf_parser::Modifier;
+
 use crate::Diagnostic;
 use crate::build::Builder;
 use crate::intern::Symbol;
@@ -20,6 +22,7 @@ impl Builder {
         self.check_duplicate_using_aliases(&mut diags);
         self.check_duplicate_types(&mut diags);
         self.check_duplicate_members(&mut diags);
+        self.check_generic_method_guards(&mut diags);
         diags.sort_by_key(|d| (d.span.file.0, d.span.lo, d.span.hi));
         diags
     }
@@ -156,6 +159,44 @@ impl Builder {
                 diags.push(Diagnostic {
                     span: m.span(),
                     message: format!("duplicate member `{}`", self.interner.resolve(m.name())),
+                });
+            }
+        }
+    }
+
+    /// Reject `virtual`/`override` **generic** methods (generic-methods doc §1,
+    /// §6, task GM-A4): a generic method is monomorphized into a *family* of
+    /// concrete functions, but a single vtable slot can hold only one
+    /// implementation — there is no slot a polymorphic call could index into.
+    /// Beef itself disallows this; we reject it loudly at the declaration so a
+    /// programmer hits a real error rather than the silent direct (non-virtual)
+    /// call the lowering would otherwise emit, which would skip dispatch.
+    ///
+    /// `[Comptime]` generic methods are NOT rejected here: they are legal Beef
+    /// (the corlib uses them, e.g. `Enum.GetCount<T>()`) and only our v1 *lowering*
+    /// cannot instantiate-and-fold them. That limitation is enforced at
+    /// collection (the gen-method emission path refuses to register such a
+    /// monomorph), keeping a clean def-graph here so the corpus ratchet holds.
+    fn check_generic_method_guards(&self, diags: &mut Vec<Diagnostic>) {
+        for m in &self.members {
+            let MemberDef::Method(md) = m else { continue };
+            if md.generic_params.is_empty() {
+                continue;
+            }
+            // A generic method's own type parameters make it un-virtual: scan the
+            // method's modifiers (not the owner's) for `virtual`/`override`.
+            if let Some(kw) = md.modifiers.iter().find_map(|mo| match mo {
+                Modifier::Virtual => Some("virtual"),
+                Modifier::Override => Some("override"),
+                _ => None,
+            }) {
+                diags.push(Diagnostic {
+                    span: md.span,
+                    message: format!(
+                        "`{kw}` generic method `{}` is not supported: a generic method \
+                         is monomorphized per type-argument and cannot occupy a vtable slot",
+                        self.interner.resolve(md.name)
+                    ),
                 });
             }
         }

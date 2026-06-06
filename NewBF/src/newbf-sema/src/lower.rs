@@ -738,11 +738,40 @@ fn record_method_inst(
         params,
         return_ty,
         modifiers,
+        attributes,
         ..
     } = member
     else {
         return;
     };
+    // GM-A4 collection guards (generic-methods doc §1/§6). v1 deliberately does
+    // NOT support certain generic-method shapes; recording a monomorph for them
+    // would emit a *wrong* function (a `virtual`/`override` direct call that skips
+    // dispatch, or a `[Comptime]` body that runs at runtime un-folded). Refuse to
+    // record so no bad symbol is ever emitted — the call site already falls
+    // through cleanly to a default value (no dangling call). `virtual`/`override`
+    // additionally gets a loud declaration-level diagnostic in the analyze pass
+    // (`check_generic_method_guards`); `[Comptime]`+generic stays a clean
+    // documented no-garbage fallthrough here (it is legal Beef the corlib relies
+    // on — only our v1 lowering can't instantiate-and-fold it).
+    if modifiers
+        .iter()
+        .any(|(mo, _)| matches!(mo, Modifier::Virtual | Modifier::Override))
+        || has_comptime_attr(attributes, mdecl_src)
+    {
+        return;
+    }
+    // Abstract-type-arg guard (doc §1, last bullet): a self/inner generic call
+    // whose type-arg is an *unbound* type-parameter (`M<U>` where `U` is the
+    // enclosing template's own parameter, not yet bound by a concrete `env`)
+    // cannot be monomorphized here — it has no concrete type. Recording it would
+    // mint a bogus `M$ptr` monomorph from the `Ptr` type-fallback. Refuse it; the
+    // concrete monomorph (collected when `env` binds the parameter) records the
+    // right symbol, and a concrete-arg self-call (`M<int32>`) is unaffected
+    // because its arg is a registered/primitive type, never abstract.
+    if targs.iter().any(|a| targ_is_abstract(a, src, t, env)) {
+        return;
+    }
     let argtys: Vec<IrType> = targs.iter().map(|a| lower_ty_env(a, src, t, env)).collect();
     if argtys.len() != generic_params.len() {
         return;
@@ -796,6 +825,58 @@ fn record_method_inst(
         name: name.to_string(),
         env,
     });
+}
+
+/// Whether a generic-method call's type-argument is an **abstract** (unbound)
+/// type parameter — a bare single-segment name that is neither bound by the
+/// current monomorph `env`, nor a registered type, nor an int-/payload-enum,
+/// nor a primitive keyword. Such an arg can only be the enclosing template's own
+/// type parameter (`M<U>` inside `M<T>`), which has no concrete type at this
+/// collection point. A concrete arg (`int32`, a registered class, a bound `T`)
+/// is never abstract, so the supported concrete-arg self-call keeps working.
+/// A compound type (`List<U>`, `U*`, `(U, int)`) is treated as concrete here —
+/// it lowers to a registered mono / pointer / tuple, not a bare `Ptr` fallback.
+fn targ_is_abstract(targ: &AstType, src: &str, t: &StructTable, env: &[(String, IrType)]) -> bool {
+    let AstType::Path { segments, .. } = targ else {
+        return false;
+    };
+    if segments.len() != 1 || !segments[0].args.is_empty() {
+        return false;
+    }
+    let name = segments[0].name.text(src);
+    // Bound by the current monomorph env, or a registered/enum/primitive type ⇒
+    // concrete. Otherwise it is a free identifier — an unbound type parameter.
+    let bound = env.iter().any(|(n, _)| n == name);
+    let registered = t.by_name.contains_key(name)
+        || t.enums.contains_key(name)
+        || t.payload_enums.contains_key(name);
+    !bound && !registered && !is_primitive_name(name)
+}
+
+/// Whether `name` is a built-in primitive type keyword (mirrors `primitive`).
+fn is_primitive_name(name: &str) -> bool {
+    matches!(
+        name,
+        "void"
+            | "bool"
+            | "int"
+            | "int64"
+            | "intptr"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "uint"
+            | "uint64"
+            | "uintptr"
+            | "uint8"
+            | "char8"
+            | "uint16"
+            | "char16"
+            | "uint32"
+            | "char32"
+            | "float"
+            | "double"
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state

@@ -258,6 +258,65 @@ namespace Demo { class X { } }
         );
     }
 
+    // ── GM-A4: generic-method declaration guards ────────────────────────────
+
+    /// A `virtual` generic method can't occupy a vtable slot (it's a family of
+    /// monomorphs) — rejected loudly at the declaration (generic-methods §1/§6).
+    #[test]
+    fn virtual_generic_method_is_diagnosed() {
+        let p = analyze_src("class C { public virtual T Wrap<T>(T x) { return x; } }");
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("`virtual` generic method")),
+            "virtual generic method must be diagnosed: {:?}",
+            p.diagnostics
+        );
+    }
+
+    /// `override` + generic is the same vtable conflict — also rejected.
+    #[test]
+    fn override_generic_method_is_diagnosed() {
+        let p = analyze_src("class C { public override T G<T>(T x) { return x; } }");
+        assert!(
+            p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("`override` generic method")),
+            "override generic method must be diagnosed: {:?}",
+            p.diagnostics
+        );
+    }
+
+    /// A `virtual` *non-generic* method, even with a generic return/param type,
+    /// is fine — the guard keys on the method's OWN type parameters, not text.
+    #[test]
+    fn virtual_nongeneric_method_is_not_diagnosed() {
+        let p = analyze_src("class C { public virtual List<int> Make() { return null; } }");
+        assert!(
+            !p.diagnostics
+                .iter()
+                .any(|d| d.message.contains("generic method")),
+            "a non-generic virtual method must not be flagged: {:?}",
+            p.diagnostics
+        );
+    }
+
+    /// A `[Comptime]` generic method is LEGAL Beef (the corlib relies on it,
+    /// e.g. `Enum.GetCount<T>()`); only our v1 *lowering* can't instantiate it.
+    /// It must NOT be a declaration error, or the corlib-slice ratchet breaks.
+    /// (The lowering-side guard prevents the wrong emission; see lower.rs.)
+    #[test]
+    fn comptime_generic_method_is_not_a_declaration_error() {
+        let p = analyze_src(
+            "class C { [Comptime] public static T Id<T>(T x) { return x; } }",
+        );
+        assert!(
+            p.diagnostics.is_empty(),
+            "a [Comptime] generic method must build a clean def-graph: {:?}",
+            p.diagnostics
+        );
+    }
+
     #[test]
     fn duplicate_field_is_diagnosed_but_method_overloads_are_not() {
         let dup = analyze_src("class C { int x; int x; }");
@@ -392,5 +451,117 @@ typealias Id = int;
         let ir = lower_src("class C { public static void h() { var x = new Foo(); x.Bar(); } }");
         assert!(ir.contains("func @C.h() -> void"), "{ir}");
         assert!(ir.contains("ret void"), "{ir}");
+    }
+
+    // ── GM-A4: deferred generic-method cases lower without garbage ───────────
+    //
+    // Each deferred shape (generic-methods §1) must produce NO monomorph symbol
+    // and NO call to one — never a dangling call to a function that was never
+    // emitted. The call site falls through to a clean default. (The whole-corpus
+    // `llvm_lowering_verifies_on_real_beef` gate proves verifier-cleanliness; here
+    // we assert the precise "no bad symbol / no dangling call" property.)
+
+    /// A `virtual` generic method instantiated by a call must NOT emit a
+    /// monomorph nor a direct call to it (that would skip vtable dispatch).
+    #[test]
+    fn virtual_generic_call_emits_no_monomorph() {
+        let ir = lower_src(
+            "class Base { public virtual T Wrap<T>(T x) { return x; } } \
+             class Program { public static int32 Main() { \
+                 Base b = new Base(); return b.Wrap<int32>(7); } }",
+        );
+        assert!(
+            !ir.contains("Wrap$"),
+            "no virtual generic monomorph may be emitted or called: {ir}"
+        );
+    }
+
+    /// A `[Comptime]` generic method instantiated by a call must NOT emit a
+    /// plain (un-folded) runtime monomorph — the gen-method path can't register
+    /// it for comptime folding, so emitting it would silently run at runtime.
+    #[test]
+    fn comptime_generic_call_emits_no_monomorph() {
+        let ir = lower_src(
+            "class Program { [Comptime] public static T Id<T>(T x) { return x; } \
+             public static int32 Main() { return Id<int32>(7); } }",
+        );
+        assert!(
+            !ir.contains("Id$"),
+            "no [Comptime] generic monomorph may be emitted or called: {ir}"
+        );
+    }
+
+    /// An inherited generic instance method (declared on a base, called on a
+    /// derived receiver) is deferred: owner = derived → key miss → clean
+    /// fallthrough, never a dangling call to a base-owner symbol.
+    #[test]
+    fn inherited_generic_instance_call_has_no_dangling_call() {
+        let ir = lower_src(
+            "class Base { public T Wrap<T>(T x) { return x; } } \
+             class Derived : Base { } \
+             class Program { public static int32 Main() { \
+                 Derived d = new Derived(); return d.Wrap<int32>(7); } }",
+        );
+        // No call may target a Wrap monomorph (the only Wrap$ allowed is the
+        // *definition* emitted for Base, which is fine — but no `call` to it).
+        assert!(
+            !ir.contains("call i32 @Base.Wrap$"),
+            "inherited generic instance call must not emit a dangling call: {ir}"
+        );
+    }
+
+    /// An instance generic call on an unresolvable receiver (a call-return
+    /// value) is deferred: the receiver owner can't be resolved at compile
+    /// time, so the call falls through cleanly with no monomorph symbol.
+    #[test]
+    fn unresolvable_receiver_generic_call_is_clean() {
+        let ir = lower_src(
+            "class Box { public T Get<T>(T x) { return x; } } \
+             class Program { \
+                 public static Box MakeBox() { return new Box(); } \
+                 public static int32 Main() { return MakeBox().Get<int32>(7); } }",
+        );
+        assert!(
+            !ir.contains("Get$"),
+            "an unresolvable-receiver generic call must not emit/call a monomorph: {ir}"
+        );
+    }
+
+    /// The supported concrete-arg self-call (`M<int32>` inside a generic body)
+    /// must keep working — GM-A4's guards must not regress it.
+    #[test]
+    fn concrete_self_call_in_generic_body_still_works() {
+        let ir = lower_src(
+            "class Program { \
+                 public static T Inner<T>(T x) { return x; } \
+                 public static T Outer<T>(T x) { return Inner<int32>(5); } \
+                 public static int32 Main() { return Outer<int32>(1); } }",
+        );
+        assert!(
+            ir.contains("call i32 @Program.Inner$i32"),
+            "concrete-arg self-call must still resolve to a direct monomorph call: {ir}"
+        );
+    }
+
+    /// An abstract inner type-arg (`Inner<T>` inside the `Outer<T>` template,
+    /// `T` unbound at the template) must NOT mint a bogus `Inner$ptr` monomorph
+    /// from the `Ptr` type-fallback (doc §1). The concrete `Inner<int32>` it
+    /// also calls is still emitted; only the abstract spurious one is suppressed.
+    #[test]
+    fn abstract_inner_type_arg_emits_no_bogus_monomorph() {
+        let ir = lower_src(
+            "class Program { \
+                 public static T Inner<T>(T x) { return x; } \
+                 public static T Outer<T>(T x) { int32 a = Inner<int32>(5); return Inner<T>(x); } \
+                 public static int32 Main() { return Outer<int32>(1); } }",
+        );
+        assert!(
+            !ir.contains("Inner$p"),
+            "abstract-type-arg self-call must not mint a bogus $ptr monomorph: {ir}"
+        );
+        assert!(
+            ir.contains("@Program.Inner$i32"),
+            "the concrete Inner<int32> monomorph must still be emitted: {ir}"
+        );
     }
 }
