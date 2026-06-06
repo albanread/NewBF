@@ -867,6 +867,12 @@ fn collect_insts_expr<'a>(
                     env,
                 );
                 record_method_inst(s.text(src), args, src, gmethods, t, env);
+            } else if let Expr::Member { name, base: mbase, .. } = &**base {
+                // Qualified generic-method call `Type.Method<Args>(…)` — record
+                // the monomorph by method name (global-name mangling). Recurse
+                // into the receiver base for its own instantiations.
+                record_method_inst(name.text(src), args, src, gmethods, t, env);
+                collect_insts_expr(mbase, src, generics, gmethods, t, seen, monos, env);
             }
         }
         Expr::Paren { inner, .. } => {
@@ -3766,13 +3772,13 @@ impl<'a> Lowerer<'a> {
                 if let Expr::Generic {
                     base, args: targs, ..
                 } = &**callee
-                    && let Expr::Ident(s) = &**base
+                    && let Some(mname) = generic_callee_name(base, src)
                 {
                     let argtys: Vec<IrType> = targs
                         .iter()
                         .map(|a| lower_ty_env(a, src, self.structs, self.env))
                         .collect();
-                    let mangled = mangle_generic(s.text(src), &argtys);
+                    let mangled = mangle_generic(mname, &argtys);
                     if let Some(sig) = self.structs.gen_method_sigs.get(&mangled).cloned()
                         && sig.params.len() == args.len()
                     {
@@ -6425,6 +6431,17 @@ fn param_ir_ty(p: &AstParam, src: &str, structs: &StructTable, env: TyEnv) -> Ir
 /// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
 fn mangle_generic(name: &str, args: &[IrType]) -> String {
     format!("{name}${}", type_codes(args))
+}
+
+/// The method name of a generic-call callee base — `Name` for a bare
+/// `Name<Args>(…)` and `Type.Name` qualified call alike. Generic methods use
+/// global-name mangling (no owner), so both resolve to the same monomorph.
+fn generic_callee_name<'b>(base: &'b Expr, src: &'b str) -> Option<&'b str> {
+    match base {
+        Expr::Ident(s) => Some(s.text(src)),
+        Expr::Member { name, .. } => Some(name.text(src)),
+        _ => None,
+    }
 }
 
 /// Lower a type, resolving generic type-parameters through `env` (so a `T`
