@@ -835,6 +835,9 @@ impl Printer<'_> {
                         Some(p) => {
                             self.line(d + 1, "Case");
                             self.labeled_expr(d + 2, "pattern", p);
+                            for e in &arm.extra {
+                                self.labeled_expr(d + 2, "pattern", e);
+                            }
                         }
                         None => self.line(d + 1, "Default"),
                     }

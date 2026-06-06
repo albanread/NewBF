@@ -486,7 +486,11 @@ pub enum Stmt {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SwitchArm {
     pub span: Span,
+    /// The primary case value/pattern; `None` for the `default` arm.
     pub pattern: Option<Expr>,
+    /// Additional comma-separated case values (`case a, b, c:` → `pattern = a`,
+    /// `extra = [b, c]`). The arm matches if the scrutinee equals any of them.
+    pub extra: Vec<Expr>,
     pub guard: Option<Expr>,
     pub body: Vec<Stmt>,
 }

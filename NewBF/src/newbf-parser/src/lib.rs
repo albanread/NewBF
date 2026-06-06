@@ -319,6 +319,10 @@ mod tests {
                         s.push(' ');
                         s.push_str(&sx(src, p));
                     }
+                    for e in &arm.extra {
+                        s.push(' ');
+                        s.push_str(&sx(src, e));
+                    }
                     for st in &arm.body {
                         s.push(' ');
                         s.push_str(&sxs(src, st));
@@ -1231,6 +1235,16 @@ namespace Demo {
         assert_eq!(ok(r#"$"{a.b(c)}""#), "(interp (call (. a b) c))");
         // No holes → a single literal run.
         assert_eq!(ok(r#"$"plain""#), r#"(interp "plain")"#);
+    }
+
+    #[test]
+    fn switch_multi_value_case() {
+        // `case a, b, c:` keeps all listed values (primary + extra), not just
+        // the first — the bug that made multi-value cases silently mismatch.
+        assert_eq!(
+            ok_stmt("switch (x) { case 1, 2, 3: return 1; default: return 0; }"),
+            "(switch x (case 1 2 3 (return 1)) (default (return 0)))"
+        );
     }
 
     #[test]

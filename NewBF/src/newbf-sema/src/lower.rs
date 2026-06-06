@@ -3224,12 +3224,24 @@ impl<'a> Lowerer<'a> {
                     self.terminated = true;
                 }
                 for (chain_i, &arm_i) in case_idxs.iter().enumerate() {
+                    // A multi-value case `case a, b, c:` matches if the scrutinee
+                    // equals any listed value — fold the per-value `==` with `or`.
+                    // Label expressions are constants/side-effect-free, so testing
+                    // them all unconditionally is fine.
                     let pat = arms[arm_i].pattern.as_ref().unwrap();
-                    let (pv, pt) = self.expr(pat, src);
-                    let ct = common_type(st, pt);
-                    let l = self.coerce(sv.clone(), st, ct);
-                    let r = self.coerce(pv, pt, ct);
-                    let eq = self.fb.cmp(CmpPred::Eq, l, r);
+                    let mut eq: Option<Value> = None;
+                    for p in std::iter::once(pat).chain(arms[arm_i].extra.iter()) {
+                        let (pv, pt) = self.expr(p, src);
+                        let ct = common_type(st, pt);
+                        let l = self.coerce(sv.clone(), st, ct);
+                        let r = self.coerce(pv, pt, ct);
+                        let cmp = self.fb.cmp(CmpPred::Eq, l, r);
+                        eq = Some(match eq {
+                            None => cmp,
+                            Some(prev) => self.fb.bin(IrBin::Or, prev, cmp, IrType::Bool),
+                        });
+                    }
+                    let eq = eq.unwrap();
                     let last = chain_i + 1 == case_idxs.len();
                     let next = if last {
                         default_target
