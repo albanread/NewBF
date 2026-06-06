@@ -236,6 +236,33 @@ impl StructTable {
                 register_payload_enum_mono(*id, decl, decl_src, env, &mut t);
             }
         }
+        // 4d. Second generic-instantiation pass, now that fields are filled
+        //     (GM-A3a). A *field-receiver* instance generic call `this.f.M<T>(…)`
+        //     needs `f`'s declared type, which `instance_recv_owner` reads from
+        //     `t.defs[owner].fields` — empty during step 3. Re-running with the
+        //     SAME `seen` set means no type monomorph is re-registered (all were
+        //     discovered syntactically in step 3, before fields mattered), and the
+        //     gen-method dedup (`gen_method_sigs.contains_key`) appends only the
+        //     newly-resolvable field-receiver monomorphs. The throwaway `monos`
+        //     stays empty (everything is already `seen`).
+        let mut monos2: MonoList = Vec::new();
+        for f in files {
+            collect_insts_items(
+                &f.unit.items,
+                f.src,
+                &generics,
+                &gmethods,
+                &mut t,
+                &mut seen,
+                &mut monos2,
+                &[],
+            );
+        }
+        debug_assert!(
+            monos2.is_empty(),
+            "second collection pass registered {} unexpected type monomorphs",
+            monos2.len()
+        );
         // 5. Compose single inheritance once every type's own layout is filled,
         //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
@@ -710,6 +737,7 @@ fn record_method_inst(
         generic_params,
         params,
         return_ty,
+        modifiers,
         ..
     } = member
     else {
@@ -732,10 +760,25 @@ fn record_method_inst(
         .zip(&argtys)
         .map(|(gp, ty)| (gp.name.text(mdecl_src).to_string(), *ty))
         .collect();
-    let psig: Vec<IrType> = params
+    // GM-A3a: an instance generic method (non-static, declared on a *concrete*
+    // owner) takes a leading `this: Ref(owner)` and is dispatched with a real
+    // receiver. A `None`-bucket entry (bare cross-class static) and a static
+    // method stay receiver-less. The ABI here is the single source of truth the
+    // call site (prepend `this` iff `is_instance`) and emission (`this_ty`) read.
+    let is_static = modifiers
         .iter()
-        .map(|p| lower_ty_env(&p.ty, mdecl_src, t, &env))
-        .collect();
+        .any(|(mo, _)| matches!(mo, Modifier::Static));
+    let is_instance = owner.is_some() && !is_static;
+    let mut psig: Vec<IrType> = Vec::with_capacity(params.len() + 1);
+    if let (true, Some(oid)) = (is_instance, owner) {
+        psig.push(IrType::Ref(oid));
+    }
+    psig.extend(params.iter().map(|p| lower_ty_env(&p.ty, mdecl_src, t, &env)));
+    // A trailing `params T[]` makes the call site pack overflow args into a `T[]`.
+    let variadic = params
+        .last()
+        .filter(|p| matches!(p.modifier, Some((ParamModifier::Params, _))))
+        .and_then(|p| pointer_elem_env(&p.ty, mdecl_src, t, &env));
     let ret = lower_ty_env(return_ty, mdecl_src, t, &env);
     t.gen_method_sigs.insert(
         key,
@@ -743,8 +786,8 @@ fn record_method_inst(
             full_name: mangled.clone(),
             ret,
             params: psig,
-            is_instance: false,
-            variadic: None,
+            is_instance,
+            variadic,
         },
     );
     t.gen_method_monos.push(GenMethodMono {
@@ -811,7 +854,10 @@ fn collect_insts_type<'a>(
                     use_in_type(&p.ty, src, generics, gmethods, t, seen, monos, env);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                    let mut locals = param_locals(params, src, t, env);
+                    collect_insts_stmt(
+                        s, src, generics, gmethods, t, seen, monos, env, cur_owner, &mut locals,
+                    );
                 }
             }
             Member::Constructor { params, body, .. } => {
@@ -819,7 +865,10 @@ fn collect_insts_type<'a>(
                     use_in_type(&p.ty, src, generics, gmethods, t, seen, monos, env);
                 }
                 if let MethodBody::Block(s) = body {
-                    collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                    let mut locals = param_locals(params, src, t, env);
+                    collect_insts_stmt(
+                        s, src, generics, gmethods, t, seen, monos, env, cur_owner, &mut locals,
+                    );
                 }
             }
             Member::Nested(n) => {
@@ -842,9 +891,34 @@ fn collect_insts_type<'a>(
     }
 }
 
+/// Seed the collector's `locals` type scope from a method/ctor's parameters
+/// (GM-A3a). Each named param contributes `(name, declared IR type)`, resolved
+/// through the monomorph `env` exactly as `lower_method` binds it — so the
+/// collector resolves an instance-call receiver to the same `StructId` the live
+/// `Lowerer` scope will (R4). `ref`/`out` params bind to the pointee value type
+/// (mirroring `lower_method`), and unnamed (`this`/discard) params are skipped.
+fn param_locals(
+    params: &[AstParam],
+    src: &str,
+    t: &StructTable,
+    env: &[(String, IrType)],
+) -> Vec<(String, IrType)> {
+    params
+        .iter()
+        .filter_map(|p| {
+            let nm = p.name?;
+            Some((nm.text(src).to_string(), lower_ty_env(&p.ty, src, t, env)))
+        })
+        .collect()
+}
+
 /// Walk statement bodies for generic instantiations in local-declaration types
 /// (`Box<int> b;`). Expression-position instantiations (`new Box<int>()`) arrive
 /// with the generic *class* slice.
+///
+/// `locals` is the GM-A3a type scope (params + explicitly-typed `Stmt::Local`s)
+/// used to resolve an instance generic-method call's receiver owner; blocks
+/// truncate it back to entry length on exit (lexical scoping).
 #[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
 fn collect_insts_stmt<'a>(
     stmt: &Stmt,
@@ -856,52 +930,82 @@ fn collect_insts_stmt<'a>(
     monos: &mut MonoList<'a>,
     env: &[(String, IrType)],
     cur_owner: Option<StructId>,
+    locals: &mut Vec<(String, IrType)>,
 ) {
     match stmt {
         Stmt::Block { stmts, .. } => {
+            // A nested block introduces its own scope: record its locals, then
+            // truncate them off on exit so they don't leak to siblings.
+            let mark = locals.len();
             for s in stmts {
-                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_stmt(
+                    s, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
+            locals.truncate(mark);
         }
-        Stmt::Local { ty, init, .. } => {
+        Stmt::Local { ty, name, init, .. } => {
             if let Some(ty) = ty {
                 use_in_type(ty, src, generics, gmethods, t, seen, monos, env);
+                // Record an explicitly-typed local so an instance generic call on
+                // it resolves its owner (GM-A3a). `var`/inferred locals (no `ty`)
+                // are deliberately *not* recorded — a receiver they back is a
+                // diagnosed shape, never silently mis-owned (doc §3.4).
+                locals.push((name.text(src).to_string(), lower_ty_env(ty, src, t, env)));
             }
             if let Some(e) = init {
-                collect_insts_expr(e, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_expr(
+                    e, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
         }
         Stmt::Locals { decls, .. } => {
             for d in decls {
-                collect_insts_stmt(d, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_stmt(
+                    d, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
         }
-        Stmt::Expr { expr, .. } => {
-            collect_insts_expr(expr, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
-        Stmt::Return { value: Some(e), .. } => {
-            collect_insts_expr(e, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
+        Stmt::Expr { expr, .. } => collect_insts_expr(
+            expr, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
+        Stmt::Return { value: Some(e), .. } => collect_insts_expr(
+            e, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
         Stmt::If {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_stmt(then, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                cond, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_stmt(
+                then, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
             if let Some(e) = els {
-                collect_insts_stmt(e, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_stmt(
+                    e, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
         }
         Stmt::While { cond, body, .. } | Stmt::DoWhile { body, cond, .. } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                cond, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_stmt(
+                body, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
         }
         Stmt::ForEach { iter, body, .. } => {
-            collect_insts_expr(iter, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                iter, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_stmt(
+                body, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
         }
-        Stmt::Defer { body, .. } => {
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
+        Stmt::Defer { body, .. } => collect_insts_stmt(
+            body, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
         Stmt::For {
             init,
             init_extra,
@@ -911,22 +1015,36 @@ fn collect_insts_stmt<'a>(
             body,
             ..
         } => {
+            let mark = locals.len();
             if let Some(i) = init {
-                collect_insts_stmt(i, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_stmt(
+                    i, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
             for s in init_extra {
-                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_stmt(
+                    s, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
             if let Some(c) = cond {
-                collect_insts_expr(c, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_expr(
+                    c, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
             if let Some(u) = update {
-                collect_insts_expr(u, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_expr(
+                    u, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
             for u in update_extra {
-                collect_insts_expr(u, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_expr(
+                    u, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
-            collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_stmt(
+                body, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            locals.truncate(mark);
         }
         _ => {}
     }
@@ -946,6 +1064,7 @@ fn collect_insts_expr<'a>(
     monos: &mut MonoList<'a>,
     env: &[(String, IrType)],
     cur_owner: Option<StructId>,
+    locals: &mut Vec<(String, IrType)>,
 ) {
     match e {
         Expr::Generic { base, args, .. } => {
@@ -961,51 +1080,87 @@ fn collect_insts_expr<'a>(
                 let owner = bare_gen_owner(cur_owner, name, gmethods);
                 record_method_inst(name, args, src, gmethods, t, env, owner);
             } else if let Expr::Member { name, base: mbase, .. } = &**base {
-                // Qualified generic-method call `Type.Method<Args>(…)`: when the
-                // receiver names a registered type, record under that owner; else
-                // fall back to the `None` bucket (instance receivers are GM-A3).
                 let mname = name.text(src);
-                let owner = qualified_gen_owner(mbase, src, t);
-                record_method_inst(mname, args, src, gmethods, t, env, owner);
-                collect_insts_expr(mbase, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                // First try a *qualified static* call `Type.Method<Args>(…)`: the
+                // receiver names a registered type. Otherwise treat it as an
+                // *instance* call `recv.Method<Args>(…)` and resolve the receiver's
+                // concrete-owner `StructId` from the same shapes the call site's
+                // `struct_base` resolves (declared local/param, `this`,
+                // `this`-field, `new T()`) — R4: identical owner rule both passes.
+                let owner = if let Some(id) = qualified_gen_owner(mbase, src, t) {
+                    Some(id)
+                } else {
+                    let lookup = |n: &str| locals.iter().find(|(ln, _)| ln == n).map(|(_, ty)| *ty);
+                    instance_recv_owner(mbase, src, &lookup, cur_owner, env, t)
+                };
+                // A `Member`-base call is *qualified-static* or *instance* — it is
+                // never a bare-cross-class `None`-bucket call. So record ONLY when
+                // the owner resolves to a concrete type; an unsupported instance
+                // receiver (`var` local, call-return, …) records NOTHING — a clean
+                // diagnosis (no `None`-bucket static mono, no dangling symbol),
+                // matching the call site, which emits no call for that shape.
+                if let Some(owner) = owner {
+                    record_method_inst(mname, args, src, gmethods, t, env, Some(owner));
+                }
+                collect_insts_expr(
+                    mbase, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
         }
-        Expr::Paren { inner, .. } => {
-            collect_insts_expr(inner, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
+        Expr::Paren { inner, .. } => collect_insts_expr(
+            inner, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
         // `sizeof(List<int>)` instantiates the type it names.
         Expr::SizeOf { ty, .. } => use_in_type(ty, src, generics, gmethods, t, seen, monos, env),
         Expr::Unary { operand, .. }
         | Expr::PostInc { operand, .. }
         | Expr::PostDec { operand, .. }
-        | Expr::Prefix { operand, .. } => {
-            collect_insts_expr(operand, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
-        Expr::Member { base, .. } => {
-            collect_insts_expr(base, src, generics, gmethods, t, seen, monos, env, cur_owner)
-        }
+        | Expr::Prefix { operand, .. } => collect_insts_expr(
+            operand, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
+        Expr::Member { base, .. } => collect_insts_expr(
+            base, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
         Expr::Binary { lhs, rhs, .. } => {
-            collect_insts_expr(lhs, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_expr(rhs, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                lhs, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_expr(
+                rhs, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
         }
         Expr::Assign { target, value, .. } => {
-            collect_insts_expr(target, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_expr(value, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                target, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_expr(
+                value, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
         }
         Expr::Ternary {
             cond, then, els, ..
         } => {
-            collect_insts_expr(cond, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_expr(then, src, generics, gmethods, t, seen, monos, env, cur_owner);
-            collect_insts_expr(els, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                cond, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_expr(
+                then, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            collect_insts_expr(
+                els, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
         }
         Expr::Call { callee, args, .. }
         | Expr::Index {
             base: callee, args, ..
         } => {
-            collect_insts_expr(callee, src, generics, gmethods, t, seen, monos, env, cur_owner);
+            collect_insts_expr(
+                callee, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
             for a in args {
-                collect_insts_expr(a, src, generics, gmethods, t, seen, monos, env, cur_owner);
+                collect_insts_expr(
+                    a, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
             }
         }
         _ => {}
@@ -1037,6 +1192,73 @@ fn bare_gen_owner(
 fn qualified_gen_owner(base: &Expr, src: &str, t: &StructTable) -> Option<StructId> {
     match base {
         Expr::Ident(s) => t.by_name.get(s.text(src)).copied(),
+        _ => None,
+    }
+}
+
+/// Resolve the *static-type* owner `StructId` of an **instance** generic-method
+/// call receiver `recv` — for exactly the v1-supported receiver shapes (doc
+/// §3.3/§3.4): a declared-typed local/param, `this`, a simple field of a
+/// resolvable receiver, `new T()`/`new T<Args>()`, and `(parenthesized)` forms.
+///
+/// **R4 — owner-skew avoidance:** this single pure resolver is the authoritative
+/// owner rule, used by BOTH the collector (`collect_insts_expr`, via a closure
+/// over its explicit `locals` scope) AND the call site (the `Expr::Generic`
+/// branch, via a closure over the live `Lowerer` scope). Because both passes run
+/// the identical match here, they always resolve the same owner; any receiver
+/// this returns `None` for is a *diagnosed* shape (the call site emits no
+/// dangling call, the collector records nothing), never a divergence.
+///
+/// `lookup_local` resolves a bare name to its IR type (the scope's view of
+/// locals/params); `this_owner` is the enclosing type's id; `env` resolves a
+/// generic `new T<Args>()` through the current monomorph bindings.
+fn instance_recv_owner(
+    recv: &Expr,
+    src: &str,
+    lookup_local: &dyn Fn(&str) -> Option<IrType>,
+    this_owner: Option<StructId>,
+    env: &[(String, IrType)],
+    t: &StructTable,
+) -> Option<StructId> {
+    let id_of = |ty: IrType| match ty {
+        IrType::Struct(id) | IrType::Ref(id) => Some(id),
+        _ => None,
+    };
+    match recv {
+        Expr::Paren { inner, .. } => {
+            instance_recv_owner(inner, src, lookup_local, this_owner, env, t)
+        }
+        // `this` → the enclosing type.
+        Expr::This(_) => this_owner,
+        // A declared-typed local/param naming a class/struct.
+        Expr::Ident(s) => id_of(lookup_local(s.text(src))?),
+        // A simple field of a resolvable receiver (`this.f`, `local.f`, …).
+        Expr::Member { base, name, .. } => {
+            let owner = instance_recv_owner(base, src, lookup_local, this_owner, env, t)?;
+            let fname = name.text(src);
+            let fidx = t.defs[owner.0 as usize]
+                .fields
+                .iter()
+                .position(|f| f.name == fname)?;
+            id_of(t.defs[owner.0 as usize].fields[fidx].ty)
+        }
+        // `new T()` / `new T<Args>()` — resolve the constructed class.
+        Expr::Prefix {
+            kw: PrefixKw::New | PrefixKw::Scope,
+            operand,
+            ..
+        } => {
+            if let Some((name, args)) = generic_new_parts(operand, src) {
+                let argtys: Vec<IrType> =
+                    args.iter().map(|a| lower_ty_env(a, src, t, env)).collect();
+                let mangled = mangle_generic(name, &argtys);
+                if let Some(ty) = t.ty_of(&mangled) {
+                    return id_of(ty);
+                }
+            }
+            let name = ctor_class_name(operand, src)?;
+            id_of(t.ty_of(name)?)
+        }
         _ => None,
     }
 }
@@ -2152,40 +2374,64 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             lower_type_at(decl, Some(*id), &prefix, env, decl_src, &structs, &mut m);
         }
     }
-    // Emit each generic-*method* monomorph as a static free function: re-find the
-    // decl by name and lower its body with the instantiation's type-param env, so
-    // a `T` resolves concretely. (`None` this_ty = static; `&[]` extra params.)
+    // Emit each generic-*method* monomorph: re-find its decl via `(owner, name)`
+    // and lower its body with the instantiation's type-param env, so a `T`
+    // resolves concretely. A `None`-owner / static monomorph is a receiver-less
+    // free function; a `Some(owner)` *instance* monomorph (GM-A3b) is emitted as
+    // a real instance method — `this_ty = Ref(owner)` (so `lower_method` spills a
+    // leading `this` and `this.field` / bare sibling calls in the body resolve)
+    // and the owner's method table is its `sigs`.
     let mut gmethods: GenMethodDecls = HashMap::new();
     for f in &all {
         index_generic_methods(&f.unit.items, f.src, &structs, &mut gmethods);
     }
+    let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
     for mono in &structs.gen_method_monos {
-        // GM-A1: re-find the decl via `(owner, name)` (owner is always `None`);
-        // take the first overload (preserves first-writer-wins).
-        if let Some(&(member, mdecl_src)) = gmethods
-            .get(&(mono.owner, mono.name.clone()))
-            .and_then(|v| v.first())
-            && let Member::Method {
-                return_ty,
-                params,
-                body,
-                ..
-            } = member
+        // Re-find the decl via `(owner, name)`, picking the overload whose
+        // type-param arity matches this monomorph's env (mirrors the collector).
+        if let Some(&(member, mdecl_src)) = gmethods.get(&(mono.owner, mono.name.clone())).and_then(
+            |v| {
+                v.iter().find(|(m, _)| {
+                    matches!(m, Member::Method { generic_params, .. }
+                        if generic_params.len() == mono.env.len())
+                })
+            },
+        ) && let Member::Method {
+            return_ty,
+            params,
+            body,
+            modifiers,
+            ..
+        } = member
         {
             let ret = lower_ty_env(return_ty, mdecl_src, &structs, &mono.env);
-            let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
+            // Instance monomorph iff non-static AND owned by a concrete type —
+            // identical to `record_method_inst`'s `is_instance` rule so the ABI
+            // (leading `this`) agrees between sig, call site, and definition.
+            let is_static = modifiers
+                .iter()
+                .any(|(mo, _)| matches!(mo, Modifier::Static));
+            let this_ty = match mono.owner {
+                Some(oid) if !is_static => Some(IrType::Ref(oid)),
+                _ => None,
+            };
+            // For an instance monomorph, resolve `this.field` / bare sibling calls
+            // through the owner's method table; otherwise no sibling scope.
+            let sigs: &HashMap<String, Vec<MethodSig>> = match (this_ty, mono.owner) {
+                (Some(_), Some(oid)) => &structs.methods[oid.0 as usize],
+                _ => &empty,
+            };
             if let Some(func) = lower_method(
                 mono.sym.clone(),
                 ret,
                 params,
                 body,
                 mdecl_src,
-                &empty,
+                sigs,
                 &structs,
-                None,
+                this_ty,
                 &mono.env,
                 &[],
-                // GM-A1: always `None` (the gen-method monos carry no owner yet).
                 mono.owner,
             ) {
                 m.add_function(func);
@@ -3920,48 +4166,14 @@ impl<'a> Lowerer<'a> {
                 } = &**callee
                     && let Some(mname) = generic_callee_name(base, src)
                 {
-                    let argtys: Vec<IrType> = targs
-                        .iter()
-                        .map(|a| lower_ty_env(a, src, self.structs, self.env))
-                        .collect();
-                    let codes = type_codes(&argtys);
-                    // Owner candidates, in order, MUST match the collector's
-                    // owner-determination rule (`bare_gen_owner`/`qualified_gen_owner`)
-                    // so collection and lowering resolve the same symbol:
-                    //   bare `M<T>`        → [Some(cur_type), None]
-                    //   qualified `T.M<T>` → [Some(by_name[T]), None]
-                    // The trailing `None` is the retained bare-cross-class static
-                    // fallback (e.g. `list_hof.bf`'s `Map`/`Filter`/`Fold`).
-                    let qualified_owner = match &**base {
-                        Expr::Member { base: mbase, .. } => match &**mbase {
-                            Expr::Ident(s) => self.structs.by_name.get(s.text(src)).copied(),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    let primary = match &**base {
-                        Expr::Ident(_) => self.cur_type,
-                        Expr::Member { .. } => qualified_owner,
-                        _ => None,
-                    };
-                    let resolved = [primary, None].into_iter().find_map(|owner| {
-                        let key: GenMKey = (owner, mname.to_string(), codes.clone());
-                        self.structs.gen_method_sigs.get(&key).cloned()
-                    });
-                    if let Some(sig) = resolved
-                        && sig.params.len() == args.len()
-                    {
-                        let call_args: Vec<Value> = args
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| {
-                                let (v, ty) = self.expr(a, src);
-                                self.coerce(v, ty, sig.params[i])
-                            })
-                            .collect();
-                        let r = self.fb.call(sig.full_name.clone(), call_args, sig.ret);
-                        return (r, sig.ret);
+                    if let Some(r) = self.lower_generic_call(base, mname, targs, args, src) {
+                        return r;
                     }
+                    // No generic-method monomorph resolved (an unsupported instance
+                    // receiver or an absent key): fall through so a same-named
+                    // *non-generic* member call still has a chance, and otherwise
+                    // the ordinary unresolved-call path yields a clean default —
+                    // never a dangling call to a symbol that was never emitted.
                 }
                 // Null-conditional call `a?.M(args)`: null-guard the whole call
                 // (the result is the method's default when `a` is null).
@@ -5950,6 +6162,158 @@ impl<'a> Lowerer<'a> {
             }
             None => (undef(IrType::I64), IrType::I64),
         }
+    }
+
+    /// Lower a generic-method call `base<targs>(args)`. Mirrors
+    /// `lower_method_call`'s three shapes, but resolves against the
+    /// `gen_method_sigs` composite key `(owner, name, type_codes)`:
+    /// - **bare `M<T>(x)`** (`base` is `Ident`): owner candidates `[cur_type,
+    ///   None]`; an instance method prepends the current `this`.
+    /// - **qualified static `Type.M<T>(x)`** (`base` is `Member` whose receiver
+    ///   names a type): owner candidates `[by_name[Type], None]`; receiver-less.
+    /// - **instance `recv.M<T>(args)`** (`base` is `Member` with a value
+    ///   receiver): owner = `instance_recv_owner(recv)` — the SAME rule the
+    ///   collector used (R4) — prepend `struct_base(recv)`'s body pointer.
+    ///
+    /// Returns `None` (no IR emitted) when no key resolves — an unsupported
+    /// instance receiver or an absent monomorph — so the caller diagnoses
+    /// cleanly instead of emitting a dangling call.
+    fn lower_generic_call(
+        &mut self,
+        base: &Expr,
+        mname: &str,
+        targs: &[AstType],
+        args: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let argtys: Vec<IrType> = targs
+            .iter()
+            .map(|a| lower_ty_env(a, src, self.structs, self.env))
+            .collect();
+        let codes = type_codes(&argtys);
+        // A non-capturing resolver (takes the table explicitly) so it never holds
+        // a `self` borrow across the later `&mut self` IR emission.
+        let lookup_sig = |t: &StructTable, owner: Option<StructId>| -> Option<MethodSig> {
+            t.gen_method_sigs
+                .get(&(owner, mname.to_string(), codes.clone()))
+                .cloned()
+        };
+
+        // Classify the callee base shape (mirrors `lower_method_call`).
+        let (sig, recv): (MethodSig, Option<(Value, StructId)>) = match base {
+            // Bare `M<T>(x)`: same-class (`cur_type`) then the retained `None`
+            // bucket (bare cross-class static, e.g. `list_hof.bf`'s `Map`).
+            Expr::Ident(_) => {
+                let sig = [self.cur_type, None]
+                    .into_iter()
+                    .find_map(|o| lookup_sig(self.structs, o))?;
+                // An instance same-class generic call (`Wrap<int32>(x)` inside
+                // another instance method) prepends the current `this`.
+                let recv = if sig.is_instance {
+                    let (slot, ty @ IrType::Ref(id)) = self.this_slot.clone()? else {
+                        return None;
+                    };
+                    Some((self.fb.load(slot, ty), id))
+                } else {
+                    None
+                };
+                (sig, recv)
+            }
+            Expr::Member { base: mbase, .. } => {
+                // Qualified static `Type.M<T>(x)`: the receiver names a registered
+                // type. `[by_name[Type], None]` — receiver-less.
+                let qual_static = qualified_gen_owner(mbase, src, self.structs).and_then(|tid| {
+                    [Some(tid), None]
+                        .into_iter()
+                        .find_map(|o| lookup_sig(self.structs, o))
+                        .filter(|s| !s.is_instance)
+                });
+                if let Some(sig) = qual_static {
+                    (sig, None)
+                } else {
+                    // Instance `recv.M<T>(args)`: resolve the receiver owner with
+                    // the SAME rule the collector used (R4), look up the key, then
+                    // get a real body pointer via `struct_base`.
+                    let owner = {
+                        let lookup = |n: &str| self.lookup(n).map(|(_, ty)| ty);
+                        instance_recv_owner(
+                            mbase,
+                            src,
+                            &lookup,
+                            self.cur_type,
+                            self.env,
+                            self.structs,
+                        )?
+                    };
+                    let sig = lookup_sig(self.structs, Some(owner))?;
+                    if !sig.is_instance {
+                        return None;
+                    }
+                    let (body_ptr, owner_id) = self.struct_base(mbase, src)?;
+                    // The collector and `struct_base` must agree on the owner, or
+                    // the prepended `this` would mismatch the symbol's ABI.
+                    debug_assert_eq!(
+                        owner_id, owner,
+                        "generic instance-call owner skew: struct_base={owner_id:?} \
+                         collector={owner:?} (R4)"
+                    );
+                    (sig, Some((body_ptr, owner_id)))
+                }
+            }
+            _ => return None,
+        };
+
+        // Value-arity guard (mirrors the old `sig.params.len() == args.len()`
+        // gate and `pick_overload`'s arity discrimination): the composite key
+        // `(owner, name, type_codes)` cannot distinguish two same-type-arg
+        // overloads of differing *value* arity (e.g. `Test<T>()` vs
+        // `Test<T>(T)`), so the recorded sig may be the wrong overload. Bail out
+        // (no IR) on a value-arity mismatch — a clean diagnosis, never a
+        // mis-arity call — so a colliding overload falls through gracefully.
+        let leading = if recv.is_some() { 1 } else { 0 };
+        let formal_len = sig.params.len() - leading;
+        let arity_ok = match sig.variadic {
+            Some(_) => args.len() + 1 >= formal_len, // fixed params + a (possibly empty) T[]
+            None => args.len() == formal_len,
+        };
+        if !arity_ok {
+            return None;
+        }
+
+        // Build the call args: a leading `this` for an instance method, then the
+        // explicit args coerced to the signature's formal params (variadic-aware).
+        let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+        if let Some((body_ptr, _)) = &recv {
+            call_args.push(body_ptr.clone());
+        }
+        let arg_vals: Vec<(Value, IrType)> =
+            args.iter().map(|a| self.arg_value(a, src)).collect();
+        if let Some(elem) = sig.variadic {
+            // `params T[]`: pack overflow args into a fresh `T[]` (formal params
+            // exclude the leading `this`).
+            let formal = &sig.params[leading..];
+            let packed = self.pack_variadic_args(formal, elem, arg_vals);
+            call_args.extend(packed);
+        } else {
+            for (i, (v, ty)) in arg_vals.into_iter().enumerate() {
+                let pt = sig.params.get(leading + i).copied().unwrap_or(ty);
+                call_args.push(self.coerce(v, ty, pt));
+            }
+        }
+        // Hard assert (doc §5.4 / §7): the assembled operand count must exactly
+        // match the (direct-call) signature's param count. A drift here would be
+        // an ABI bug the LLVM verifier wouldn't necessarily catch on a typed
+        // direct call, so fail loudly rather than emit a mis-arity call.
+        assert_eq!(
+            call_args.len(),
+            sig.params.len(),
+            "generic-method call arity mismatch for {}: {} args vs {} params",
+            sig.full_name,
+            call_args.len(),
+            sig.params.len()
+        );
+        let r = self.fb.call(sig.full_name.clone(), call_args, sig.ret);
+        Some((r, sig.ret))
     }
 
     fn lower_method_call(
