@@ -130,16 +130,59 @@ class List<T> {
 		this.mItems = nb;
 		this.mCap = nc;
 	}
+
+	// --- Higher-order functions, the idiomatic instance form (GM-B2) ---------
+	// These are generic methods on the generic owner `List<T>` (so they exercise
+	// generic-methods B1) taking a uniform function-value (`Func$`) parameter (so
+	// they exercise fn-values Slice A). The receiver is the implicit `this`: each
+	// method reads `this.mCount`/`this.mItems` directly — no explicit `self`. A
+	// capturing closure, a non-capturing lambda, or a method reference all work as
+	// the function argument. `xs.Map<R>(f)` mangles to an owner-mono-prefixed
+	// symbol like `@List$i32.Map$i32`. (The free static `Functional.Map/Filter/Fold`
+	// below are retained for the bare-cross-class call shape; this is the payoff form.)
+
+	// A new `List<R>` holding `f` applied to each element (in order). `R` is the
+	// method's own type-param, distinct from the owner's `T`, so `Map` can change
+	// the element type.
+	public List<R> Map<R>(function R(T) f) {
+		List<R> r = new List<R>();
+		for (int i = 0; i < this.mCount; i++) {
+			r.Add(f(this.mItems[i]));
+		}
+		return r;
+	}
+
+	// A new `List<T>` of the elements for which `pred` holds. Non-generic method
+	// on the generic owner — `T` comes from the owner.
+	public List<T> Filter(function bool(T) pred) {
+		List<T> r = new List<T>();
+		for (int i = 0; i < this.mCount; i++) {
+			T x = this.mItems[i];
+			if (pred(x)) { r.Add(x); }
+		}
+		return r;
+	}
+
+	// Left-fold: thread `seed` through `f(acc, elem)` over every element. `A` is
+	// the method's own type-param (the accumulator type).
+	public A Fold<A>(A seed, function A(A, T) f) {
+		A acc = seed;
+		for (int i = 0; i < this.mCount; i++) {
+			acc = f(acc, this.mItems[i]);
+		}
+		return acc;
+	}
 }
 
 // Higher-order functions over List<T> — the payoff of lambdas/closures. These
-// are free static generics, called bare (`Map<int,int>(xs, f)`): a generic
-// *method* on the generic *type* List<T> (i.e. `xs.Map<R>(f)`) isn't supported
-// yet (global-name mangling), so the receiver is an explicit `self` parameter.
-// The `function R(T) f` parameter is callable inside the body (the higher-order
-// payoff), so each method just walks the list applying `f`. Non-capturing
-// lambdas and method references work as the function argument today; capturing
-// closures await the uniform function-value representation.
+// are free static generics, called bare (`Map<int,int>(xs, f)`) with the
+// receiver as an explicit `self` parameter. The idiomatic instance form
+// (`xs.Map<R>(f)`) now lives on `List<T>` above (generic-methods B2); these
+// static carriers are retained for the bare-cross-class call shape that
+// `list_hof.bf`/`closure_arg.bf` exercise. The `function R(T) f` parameter is
+// callable inside the body (the higher-order payoff), so each method just walks
+// the list applying `f`. Non-capturing lambdas, capturing closures, and method
+// references all work as the function argument (uniform function values).
 class Functional {
 	// A new list holding `f` applied to each element of `self`.
 	public static List<R> Map<T, R>(List<T> self, function R(T) f) {
