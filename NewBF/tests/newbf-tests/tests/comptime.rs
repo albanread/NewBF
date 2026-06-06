@@ -112,3 +112,42 @@ fn comptime_call_folds_into_caller() {
     let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
     assert_eq!(main(), 5050);
 }
+
+#[test]
+fn comptime_call_with_const_arg_folds() {
+    // A `[Comptime]` function called with a *constant* argument folds via the
+    // synthesized wrapper: `Factorial(5)` evaluates to 120 at compile time, the
+    // call site becomes the literal, and the (recursive) comptime function is
+    // dropped — proven the same way: it's absent yet `Main` still runs.
+    let src = r#"
+        class Program {
+            [Comptime]
+            public static int Factorial(int n) {
+                if (n <= 1) { return 1; }
+                return n * Factorial(n - 1);
+            }
+            public static int32 Main() { return (int32)Factorial(5); }
+        }
+    "#;
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let program = analyze(&files);
+    let mut module = lower_program(&files, &program);
+    assert!(module.funcs.iter().any(|f| f.name == "Program.Factorial"));
+
+    fold_comptime(&mut module).expect("comptime fold succeeds");
+
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "Program.Factorial"),
+        "comptime function should be removed after folding"
+    );
+    let jit = OrcJit::from_ir(&module).expect("jit builds");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 120);
+}
