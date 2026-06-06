@@ -2518,6 +2518,7 @@ fn lower_method(
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
             lw.bind(nm.text(src), slot, ty, elem);
+            lw.note_enum_local(nm.text(src), &p.ty, src);
             // A `T[]` parameter is an array: mark it so `a.Count`/`foreach`/`delete`
             // work on it just like an array local (the value is the elements
             // pointer; the length header rides 8 bytes behind it).
@@ -2683,6 +2684,11 @@ struct Lowerer<'a> {
     /// In-scope local (nested) functions: name → (emitted symbol, return type,
     /// parameter types). A bare call to one lowers to a direct call to its symbol.
     local_fns: HashMap<String, (String, IrType, Vec<IrType>)>,
+    /// Locals/params whose declared type is an int-backed `enum`: name → enum
+    /// name. Int-backed enums lower to `int32`, losing their identity, so this
+    /// recovers it — letting a bare `.Case` pattern in `switch (x)` resolve
+    /// against `x`'s enum (the scrutinee determines the enum, as Beef requires).
+    enum_locals: HashMap<String, String>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -2708,6 +2714,7 @@ impl<'a> Lowerer<'a> {
             array_locals: std::collections::HashSet::new(),
             defers: vec![Vec::new()],
             local_fns: HashMap::new(),
+            enum_locals: HashMap::new(),
         }
     }
 
@@ -2716,6 +2723,19 @@ impl<'a> Lowerer<'a> {
             .last_mut()
             .unwrap()
             .insert(name.to_string(), (slot, ty, elem));
+    }
+
+    /// If `ty` names an int-backed `enum`, remember that `name` has that enum
+    /// type — so a bare `.Case` pattern in `switch (name)` can resolve against it.
+    fn note_enum_local(&mut self, name: &str, ty: &AstType, src: &str) {
+        if let AstType::Path { segments, .. } = ty
+            && let Some(seg) = segments.last()
+        {
+            let en = seg.name.text(src);
+            if self.structs.enums.contains_key(en) {
+                self.enum_locals.insert(name.to_string(), en.to_string());
+            }
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<(Value, IrType)> {
@@ -2822,6 +2842,9 @@ impl<'a> Lowerer<'a> {
                     .as_ref()
                     .and_then(|t| pointer_elem_env(t, src, self.structs, self.env));
                 self.bind(name.text(src), slot, slot_ty, elem);
+                if let Some(t) = ty {
+                    self.note_enum_local(name.text(src), t, src);
+                }
                 // A heap-array local (`T[] a`): remember it's an array so `a.Count`
                 // reads the length header and `delete a` frees the real block base.
                 if matches!(ty, Some(AstType::Array { .. })) {
@@ -3216,6 +3239,14 @@ impl<'a> Lowerer<'a> {
                     .unwrap_or(exit);
                 let cont = self.loops.last().map(|&(c, _)| c).unwrap_or(exit);
 
+                // An int-backed enum scrutinee (e.g. a `Color` local) lowers to
+                // `int32`, so a bare `.Case` pattern needs the enum name to
+                // resolve. Recover it from the scrutinee when it's a tracked
+                // local/param; the scrutinee determines the enum, per Beef.
+                let scrut_enum: Option<String> = match scrutinee {
+                    Expr::Ident(s) => self.enum_locals.get(s.text(src)).cloned(),
+                    _ => None,
+                };
                 let case_idxs: Vec<usize> = (0..arms.len())
                     .filter(|&i| arms[i].pattern.is_some())
                     .collect();
@@ -3231,7 +3262,7 @@ impl<'a> Lowerer<'a> {
                     let pat = arms[arm_i].pattern.as_ref().unwrap();
                     let mut eq: Option<Value> = None;
                     for p in std::iter::once(pat).chain(arms[arm_i].extra.iter()) {
-                        let (pv, pt) = self.expr(p, src);
+                        let (pv, pt) = self.lower_case_value(p, scrut_enum.as_deref(), src);
                         let ct = common_type(st, pt);
                         let l = self.coerce(sv.clone(), st, ct);
                         let r = self.coerce(pv, pt, ct);
@@ -4096,6 +4127,30 @@ impl<'a> Lowerer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Lower a switch case-label value. A bare `.Case` (`DotIdent`) is resolved
+    /// against the scrutinee's int-backed enum `scrut_enum` (which the plain
+    /// expression path can't, since the enum name is only known from the
+    /// scrutinee); everything else lowers as an ordinary expression.
+    fn lower_case_value(
+        &mut self,
+        pat: &Expr,
+        scrut_enum: Option<&str>,
+        src: &str,
+    ) -> (Value, IrType) {
+        if let Expr::DotIdent { name, .. } = pat
+            && let Some(en) = scrut_enum
+            && let Some(cases) = self.structs.enums.get(en)
+            && let Some(&v) = cases.get(name.text(src))
+        {
+            let i32t = IrType::Int {
+                bits: 32,
+                signed: true,
+            };
+            return (Value::int(v as i128, i32t), i32t);
+        }
+        self.expr(pat, src)
     }
 
     /// `Enum.Case` where `Enum` is a registered enum and `Case` is one of its
