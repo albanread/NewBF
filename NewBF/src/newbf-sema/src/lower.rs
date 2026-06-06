@@ -129,6 +129,12 @@ struct StructTable {
     /// function symbol. A pre-pass assigns each `$localfn{N}`; the body lowers it
     /// and a same-method call resolves the name to a direct call.
     local_fn_syms: HashMap<Span, String>,
+    /// Per-type field default initializers (`int32 v = 9;`) that are *constant*
+    /// literals, keyed by struct id → list of (field name, constant). Applied at
+    /// construction (before the constructor body) by name, so they survive
+    /// inheritance's field reindexing. Non-constant inits (calls/`new`) aren't
+    /// captured yet.
+    field_inits: HashMap<StructId, Vec<(String, Const)>>,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -1318,6 +1324,7 @@ fn fill_fields_at(
             ty,
             name,
             modifiers,
+            init,
             ..
         } = m
         {
@@ -1364,6 +1371,16 @@ fn fill_fields_at(
                 name: name.text(src).to_string(),
                 ty: fty,
             });
+            // A constant field default (`int32 v = 9;`) is recorded by name so it
+            // can be applied at construction (after inheritance reindexes fields).
+            if let Some(e) = init
+                && let Some(c) = const_field_init(e, fty, src)
+            {
+                t.field_inits
+                    .entry(id)
+                    .or_default()
+                    .push((name.text(src).to_string(), c));
+            }
         }
     }
     // An instance auto-property (at least one body-less accessor) gets a
@@ -5038,6 +5055,9 @@ impl<'a> Lowerer<'a> {
                     .global_addr(vtable_name(&self.structs.prefixes[id.0 as usize]))
             };
             self.fb.store(hdr, header);
+            // Apply constant field defaults (`int32 v = 9;`) for this class and its
+            // bases before any constructor runs, so a ctor body can override them.
+            self.emit_field_inits(p.clone(), id);
             // Implicitly chain the parameterless base constructors, root-first, so
             // inherited fields are initialized before this class's own ctor runs.
             // (Explicit `: base(args)` chaining isn't parsed yet, so every ctor is
@@ -5285,12 +5305,41 @@ impl<'a> Lowerer<'a> {
         Some(self.construct_value_struct(id, args, src))
     }
 
-    /// Stack-construct a value struct: alloca a slot, run the arity-matched
-    /// constructor through it (`this` is a pointer to the body), and load the
-    /// initialized value. With no matching ctor the slot is left as-is.
+    /// Apply constant field default initializers (`int32 v = 9;`) to the object
+    /// at `obj` (a pointer to the body), for `id` and every base in its chain.
+    /// Keyed by field name so it survives inheritance's field reindexing. Run at
+    /// construction, before the constructor body, so a ctor can still override.
+    fn emit_field_inits(&mut self, obj: Value, id: StructId) {
+        // Collect (field name, const) for id and its bases (most-derived first;
+        // names are unique across a hierarchy, so order doesn't matter).
+        let mut inits: Vec<(String, Const)> = Vec::new();
+        let mut cur = Some(id);
+        while let Some(cid) = cur {
+            if let Some(list) = self.structs.field_inits.get(&cid) {
+                inits.extend(list.iter().cloned());
+            }
+            cur = self.structs.bases[cid.0 as usize];
+        }
+        for (name, c) in inits {
+            if let Some(idx) = self.structs.defs[id.0 as usize]
+                .fields
+                .iter()
+                .position(|f| f.name == name)
+            {
+                let fp = self.fb.field_addr(obj.clone(), id, idx as u32);
+                self.fb.store(fp, Value::Const(c));
+            }
+        }
+    }
+
+    /// Stack-construct a value struct: alloca a slot, apply constant field
+    /// defaults, run the arity-matched constructor through it (`this` is a pointer
+    /// to the body), and load the initialized value. With no matching ctor the
+    /// slot keeps its field defaults (or is left as-is when there are none).
     fn construct_value_struct(&mut self, id: StructId, args: &[Expr], src: &str) -> (Value, IrType) {
         let ty = IrType::Struct(id);
         let slot = self.fb.alloca(ty);
+        self.emit_field_inits(slot.clone(), id);
         if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
             let mut call_args = vec![slot.clone()];
             for (i, a) in args.iter().enumerate() {
@@ -5334,7 +5383,13 @@ impl<'a> Lowerer<'a> {
         // spilled to a slot so its fields are addressable).
         let (obj, id, is_value) = if matches!(base, Expr::DotIdent { .. }) {
             match target {
-                Some(IrType::Struct(id)) => (self.fb.alloca(IrType::Struct(id)), id, true),
+                Some(IrType::Struct(id)) => {
+                    let slot = self.fb.alloca(IrType::Struct(id));
+                    // Field defaults first; explicit `field = value` entries below
+                    // (in assign_init_fields) override them.
+                    self.emit_field_inits(slot.clone(), id);
+                    (slot, id, true)
+                }
                 Some(IrType::Ref(id)) => {
                     let (v, _) = self.expr(base, src);
                     let _ = v;
@@ -6317,6 +6372,32 @@ fn primitive(name: &str) -> IrType {
         "double" => IrType::F64,
         // A named non-primitive type is a reference (class) — a pointer.
         _ => IrType::Ptr,
+    }
+}
+
+/// Evaluate a *constant* field default initializer (`int32 v = 9;`) to an IR
+/// constant typed for the field `fty`. Handles the common literal forms (incl. a
+/// negated numeric literal and parentheses); returns `None` for anything that
+/// isn't a compile-time literal (a call / `new` / enum-const default — applied
+/// at construction later, a follow-on).
+fn const_field_init(init: &Expr, fty: IrType, src: &str) -> Option<Const> {
+    match init {
+        Expr::Int(s) => Some(Const::Int(parse_int(s.text(src)), fty)),
+        Expr::Float(s) => Some(Const::Float(parse_float(s.text(src)), fty)),
+        Expr::Bool(s) => Some(Const::Bool(s.text(src) == "true")),
+        Expr::Char(s) => Some(Const::Int(decode_char_literal(s.text(src)), fty)),
+        Expr::Null(_) => Some(Const::Null),
+        Expr::Paren { inner, .. } => const_field_init(inner, fty, src),
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand,
+            ..
+        } => match &**operand {
+            Expr::Int(s) => Some(Const::Int(-parse_int(s.text(src)), fty)),
+            Expr::Float(s) => Some(Const::Float(-parse_float(s.text(src)), fty)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
