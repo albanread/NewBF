@@ -3515,18 +3515,19 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
         return;
     }
     let new_prefix = format!("{prefix}{}.", td.name.text(src));
-    // An interface is now a registered type (IT-T1), but its members are NOT
-    // lowered here as instance methods of the interface id: T1 keeps interface
-    // emission byte-identical to the pre-registration behavior (owner_id was
-    // `None`), so a default-bodied interface method emits exactly as before
-    // (no `this`, empty `sigs`). IT-T6 takes over default-body emission with
-    // `this: Ref(iface_id)`. Resolving the interface id here would silently
-    // flip `this_ty`/`sigs` and change the IR — out of scope for T1.
-    let owner_id = structs
-        .by_name
-        .get(td.name.text(src))
-        .copied()
-        .filter(|&id| !matches!(structs.kinds[id.0 as usize], StructKind::Interface));
+    // An interface is a registered type (IT-T1). IT-T6 now resolves its id as
+    // the owner so a DEFAULT-bodied interface method (`int32 D() { … }`) lowers
+    // through `lower_method` with `this : Ref(iface_id)`, emitted under the
+    // symbol `{IFace.prefix}{Method}` (e.g. `I.D`) — exactly the symbol IT-T3
+    // wrote into the itable slot via `idefaults`, so the slot resolves to a real
+    // function. An ABSTRACT (body-less) interface method has `MethodBody::None`,
+    // so `lower_method` returns `None` and emits nothing — only defaults emit.
+    // (Interfaces have no ctors/dtors/fields, and `methods[iface]` is empty —
+    // defaults are deliberately kept out of it — so `lower_type_at`'s symbol
+    // lookup falls back to the `{prefix}{name}` form, reconciling with the slot
+    // symbol. A bare sibling call inside a default body routes to interface
+    // dispatch on `this`, handled in the bare-call path.)
+    let owner_id = structs.by_name.get(td.name.text(src)).copied();
     lower_type_at(td, owner_id, &new_prefix, &[], src, structs, m);
 }
 
@@ -5181,6 +5182,27 @@ impl<'a> Lowerer<'a> {
                             ptys.len()
                         );
                         return (self.fb.call_indirect(code, call_args, ret), ret);
+                    }
+                    // Sibling interface dispatch inside a DEFAULT interface-method
+                    // body (IT-T6, itables.md §5 T6 / §7). When the enclosing
+                    // `this` is an interface value (`Ref(iface_id)`, since IT-T6
+                    // lowers a default body with `this : Ref(iface_id)`), a bare
+                    // call `A(args)` to another interface method (`A` in
+                    // `imethods[iface]`) must dispatch through `this`'s interface
+                    // vtable — NOT a direct call, since an abstract sibling has no
+                    // direct symbol. Route it to the same interface-dispatch path
+                    // as `this.A(args)` would take. (`this` loads as the body
+                    // pointer; `emit_iface_dispatch` returns `None` if `name`
+                    // isn't an interface slot, so a non-interface bare call inside
+                    // such a body falls through unchanged.)
+                    if let Some((slot, ty @ IrType::Ref(id))) = self.this_slot.clone()
+                        && matches!(self.structs.kinds[id.0 as usize], StructKind::Interface)
+                    {
+                        let this_v = self.fb.load(slot, ty);
+                        if let Some(r) = self.emit_iface_dispatch(this_v, id, name, arg_vals.clone())
+                        {
+                            return r;
+                        }
                     }
                     // Resolve among the same-type overloads by argument type
                     // (`this`-less candidates — statics and free fns; an instance
@@ -7303,6 +7325,63 @@ impl<'a> Lowerer<'a> {
         Some((r, sig.ret))
     }
 
+    /// Emit an interface dispatch on an already-evaluated body pointer
+    /// (itables.md §5/§5.6 / §5 T6). `body_ptr` is the object pointer whose
+    /// *static* type is the interface `iface_id`; `mname` names a method in
+    /// `imethods[iface_id]`. The slot is globally fixed for `(interface, method)`
+    /// (`iface_slot_base[iface] + midx`), so the concrete class is never needed:
+    /// load the vtable from the object header, index the slot, `call_indirect`.
+    /// The whole sequence is emitted inline in the current block (like a virtual
+    /// call), so every value dominates its use trivially (no new block/phi).
+    ///
+    /// Shared by `lower_method_call`'s interface-receiver branch (`obj.M()` where
+    /// `obj : Ref(iface)`) and the bare-call path: a sibling unqualified call
+    /// inside a DEFAULT interface-method body (`A()` inside `I.D`'s body, where
+    /// `this : Ref(iface)`) — the bare `A()` becomes an interface dispatch on
+    /// `this`, NOT a direct call (an abstract sibling has no direct symbol).
+    /// Returns `None` if `mname` isn't an interface slot of `iface_id`.
+    fn emit_iface_dispatch(
+        &mut self,
+        body_ptr: Value,
+        iface_id: StructId,
+        mname: &str,
+        arg_vals: Vec<(Value, IrType)>,
+    ) -> Option<(Value, IrType)> {
+        debug_assert!(
+            matches!(self.structs.kinds[iface_id.0 as usize], StructKind::Interface),
+            "emit_iface_dispatch on non-interface id {}",
+            iface_id.0
+        );
+        let midx = self.structs.imethods[iface_id.0 as usize]
+            .iter()
+            .position(|(n, _)| n == mname)?;
+        let sig = self.structs.imethods[iface_id.0 as usize][midx].1.clone();
+        let base_slot = self.structs.iface_slot_base[&iface_id];
+        let slot = base_slot + midx;
+        // Header is at offset 0. An interface has an EMPTY StructDef (no
+        // `$header` field), so use a RAW pointer-indexed GEP (`elem_addr`
+        // body_ptr[0] : Ptr), NOT `field_addr` through the interface id.
+        let hdr = self
+            .fb
+            .elem_addr(body_ptr.clone(), IrType::Ptr, Value::int(0, IrType::I64));
+        let vtbl = self.fb.load(hdr, IrType::Ptr);
+        let slotp = self
+            .fb
+            .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
+        let fnptr = self.fb.load(slotp, IrType::Ptr);
+        // `this`-leading; coerce each arg to the slot sig's param type
+        // (params[0] is `this : Ref(iface_id)`; formals start at index 1).
+        let mut call_args = vec![body_ptr];
+        let mut pidx = 1;
+        for (v, t) in arg_vals {
+            let pt = sig.params.get(pidx).copied().unwrap_or(t);
+            call_args.push(self.coerce(v, t, pt));
+            pidx += 1;
+        }
+        let r = self.fb.call_indirect(fnptr, call_args, sig.ret);
+        Some((r, sig.ret))
+    }
+
     fn lower_method_call(
         &mut self,
         base: &Expr,
@@ -7385,35 +7464,9 @@ impl<'a> Lowerer<'a> {
         // value dominates its use trivially (no new block, no phi — R8-safe).
         if let Some((body_ptr, owner_id)) = self.struct_base(base, src)
             && matches!(self.structs.kinds[owner_id.0 as usize], StructKind::Interface)
-            && let Some(midx) = self.structs.imethods[owner_id.0 as usize]
-                .iter()
-                .position(|(n, _)| n == mname)
+            && let Some(r) = self.emit_iface_dispatch(body_ptr, owner_id, mname, arg_vals.clone())
         {
-            let sig = self.structs.imethods[owner_id.0 as usize][midx].1.clone();
-            let base_slot = self.structs.iface_slot_base[&owner_id];
-            let slot = base_slot + midx;
-            // Header is at offset 0. An interface has an EMPTY StructDef (no
-            // `$header` field), so use a RAW pointer-indexed GEP (`elem_addr`
-            // body_ptr[0] : Ptr), NOT `field_addr` through the interface id.
-            let hdr = self
-                .fb
-                .elem_addr(body_ptr.clone(), IrType::Ptr, Value::int(0, IrType::I64));
-            let vtbl = self.fb.load(hdr, IrType::Ptr);
-            let slotp =
-                self.fb
-                    .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
-            let fnptr = self.fb.load(slotp, IrType::Ptr);
-            // `this`-leading; coerce each arg to the slot sig's param type
-            // (params[0] is `this : Ref(iface_id)`; formals start at index 1).
-            let mut call_args = vec![body_ptr];
-            let mut pidx = 1;
-            for (v, t) in arg_vals {
-                let pt = sig.params.get(pidx).copied().unwrap_or(t);
-                call_args.push(self.coerce(v, t, pt));
-                pidx += 1;
-            }
-            let r = self.fb.call_indirect(fnptr, call_args, sig.ret);
-            return (r, sig.ret);
+            return r;
         }
         // Instance call `obj.Method(args)` / `this.Method(args)`. `members: true`
         // admits instance overloads (matched past `this`) and statics.
