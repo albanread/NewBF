@@ -1900,10 +1900,12 @@ impl<'a> Parser<'a> {
         }
 
         // C-style: `(init; cond; update)`
+        let mut init_extra = Vec::new();
         let init = if self.at(TokenKind::Semicolon) {
             None
         } else {
-            Some(Box::new(self.for_init()))
+            let first = self.for_init(&mut init_extra);
+            Some(Box::new(first))
         };
         self.expect(TokenKind::Semicolon, "`;` after for-init");
         let cond = if self.at(TokenKind::Semicolon) {
@@ -1912,21 +1914,22 @@ impl<'a> Parser<'a> {
             Some(self.expr())
         };
         self.expect(TokenKind::Semicolon, "`;` after for-condition");
+        let mut update_extra = Vec::new();
         let update = if self.at(TokenKind::RParen) {
             None
         } else {
             // Comma-separated update expressions: `for (…;…; i++, j--)`.
-            // Keep the first; consume the rest.
             let first = self.expr();
             while self.eat(TokenKind::Comma) {
                 if self.at(TokenKind::RParen) {
                     break;
                 }
                 let before = self.pos;
-                let _ = self.expr();
+                let e = self.expr();
                 if self.pos == before {
                     break;
                 }
+                update_extra.push(e);
             }
             Some(first)
         };
@@ -1935,19 +1938,26 @@ impl<'a> Parser<'a> {
         Stmt::For {
             span: self.finish(lo),
             init,
+            init_extra,
             cond,
             update,
+            update_extra,
             body,
         }
     }
 
     /// A for-init: a `var`/`let` local without trailing `;`, a typed
-    /// local (`int32 i = 0`) without trailing `;`, or an expression.
-    fn for_init(&mut self) -> Stmt {
+    /// local (`int32 i = 0`) without trailing `;`, or an expression. Extra
+    /// comma-separated declarators of a typed init (`int i = 0, j = 10`) are
+    /// pushed onto `extra`, each re-using the leading type.
+    fn for_init(&mut self, extra: &mut Vec<Stmt>) -> Stmt {
         if self.at_kw(Keyword::Var) || self.at_kw(Keyword::Let) {
-            return self.local(false);
+            let first = self.local(false);
+            self.for_init_extra_decls(&first, extra);
+            return first;
         }
         if let Some(s) = self.try_typed_local_init(false) {
+            self.for_init_extra_decls(&s, extra);
             return s;
         }
         let lo = self.start();
@@ -1955,6 +1965,35 @@ impl<'a> Parser<'a> {
         Stmt::Expr {
             span: self.finish(lo),
             expr: e,
+        }
+    }
+
+    /// Parse trailing `, name = expr` declarators after a typed/`var` for-init,
+    /// each cloning the first declarator's type (so `for (int i=0, j=10; …)`
+    /// declares both `i` and `j` as `int`). Stops at `;`.
+    fn for_init_extra_decls(&mut self, first: &Stmt, extra: &mut Vec<Stmt>) {
+        let ty = match first {
+            Stmt::Local { ty, .. } => ty.clone(),
+            _ => return,
+        };
+        while self.eat(TokenKind::Comma) {
+            if !self.at(TokenKind::Ident) {
+                break;
+            }
+            let lo = self.start();
+            let name = self.bump().span;
+            let init = if self.eat(TokenKind::Assign) {
+                Some(self.expr())
+            } else {
+                None
+            };
+            extra.push(Stmt::Local {
+                span: self.finish(lo),
+                is_let: false,
+                ty: ty.clone(),
+                name,
+                init,
+            });
         }
     }
 

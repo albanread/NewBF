@@ -440,8 +440,14 @@ pub enum Stmt {
     For {
         span: Span,
         init: Option<Box<Stmt>>,
+        /// Extra comma-separated init declarators (`for (int i=0, j=10; …)` →
+        /// `init = i`, `init_extra = [j]`). Lowered in the loop's own scope.
+        init_extra: Vec<Stmt>,
         cond: Option<Expr>,
         update: Option<Expr>,
+        /// Extra comma-separated update expressions (`for (…;…; i++, j--)` →
+        /// `update = i++`, `update_extra = [j--]`).
+        update_extra: Vec<Expr>,
         body: Box<Stmt>,
     },
     /// `for (var name in iter) body` (for-each)

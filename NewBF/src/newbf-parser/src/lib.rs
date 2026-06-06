@@ -275,14 +275,24 @@ mod tests {
             }
             Stmt::For {
                 init,
+                init_extra,
                 cond,
                 update,
+                update_extra,
                 body,
                 ..
             } => {
-                let i = init.as_ref().map_or("_".into(), |s| sxs(src, s));
+                let mut i = init.as_ref().map_or("_".into(), |s| sxs(src, s));
+                for e in init_extra {
+                    i.push('+');
+                    i.push_str(&sxs(src, e));
+                }
                 let c = cond.as_ref().map_or("_".into(), |e| sx(src, e));
-                let u = update.as_ref().map_or("_".into(), |e| sx(src, e));
+                let mut u = update.as_ref().map_or("_".into(), |e| sx(src, e));
+                for e in update_extra {
+                    u.push('+');
+                    u.push_str(&sx(src, e));
+                }
                 format!("(for {} {} {} {})", i, c, u, sxs(src, body))
             }
             Stmt::ForEach {
@@ -1235,6 +1245,16 @@ namespace Demo {
         assert_eq!(ok(r#"$"{a.b(c)}""#), "(interp (call (. a b) c))");
         // No holes → a single literal run.
         assert_eq!(ok(r#"$"plain""#), r#"(interp "plain")"#);
+    }
+
+    #[test]
+    fn for_multi_init_and_update() {
+        // Multiple comma-separated init declarators (sharing the leading type)
+        // and multiple update expressions, all kept.
+        assert_eq!(
+            ok_stmt("for (int i = 0, j = 10; i < j; i++, j--) { }"),
+            "(for (var i 0)+(var j 10) (< i j) (post++ i)+(post-- j) (block))"
+        );
     }
 
     #[test]

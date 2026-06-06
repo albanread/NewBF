@@ -400,9 +400,17 @@ fn register_tuples_in_stmt(stmt: &Stmt, src: &str, t: &mut StructTable) {
             register_tuples_in_stmt(body, src, t)
         }
         Stmt::ForEach { body, .. } => register_tuples_in_stmt(body, src, t),
-        Stmt::For { init, body, .. } => {
+        Stmt::For {
+            init,
+            init_extra,
+            body,
+            ..
+        } => {
             if let Some(i) = init {
                 register_tuples_in_stmt(i, src, t);
+            }
+            for s in init_extra {
+                register_tuples_in_stmt(s, src, t);
             }
             register_tuples_in_stmt(body, src, t);
         }
@@ -792,18 +800,26 @@ fn collect_insts_stmt<'a>(
         }
         Stmt::For {
             init,
+            init_extra,
             cond,
             update,
+            update_extra,
             body,
             ..
         } => {
             if let Some(i) = init {
                 collect_insts_stmt(i, src, generics, gmethods, t, seen, monos, env);
             }
+            for s in init_extra {
+                collect_insts_stmt(s, src, generics, gmethods, t, seen, monos, env);
+            }
             if let Some(c) = cond {
                 collect_insts_expr(c, src, generics, gmethods, t, seen, monos, env);
             }
             if let Some(u) = update {
+                collect_insts_expr(u, src, generics, gmethods, t, seen, monos, env);
+            }
+            for u in update_extra {
                 collect_insts_expr(u, src, generics, gmethods, t, seen, monos, env);
             }
             collect_insts_stmt(body, src, generics, gmethods, t, seen, monos, env);
@@ -3030,8 +3046,10 @@ impl<'a> Lowerer<'a> {
             }
             Stmt::For {
                 init,
+                init_extra,
                 cond,
                 update,
+                update_extra,
                 body,
                 ..
             } => {
@@ -3040,6 +3058,9 @@ impl<'a> Lowerer<'a> {
                 self.scopes.push(HashMap::new());
                 if let Some(init) = init {
                     self.stmt(init, src);
+                }
+                for s in init_extra {
+                    self.stmt(s, src);
                 }
                 let head = self.fb.create_block("for.head");
                 let body_b = self.fb.create_block("for.body");
@@ -3065,9 +3086,12 @@ impl<'a> Lowerer<'a> {
                 if !self.terminated {
                     self.fb.br(cont);
                 }
-                // cont: run the update, then back to the head.
+                // cont: run the update(s), then back to the head.
                 self.switch(cont);
                 if let Some(u) = update {
+                    self.expr(u, src);
+                }
+                for u in update_extra {
                     self.expr(u, src);
                 }
                 self.fb.br(head);
@@ -3492,18 +3516,26 @@ impl<'a> Lowerer<'a> {
             }
             Stmt::For {
                 init,
+                init_extra,
                 cond,
                 update,
+                update_extra,
                 body,
                 ..
             } => {
                 if let Some(i) = init {
                     self.caps_stmt(i, src, bound, seen, caps);
                 }
+                for s in init_extra {
+                    self.caps_stmt(s, src, bound, seen, caps);
+                }
                 if let Some(c) = cond {
                     self.caps_expr(c, src, bound, seen, caps);
                 }
                 if let Some(u) = update {
+                    self.caps_expr(u, src, bound, seen, caps);
+                }
+                for u in update_extra {
                     self.caps_expr(u, src, bound, seen, caps);
                 }
                 self.caps_stmt(body, src, bound, seen, caps);
