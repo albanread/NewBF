@@ -140,6 +140,14 @@ struct StructTable {
     /// function symbol. A pre-pass assigns each `$localfn{N}`; the body lowers it
     /// and a same-method call resolves the name to a direct call.
     local_fn_syms: HashMap<Span, String>,
+    /// FV-T4: static method-ref thunks to emit. A `Type.M` value reference is
+    /// wrapped by a `$mref$<full>($self /*ignored*/, P…){ return <full>(P…); }`
+    /// thunk so it fits the uniform `code(target, args…)` convention (the real
+    /// `<full>` has no `$self` param). Keyed by full method symbol (the thunk's
+    /// callee) to de-dup; the value is `(thunk symbol, full method symbol, ret,
+    /// param types)`. Filled via interior mutability at the reference site (where
+    /// only `&StructTable` is held) and drained in the emit pass.
+    method_ref_thunks: RefCell<HashMap<String, MethodRefThunk>>,
     /// Per-type field default initializers (`int32 v = 9;`) that are *constant*
     /// literals, keyed by struct id → list of (field name, constant). Applied at
     /// construction (before the constructor body) by name, so they survive
@@ -150,6 +158,20 @@ struct StructTable {
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
 type MonoRecord = (StructId, String, Vec<(String, IrType)>);
+
+/// FV-T4: a static method-ref thunk to emit. `$mref$<full>($self, P…) -> ret`
+/// drops its `$self` and tail-calls `<full>(P…)`, so a bare static method
+/// reference fits the uniform `code(target, args…)` calling convention.
+#[derive(Clone)]
+struct MethodRefThunk {
+    /// The thunk's own symbol (`$mref$<full>`) — the value returned by the ref.
+    thunk_sym: String,
+    /// The wrapped method's real symbol (the thunk's callee).
+    callee: String,
+    /// The wrapped method's return type and explicit parameter types.
+    ret: IrType,
+    params: Vec<IrType>,
+}
 
 /// Composite resolution key for a generic-method monomorph:
 /// `(owner, method name, type_codes(args))`. Keying by the triple (rather than
@@ -872,13 +894,18 @@ fn record_method_inst(
     if let (true, Some(oid)) = (is_instance, owner) {
         psig.push(IrType::Ref(oid));
     }
-    psig.extend(params.iter().map(|p| lower_ty_env(&p.ty, mdecl_src, t, &env)));
+    // FV-T3: a `function R(P)` param of a *generic* method (e.g. `Map<T,R>`'s
+    // `function R(T) f`) is a closure-carrying position, so it lowers to `$Func`
+    // via `param_ir_ty`/`lower_value_ty` (delegate-gated). This is the call-site
+    // coercion target that auto-wraps a non-capturing/method-ref `Ptr` arg and
+    // no-op-coerces a capturing-lambda `Func$` arg — the §49 fix path.
+    psig.extend(params.iter().map(|p| param_ir_ty(p, mdecl_src, t, &env)));
     // A trailing `params T[]` makes the call site pack overflow args into a `T[]`.
     let variadic = params
         .last()
         .filter(|p| matches!(p.modifier, Some((ParamModifier::Params, _))))
         .and_then(|p| pointer_elem_env(&p.ty, mdecl_src, t, &env));
-    let ret = lower_ty_env(return_ty, mdecl_src, t, &env);
+    let ret = lower_value_ty(return_ty, mdecl_src, t, &env);
     t.gen_method_sigs.insert(
         key,
         MethodSig {
@@ -2077,7 +2104,10 @@ fn fill_members_at(
                     .and_then(|p| pointer_elem_env(&p.ty, src, t, env));
                 let sig = MethodSig {
                     full_name,
-                    ret: lower_ty_env(return_ty, src, t, env),
+                    // FV-T3: a `function R(P)` return type lowers to `$Func`
+                    // (closure-carrying position), so a call-site that consumes
+                    // the result sees the value-struct, not a bare `Ptr`.
+                    ret: lower_value_ty(return_ty, src, t, env),
                     params: ps,
                     is_instance,
                     variadic,
@@ -2466,28 +2496,12 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             .get(name)
             .cloned()
             .unwrap_or_default();
-        let func = if caps.is_empty() {
-            // Non-capturing → a plain free function; params bind as `extra`.
-            let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
-            let extra: Vec<(&str, IrType)> = params.iter().map(|(n, t)| (n.as_str(), *t)).collect();
-            lower_method(
-                name.clone(),
-                *ret,
-                &[],
-                &mb,
-                lsrc,
-                &empty,
-                &structs,
-                None,
-                &[],
-                &extra,
-                None,
-            )
-        } else {
-            // Capturing → a closure function taking the env as `$self`.
-            emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs)
-        };
-        if let Some(func) = func {
+        // FV-T2: route *every* lambda through `emit_closure` so each `$lambdaN`
+        // is uniformly `$self`-leading (param 0 = `$self: Ptr`). A non-capturing
+        // body gets an empty `caps` list and simply ignores `$self` (the uniform
+        // call passes a `null` target). This is the one callee ABI behind the
+        // single uniform calling convention (`code(target, args…)`).
+        if let Some(func) = emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs) {
             m.add_function(func);
         }
     }
@@ -2555,7 +2569,10 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             ..
         } = member
         {
-            let ret = lower_ty_env(return_ty, mdecl_src, &structs, &mono.env);
+            // FV-T3: keep the emitted return type in lockstep with the recorded
+            // generic-method sig (`record_method_inst` uses `lower_value_ty`), so
+            // a `function`-returning generic method's ret is `$Func` on both sides.
+            let ret = lower_value_ty(return_ty, mdecl_src, &structs, &mono.env);
             // Instance monomorph iff non-static AND owned by a concrete type —
             // identical to `record_method_inst`'s `is_instance` rule so the ABI
             // (leading `this`) agrees between sig, call site, and definition.
@@ -2589,7 +2606,47 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             }
         }
     }
+    // FV-T4: emit each collected static method-ref thunk once. This runs LAST so
+    // every reference site (regular method bodies, lambda/local-fn bodies, and
+    // generic monomorph bodies above) has already populated the de-dup set.
+    let thunks: Vec<MethodRefThunk> = structs
+        .method_ref_thunks
+        .borrow()
+        .values()
+        .cloned()
+        .collect();
+    for thunk in &thunks {
+        m.add_function(emit_method_ref_thunk(thunk));
+    }
     m
+}
+
+/// FV-T4: emit a static method-ref thunk `$mref$<full>($self, P…) -> ret` that
+/// ignores `$self` and tail-calls `<full>(P…)`. This absorbs the uniform
+/// convention's hidden `$self` (param 0) so a static method (which has no `$self`)
+/// is callable through the same `code(target, args…)` shape as a lambda/closure.
+fn emit_method_ref_thunk(thunk: &MethodRefThunk) -> Function {
+    let mut ir_params: Vec<IrParam> = vec![IrParam {
+        name: Some("$self".to_string()),
+        ty: IrType::Ptr,
+    }];
+    ir_params.extend(thunk.params.iter().enumerate().map(|(i, t)| IrParam {
+        name: Some(format!("p{i}")),
+        ty: *t,
+    }));
+    let mut fb = FunctionBuilder::new(thunk.thunk_sym.clone(), ir_params, thunk.ret);
+    // Forward the explicit params (which start at `Param(1)`, after `$self`) to
+    // the real method in order.
+    let args: Vec<Value> = (0..thunk.params.len())
+        .map(|i| Value::Param((i + 1) as u32))
+        .collect();
+    let r = fb.call(thunk.callee.clone(), args, thunk.ret);
+    if thunk.ret == IrType::Void {
+        fb.ret(None);
+    } else {
+        fb.ret(Some(r));
+    }
+    fb.finish()
 }
 
 fn lower_items(items: &[Item], prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
@@ -2819,7 +2876,11 @@ fn lower_type_at(
                     })
                     .map(|s| s.full_name.clone())
                     .unwrap_or_else(|| format!("{new_prefix}{}", name.text(src)));
-                let ret = lower_ty_env(return_ty, src, structs, env);
+                // FV-T3: a `function R(P)` *return type* is a closure-carrying
+                // position, so it lowers to `$Func` (`lower_value_ty`) — letting
+                // `Return` coerce a produced function value to a `Func$` ret (a
+                // no-op) rather than `undef` it. Delegate-gated.
+                let ret = lower_value_ty(return_ty, src, structs, env);
                 // Instance methods take a leading `this`; static ones don't.
                 let is_static = modifiers
                     .iter()
@@ -3102,7 +3163,11 @@ fn lower_method(
                 );
                 continue;
             }
-            let ty = lower_ty_env(&p.ty, src, structs, env);
+            // FV-T3: the spill slot's type is the *param* IR type — a by-value
+            // `function R(P)` param is the `$Func` value-struct, so the slot and
+            // the `Value::Param` it stores agree (storing a `Func$` into a `Ptr`
+            // slot would be an ABI mismatch).
+            let ty = param_ir_ty(p, src, structs, env);
             let elem = pointer_elem_env(&p.ty, src, structs, env);
             let slot = lw.fb.alloca(ty);
             lw.fb.store(slot.clone(), Value::Param((i + base) as u32));
@@ -3116,21 +3181,22 @@ fn lower_method(
             }
             // A `function R(P)`-typed *parameter* is callable: record its
             // signature (under the monomorph env) so `name(args)` in the body
-            // lowers to an indirect call. This is what lets a higher-order
-            // method like `Map(self, f)` actually call its `f`. Bare code
-            // pointer — fine for non-capturing-lambda / method-ref arguments;
-            // passing a *closure* needs the uniform function-value repr (a
-            // follow-on), so closures aren't recorded here.
+            // lowers to the uniform indirect call (§5.3). This is what lets a
+            // higher-order method like `Map(self, f)` actually call its `f`. The
+            // slot now holds a `$Func` value (FV-T3), so the call site loads
+            // `code`/`target` from it; a `delegate`-typed param stays bare `Ptr`
+            // (gated below) and is not callable through this path.
             if let AstType::Function {
                 return_ty,
                 params: fps,
+                is_delegate: false,
                 ..
             } = &p.ty
             {
-                let fret = lower_ty_env(return_ty, src, structs, env);
+                let fret = lower_value_ty(return_ty, src, structs, env);
                 let fptys: Vec<IrType> = fps
                     .iter()
-                    .map(|t| lower_ty_env(t, src, structs, env))
+                    .map(|t| lower_value_ty(t, src, structs, env))
                     .collect();
                 lw.fn_sigs.insert(nm.text(src).to_string(), (fret, fptys));
             }
@@ -3162,10 +3228,13 @@ fn lower_method(
     Some(lw.fb.finish())
 }
 
-/// Emit a *capturing* lambda as a closure function `$lambdaN($self, params…) ->
-/// ret`. `$self` (param 0) is the env pointer `[code_ptr | cap0 | cap1 …]`; each
-/// capture binds to its env slot `$self[i+1]` (reads/writes flow through that
-/// address); the lambda's own params follow and spill to slots as usual.
+/// Emit a lambda as a `$self`-leading function `$lambdaN($self, params…) -> ret`.
+/// `$self` (param 0) is the function value's `target` — for a *capturing* lambda
+/// it's the env pointer `[cap0 | cap1 …]` (FV-T3: the env holds ONLY captures, no
+/// leading code-pointer slot), so each capture binds to `$self[i]`; the lambda's
+/// own params follow (`Param(i+1)`). A *non-capturing* lambda passes an empty
+/// `caps` list, so the capture loop is a no-op and `$self` (a `null` target) is
+/// simply ignored — the one uniform callee ABI for all function values.
 #[allow(clippy::too_many_arguments)]
 fn emit_closure(
     name: &str,
@@ -3192,13 +3261,17 @@ fn emit_closure(
     let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
     let mut lw = Lowerer::new(fb, ret, &empty, structs, &[], None);
 
-    // Captures: bind each name to its env address `$self[i+1]`.
+    // Captures: bind each name to its env address `$self[i]`. The env (the
+    // `target`) now holds ONLY captures — slot 0 is the first capture, not a
+    // code pointer (the code pointer lives in the `Func$.code` field at the
+    // producer, FV-T3). A non-capturing lambda has an empty `caps`, so this loop
+    // is a no-op and `$self` (a `null` target) is never dereferenced.
     let self_env = Value::Param(0);
     for (i, (n, t)) in caps.iter().enumerate() {
         let addr = lw.fb.elem_addr(
             self_env.clone(),
             IrType::Ptr,
-            Value::int((i + 1) as i128, IrType::I64),
+            Value::int(i as i128, IrType::I64),
         );
         lw.bind(n, addr, *t, None);
     }
@@ -3260,14 +3333,11 @@ struct Lowerer<'a> {
     /// Generic type-parameter env when lowering a monomorph's body (so a `T`
     /// local declaration resolves to its concrete type). Empty otherwise.
     env: TyEnv<'a>,
-    /// Function-pointer locals: name → (return type, parameter types). A
-    /// `function R(P)` local holds a code address; a call `f(args)` through it
-    /// lowers to an indirect call with this signature.
+    /// Function-value locals/params: name → (return type, parameter types). A
+    /// `function R(P)` local/param holds a `$Func` value-struct (`code` +
+    /// `target`); a call `f(args)` through it loads both and emits the uniform
+    /// indirect call `code(target, args…)` with this signature (FV-T3, §5.3).
     fn_sigs: HashMap<String, (IrType, Vec<IrType>)>,
-    /// Names of function-pointer locals that hold a *closure* (an env pointer
-    /// whose slot 0 is the code pointer), not a bare code pointer. A call
-    /// through one passes the env as a hidden first argument.
-    closures: std::collections::HashSet<String>,
     /// Names of heap-array locals (`T[] a = new T[n]`). The value is a pointer to
     /// the elements; the length is stored in the 8 bytes just *before* it, so
     /// `a[i]` reuses the typed-pointer index path and `a.Count` loads `ptr[-1]`.
@@ -3316,7 +3386,6 @@ impl<'a> Lowerer<'a> {
             cur_type,
             env,
             fn_sigs: HashMap::new(),
-            closures: std::collections::HashSet::new(),
             array_locals: std::collections::HashSet::new(),
             defers: vec![Vec::new()],
             local_fns: HashMap::new(),
@@ -3455,9 +3524,13 @@ impl<'a> Lowerer<'a> {
                 // Resolve the declared slot type up front so a target-typed enum
                 // initializer (`Option<int32> a = .Some(40);`) can pick the right
                 // monomorph — `.Some` alone is ambiguous across `Option`'s monos.
+                // FV-T3: a `function R(P)` *local* is a closure-carrying position,
+                // so its slot is the `$Func` value-struct (via `lower_value_ty`).
+                // The lambda/method-ref initializer's value (`Func$` or bare
+                // `Ptr`) is coerced into it below (`coerce` auto-wraps a `Ptr`).
                 let declared = ty
                     .as_ref()
-                    .map(|t| lower_ty_env(t, src, self.structs, self.env));
+                    .map(|t| lower_value_ty(t, src, self.structs, self.env));
                 let (init_val, init_ty) = match init {
                     Some(e) => {
                         let (v, t) = declared
@@ -3496,34 +3569,24 @@ impl<'a> Lowerer<'a> {
                 if matches!(ty, Some(AstType::Array { .. })) {
                     self.array_locals.insert(name.text(src).to_string());
                 }
-                // A `function R(P)` local is a code pointer (slot type `Ptr`);
-                // record its signature so a later `name(args)` can lower to an
-                // indirect call with the right return type + arg coercions.
+                // A `function R(P)` local holds a `$Func` value (slot type set
+                // above via `lower_value_ty`); record its signature so a later
+                // `name(args)` lowers to the uniform indirect call (load
+                // `code`/`target`, §5.3). A `delegate`-typed local stays bare
+                // `Ptr` and is not callable through this path (gated).
                 if let Some(AstType::Function {
-                    return_ty, params, ..
+                    return_ty,
+                    params,
+                    is_delegate: false,
+                    ..
                 }) = ty
                 {
-                    let ret = lower_ty_env(return_ty, src, self.structs, self.env);
+                    let ret = lower_value_ty(return_ty, src, self.structs, self.env);
                     let ptys: Vec<IrType> = params
                         .iter()
-                        .map(|p| lower_ty_env(p, src, self.structs, self.env))
+                        .map(|p| lower_value_ty(p, src, self.structs, self.env))
                         .collect();
                     self.fn_sigs.insert(name.text(src).to_string(), (ret, ptys));
-                    // If the initializer is a *capturing* lambda, this local
-                    // holds a closure (env pointer) — a call through it passes
-                    // the env as a hidden first arg. (The lambda's captures were
-                    // recorded by name when its `Expr::Lambda` was lowered above.)
-                    if let Some(Expr::Lambda { span, .. }) = init
-                        && let Some(lname) = self.structs.lambda_names.get(span)
-                        && self
-                            .structs
-                            .lambda_captures
-                            .borrow()
-                            .get(lname)
-                            .is_some_and(|c| !c.is_empty())
-                    {
-                        self.closures.insert(name.text(src).to_string());
-                    }
                 }
             }
             Stmt::Return { value, .. } => {
@@ -4230,28 +4293,35 @@ impl<'a> Lowerer<'a> {
                 );
                 let code = self.fb.global_addr(name);
                 if caps.is_empty() {
+                    // Non-capturing: a bare code `Ptr`. It coerces to
+                    // `Func${code, target=null}` only when it crosses a
+                    // `Func$`-typed slot/param/return boundary (`coerce`, §5.4).
                     return (code, IrType::Ptr);
                 }
-                let words = (1 + caps.len()) as i128;
+                // Capturing: build a `Func$` value. The env (`target`) holds ONLY
+                // the captures (no leading code-pointer slot, FV-T3); each capture
+                // is stored at index `i`. `emit_closure` reads them back at
+                // `$self[i]`.
+                let words = caps.len() as i128;
                 let env = self.fb.call(
                     "malloc",
                     vec![Value::int(words * 8, IrType::I64)],
                     IrType::Ptr,
                 );
-                let slot0 = self
-                    .fb
-                    .elem_addr(env.clone(), IrType::Ptr, Value::int(0, IrType::I64));
-                self.fb.store(slot0, code);
                 for (i, (_n, slot, ty)) in caps.iter().enumerate() {
                     let dst = self.fb.elem_addr(
                         env.clone(),
                         IrType::Ptr,
-                        Value::int((i + 1) as i128, IrType::I64),
+                        Value::int(i as i128, IrType::I64),
                     );
                     let val = self.fb.load(slot.clone(), *ty);
                     self.fb.store(dst, val);
                 }
-                (env, IrType::Ptr)
+                // `Func$ {code = global_addr($lambdaN), target = env}`, built in a
+                // fresh alloca co-located with the captures (SSA-dominance safe,
+                // §5.6) and returned as the loaded value-struct.
+                let fv = self.build_func_value(code, env);
+                (fv, IrType::Struct(self.structs.func_struct))
             }
             Expr::Paren { inner, .. } => self.expr(inner, src),
             // A tuple literal `(a, b, …)` builds its synthetic value struct. With
@@ -4365,36 +4435,40 @@ impl<'a> Lowerer<'a> {
                             .collect();
                         return (self.fb.call(sym, call_args, ret), ret);
                     }
-                    // A function-pointer local (`function R(P) f`): `f(args)`
-                    // loads the code pointer and calls it indirectly.
+                    // A function-value local/param (`function R(P) f`): `f(args)`
+                    // is the ONE uniform call shape (§5.3). `f` holds a `$Func`
+                    // value-struct; load its `code` and `target`, then
+                    // `call_indirect(code, [target, args…])`. No branch on
+                    // closure-ness — `target` (env or `null`) is always param 0;
+                    // the callee's `$self` ignores a `null` target.
                     if let Some((ret, ptys)) = self.fn_sigs.get(name).cloned()
                         && let Some((slot, _)) = self.lookup(name)
                     {
-                        let is_closure = self.closures.contains(name);
-                        // `f`'s value is the env pointer for a closure, or the
-                        // code pointer for a bare function pointer.
-                        let f = self.fb.load(slot, IrType::Ptr);
-                        let (fptr, env) = if is_closure {
-                            // Code pointer is env slot 0; the env is the hidden
-                            // first argument (`$self`).
-                            let code_slot = self.fb.elem_addr(
-                                f.clone(),
-                                IrType::Ptr,
-                                Value::int(0, IrType::I64),
-                            );
-                            (self.fb.load(code_slot, IrType::Ptr), Some(f))
-                        } else {
-                            (f, None)
+                        let fid = self.structs.func_struct;
+                        let code = {
+                            let a = self.fb.field_addr(slot.clone(), fid, 0);
+                            self.fb.load(a, IrType::Ptr)
                         };
-                        let mut call_args: Vec<Value> = Vec::new();
-                        if let Some(env) = env {
-                            call_args.push(env);
-                        }
+                        let target = {
+                            let a = self.fb.field_addr(slot, fid, 1);
+                            self.fb.load(a, IrType::Ptr)
+                        };
+                        let mut call_args: Vec<Value> = vec![target];
                         for (i, (v, t)) in arg_vals.into_iter().enumerate() {
                             let pt = ptys.get(i).copied().unwrap_or(t);
                             call_args.push(self.coerce(v, t, pt));
                         }
-                        return (self.fb.call_indirect(fptr, call_args, ret), ret);
+                        // LLVM builds the indirect-call type from the *args*, not
+                        // the callee signature (§1), so an arity drift is
+                        // verify-clean — assert it here instead.
+                        debug_assert_eq!(
+                            call_args.len(),
+                            ptys.len() + 1,
+                            "function-value call arity drift for `{name}`: {} args vs {} params + $self",
+                            call_args.len(),
+                            ptys.len()
+                        );
+                        return (self.fb.call_indirect(code, call_args, ret), ret);
                     }
                     // Resolve among the same-type overloads by argument type
                     // (`this`-less candidates — statics and free fns; an instance
@@ -4650,6 +4724,30 @@ impl<'a> Lowerer<'a> {
             && let Some(res) = self.try_operator_overload(sym, l.clone(), lt, r.clone(), rt)
         {
             return res;
+        }
+        // FV-T3 (§5.4): `f == null` / `f != null` on a `$Func` value lowers to a
+        // single compare of its `code` field (`f.code == null`), not a struct
+        // compare. Either operand may be the `Func$` (the other being `null`,
+        // i.e. a `Ptr` `Const::Null`).
+        if matches!(op, AstBin::Eq | AstBin::Ne) {
+            let fid = self.structs.func_struct;
+            let func = IrType::Struct(fid);
+            let code = if lt == func && rt.is_pointer() {
+                Some(self.func_code_field(l.clone()))
+            } else if rt == func && lt.is_pointer() {
+                Some(self.func_code_field(r.clone()))
+            } else {
+                None
+            };
+            if let Some(code) = code {
+                let pred = if matches!(op, AstBin::Ne) {
+                    CmpPred::Ne
+                } else {
+                    CmpPred::Eq
+                };
+                let res = self.fb.cmp(pred, code, Value::Const(Const::Null));
+                return (res, IrType::Bool);
+            }
         }
         match op {
             AstBin::Add
@@ -5286,7 +5384,25 @@ impl<'a> Lowerer<'a> {
                     .get(name)
                     .and_then(|c| c.iter().find(|s| !s.is_instance))
             {
-                return Some((self.fb.global_addr(sig.full_name.clone()), IrType::Ptr));
+                // FV-T4: a static method `Type.M` has no `$self` param, so calling
+                // it through the uniform `code(target, args…)` convention would
+                // shift every argument by one. Wrap it in a de-duplicated
+                // `$mref$<full>($self /*ignored*/, P…){ return <full>(P…); }`
+                // thunk and return the thunk's bare `Ptr` address (it coerces to
+                // `Func${code, target=null}` at the boundary like a non-capturing
+                // lambda). The thunk is emitted once in the emit pass.
+                let thunk_sym = format!("$mref${}", sig.full_name);
+                self.structs
+                    .method_ref_thunks
+                    .borrow_mut()
+                    .entry(sig.full_name.clone())
+                    .or_insert_with(|| MethodRefThunk {
+                        thunk_sym: thunk_sym.clone(),
+                        callee: sig.full_name.clone(),
+                        ret: sig.ret,
+                        params: sig.params.clone(),
+                    });
+                return Some((self.fb.global_addr(thunk_sym), IrType::Ptr));
             }
         }
         None
@@ -6749,6 +6865,32 @@ impl<'a> Lowerer<'a> {
     /// appropriate IR cast. Keeps the IR well-typed at every use site; when no
     /// single cast bridges the two (e.g. `ptr`↔`float`) it yields a typed
     /// `undef` rather than emitting an ill-typed instruction.
+    /// Build a `Func$ { code, target }` value-struct in a fresh alloca (two
+    /// stores + a load) and return the loaded struct. Emitted at the producer
+    /// site, in the current block, so the alloca/stores/load dominate the use
+    /// (no cross-merge production, §5.6). `target` is `null` for a non-capturing
+    /// lambda / static method-ref thunk, the env for a capturing closure.
+    fn build_func_value(&mut self, code: Value, target: Value) -> Value {
+        let fid = self.structs.func_struct;
+        let slot = self.fb.alloca(IrType::Struct(fid));
+        let code_addr = self.fb.field_addr(slot.clone(), fid, 0);
+        self.fb.store(code_addr, code);
+        let target_addr = self.fb.field_addr(slot.clone(), fid, 1);
+        self.fb.store(target_addr, target);
+        self.fb.load(slot, IrType::Struct(fid))
+    }
+
+    /// Extract the `code` field (`Ptr`) of a `$Func` value-struct `v`. Spills the
+    /// aggregate to a fresh alloca and reads field 0 — used by `f == null`, which
+    /// is defined as `f.code == null` (§5.4).
+    fn func_code_field(&mut self, v: Value) -> Value {
+        let fid = self.structs.func_struct;
+        let slot = self.fb.alloca(IrType::Struct(fid));
+        self.fb.store(slot.clone(), v);
+        let code_addr = self.fb.field_addr(slot, fid, 0);
+        self.fb.load(code_addr, IrType::Ptr)
+    }
+
     fn coerce(&mut self, v: Value, from: IrType, to: IrType) -> Value {
         if from == to {
             return v;
@@ -6766,6 +6908,15 @@ impl<'a> Lowerer<'a> {
             && self.structs.by_name.get("String") == Some(&rid)
         {
             return self.construct_string(v);
+        }
+        // FV-T3 (§5.4): a bare code `Ptr` (a non-capturing lambda address or a
+        // static method-ref `$mref$` thunk) crossing into a `Func$`-typed slot /
+        // param / return auto-wraps to `Func${code = v, target = null}`. A
+        // `Const::Null` flows through the same arm (its IR type is `Ptr`) to
+        // `Func${null, null}`, giving `function R(P) f = null;` a defined value.
+        // There is deliberately NO `Func$ → Ptr` path (it would drop `target`).
+        if from == IrType::Ptr && to == IrType::Struct(self.structs.func_struct) {
+            return self.build_func_value(v, Value::Const(Const::Null));
         }
         match (from, to) {
             // Same-width integers share one LLVM type (signedness isn't in the
@@ -7105,9 +7256,15 @@ fn is_by_ref(p: &AstParam) -> bool {
 /// agree on the pointer shape.
 fn param_ir_ty(p: &AstParam, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
     if is_by_ref(p) {
+        // A `ref`/`out` param is always a pointer to caller storage — even a
+        // `ref function R(P)` stays a bare `Ptr`, never a `Func$`.
         IrType::Ptr
     } else {
-        lower_ty_env(&p.ty, src, structs, env)
+        // FV-T3: a by-value `function R(P)` *parameter* is a closure-carrying
+        // position, so it lowers to the `$Func` value-struct (delegate-gated in
+        // `lower_value_ty`). This makes both the emitted callee param and the
+        // recorded `MethodSig.params` (the call-site coercion target) `Func$`.
+        lower_value_ty(&p.ty, src, structs, env)
     }
 }
 
@@ -7151,10 +7308,6 @@ fn generic_callee_name<'b>(base: &'b Expr, src: &'b str) -> Option<&'b str> {
     }
 }
 
-/// Lower a type, resolving generic type-parameters through `env` (so a `T`
-/// field of a monomorphized `Box<int>` becomes `i64`) and generic
-/// instantiations through the monomorphized symbol table (`Box<int>` → the
-/// registered `Box$i64`).
 /// Like [`lower_ty_env`], but a `function R(P)` in a *closure-carrying* position
 /// (a param, a local, or a return type) lowers to the two-word `$Func`
 /// value-struct (`Struct(func_struct)`) rather than a bare code pointer, so the
@@ -7164,17 +7317,28 @@ fn generic_callee_name<'b>(base: &'b Expr, src: &'b str) -> Option<&'b str> {
 /// they keep calling `lower_ty_env`, which lowers `AstType::Function` to bare
 /// `Ptr`, preserving their layout.
 ///
-/// FV-T1 only introduces this helper; it is not yet threaded into any call site
-/// (param/local/return threading lands in FV-T3), so it is currently unused.
-/// (Same pattern GM-A1 used to land `cur_type` ahead of its consumers.)
-#[allow(dead_code)] // wired into param/local/return sites in FV-T3
+/// **Delegate gating (doc §6):** only a `function R(P)` type is swept into
+/// `Func$`. A `delegate R(P)` (parsed as the same `AstType::Function` node but
+/// with `is_delegate == true`) is Beef's heap GC object and is **not** widened in
+/// this slice — it stays a bare `Ptr` (T8 groundwork). Several corlib-slice files
+/// (`Array.bf`, `Lazy.bf`, `Platform.bf`, …) have `delegate`-typed params/locals;
+/// widening them would change layout and break the verify corpus.
 fn lower_value_ty(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
-    if let AstType::Function { .. } = ty {
+    if let AstType::Function {
+        is_delegate: false, ..
+    } = ty
+    {
         return IrType::Struct(structs.func_struct);
     }
     lower_ty_env(ty, src, structs, env)
 }
 
+/// Lower a type, resolving generic type-parameters through `env` (so a `T`
+/// field of a monomorphized `Box<int>` becomes `i64`) and generic
+/// instantiations through the monomorphized symbol table (`Box<int>` → the
+/// registered `Box$i64`). An `AstType::Function` (both `function` and
+/// `delegate`) lowers to bare `Ptr` here; the closure-carrying `Func$` widening
+/// lives only in [`lower_value_ty`].
 fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
     match ty {
         AstType::Path { segments, .. } if segments.len() == 1 && segments[0].args.is_empty() => {
@@ -7418,5 +7582,76 @@ mod tests {
         );
         assert_eq!(lower_ty_env(fn_ty, wrapper, &t, &[]), IrType::Ptr);
         let _ = src; // documents the bare type-decl form
+    }
+
+    /// FV-T3+T4 / Risk R1 (verify-clean ABI drift): the LLVM backend builds an
+    /// indirect call's type from its *args*, so an arity/ABI mismatch through a
+    /// function value passes the verifier yet miscompiles. This walks the lowered
+    /// `Module.funcs` and asserts the uniform callee ABI invariants the
+    /// run-corpus alone otherwise guards:
+    ///   - every `$lambda*` and `$mref*` has `param[0].ty == Ptr` (the `$self`),
+    ///   - `$Func` is a 2-`Ptr`-field value struct,
+    ///   - every `Func$` indirect call (`$mref$` thunk callee) is arity-clean.
+    #[test]
+    fn lowered_function_values_have_uniform_self_leading_abi() {
+        // A program exercising all three producers: a non-capturing lambda, a
+        // capturing closure (env), and a static method-ref (thunked), each into a
+        // `function`-typed local, plus a generic HOF call through the value.
+        let src = r#"
+            class Mathx { public static int32 Square(int32 x) { return x * x; } }
+            class Program {
+                public static int32 Main() {
+                    int32 b = 10;
+                    function int32(int32) plain = x => x + 1;
+                    function int32(int32) capt  = a => a + b;
+                    function int32(int32) sref  = Mathx.Square;
+                    return plain(1) + capt(2) + sref(3);
+                }
+            }
+        "#;
+        let (unit, _pd) = parse_file(src, FileId(0));
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // `$Func` is a 2-`Ptr`-field value struct.
+        let func_def = module
+            .structs
+            .iter()
+            .find(|s| s.name == "$Func")
+            .expect("$Func struct present in module");
+        assert_eq!(func_def.fields.len(), 2, "$Func has exactly two fields");
+        assert!(
+            func_def.fields.iter().all(|f| f.ty == IrType::Ptr),
+            "$Func fields must both be Ptr"
+        );
+
+        // Every emitted lambda/method-ref-thunk leads with a `Ptr` `$self`.
+        let mut saw_lambda = false;
+        let mut saw_mref = false;
+        for f in &module.funcs {
+            if f.name.starts_with("$lambda") {
+                saw_lambda = true;
+                assert!(
+                    !f.params.is_empty() && f.params[0].ty == IrType::Ptr,
+                    "{}: param[0] must be the Ptr $self",
+                    f.name
+                );
+            }
+            if f.name.starts_with("$mref") {
+                saw_mref = true;
+                assert!(
+                    !f.params.is_empty() && f.params[0].ty == IrType::Ptr,
+                    "{}: param[0] must be the Ptr $self",
+                    f.name
+                );
+            }
+        }
+        assert!(saw_lambda, "expected at least one $lambda* function");
+        assert!(saw_mref, "expected the $mref$ thunk for Mathx.Square");
     }
 }
