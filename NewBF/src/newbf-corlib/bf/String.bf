@@ -213,6 +213,27 @@ class String {
 			this.Append(other.CharAt(i));
 		}
 	}
+	// Append the decimal rendering of `n` (e.g. -1024 → "-1024"). Selected over
+	// the char8/String overloads by the argument's type. Negative values emit a
+	// leading '-' then the digits of the magnitude; zero emits "0".
+	public void Append(int n) {
+		if (n < 0) {
+			this.Append('-');
+			this.AppendDigits(-n);
+		} else {
+			this.AppendDigits(n);
+		}
+	}
+	// Append n's decimal digits most-significant-first: recurse on the high
+	// digits before appending the current low one. Assumes n >= 0.
+	void AppendDigits(int n) {
+		if (n >= 10) {
+			this.AppendDigits(n / 10);
+		}
+		int d = n % 10;
+		char8 c = '0' + d;
+		this.Append(c);
+	}
 	void Grow() {
 		int nc = this.mCapacity * 2;
 		char8* nb = Internal.Malloc(nc);
