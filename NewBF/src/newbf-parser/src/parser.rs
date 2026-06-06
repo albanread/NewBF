@@ -586,14 +586,15 @@ impl<'a> Parser<'a> {
                 // records it). Control-flow bodies never reach here — their
                 // conditions are parenthesised, so the `{` follows the `)`.
                 TokenKind::LBrace if !self.suppress_init && self.initializer_follows(&e) => {
+                    // Wrap even an *empty* initializer (`.{}`, `new T() {}`): it
+                    // still constructs (running field defaults / the ctor) and the
+                    // braces would otherwise be silently dropped.
                     let entries = self.consume_initializer();
-                    if !entries.is_empty() {
-                        e = Expr::Initializer {
-                            span: self.finish(lo),
-                            base: Box::new(e),
-                            entries,
-                        };
-                    }
+                    e = Expr::Initializer {
+                        span: self.finish(lo),
+                        base: Box::new(e),
+                        entries,
+                    };
                 }
                 _ => break,
             }
