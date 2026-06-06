@@ -53,6 +53,15 @@ fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
 /// resolves.
 #[derive(Default)]
 struct StructTable {
+    /// The well-known `$Func` value-struct id (`{ code: Ptr, target: Ptr }`),
+    /// registered FIRST in [`StructTable::build`] so it is genuinely
+    /// `StructId(0)`. A function value in a *closure-carrying* position (param /
+    /// local / return) lowers to `Struct(func_struct)` via [`lower_value_ty`];
+    /// C-ABI function-pointer positions (fields/casts/externs) stay bare `Ptr`.
+    /// NOTE on the default-id hazard: `StructTable` derives `Default`, so an
+    /// unset `func_struct` would silently be `StructId(0)`. Registering `$Func`
+    /// first makes `StructId(0)` genuinely `$Func`; `build` asserts this.
+    func_struct: StructId,
     by_name: HashMap<String, StructId>,
     kinds: Vec<StructKind>,
     defs: Vec<StructDef>,
@@ -168,6 +177,17 @@ struct GenMethodMono {
 impl StructTable {
     fn build(files: &[SourceFile<'_>]) -> Self {
         let mut t = StructTable::default();
+        // 0. Register the well-known `$Func` value-struct FIRST so it gets
+        //    `StructId(0)` and `func_struct` genuinely points at it (the
+        //    default-id hazard: `func_struct` defaults to `StructId(0)`, so the
+        //    default MUST be a real `$Func`). `$Func` = `{ code: Ptr, target:
+        //    Ptr }` is the uniform two-word function-value representation used in
+        //    closure-carrying positions (param/local/return) by `lower_value_ty`.
+        //    Registering it first shifts every subsequent struct's id by one,
+        //    which is safe: ids are only ever obtained via registration
+        //    (`StructId(t.defs.len())`) or `by_name`/loop indices — nothing
+        //    hardcodes a numeric id.
+        t.func_struct = register_func_struct(&mut t);
         // 1. Register every non-generic type's name/id, and int-backed enums.
         for f in files {
             register_struct_names(&f.unit.items, "", f.src, &mut t);
@@ -267,6 +287,19 @@ impl StructTable {
         //    then lay out vtables (which inherit/override across that hierarchy).
         apply_inheritance(&mut t);
         apply_vtables(&mut t);
+        // Default-id hazard guard: `func_struct` must genuinely be the `$Func`
+        // value-struct (registered first, at `StructId(0)`), with exactly two
+        // `Ptr` fields. If this ever fails, an unset/aliased `func_struct` would
+        // silently point at the wrong (or no) struct.
+        let fd = &t.defs[t.func_struct.0 as usize];
+        debug_assert_eq!(t.func_struct, StructId(0), "$Func must be StructId(0)");
+        debug_assert_eq!(fd.name, "$Func", "func_struct must name the $Func struct");
+        debug_assert!(
+            fd.fields.len() == 2
+                && fd.fields[0].ty == IrType::Ptr
+                && fd.fields[1].ty == IrType::Ptr,
+            "$Func must have exactly two Ptr fields (code, target)"
+        );
         t
     }
 
@@ -375,6 +408,43 @@ fn index_generic_methods<'a>(
             _ => {}
         }
     }
+}
+
+/// Register the well-known `$Func` value-struct `{ code: Ptr, target: Ptr }`
+/// and return its id. Called FIRST in [`StructTable::build`] so it is
+/// `StructId(0)` (see the `func_struct` field's default-id note). Both fields
+/// are opaque `Ptr`, so there is one `$Func` layout independent of the function
+/// signature (no monomorph explosion). Pushes onto every parallel per-id vector
+/// (as the other registration helpers do) to keep the table well-formed.
+fn register_func_struct(t: &mut StructTable) -> StructId {
+    let id = StructId(t.defs.len() as u32);
+    let fields = vec![
+        FieldDef {
+            name: "code".into(),
+            ty: IrType::Ptr,
+        },
+        FieldDef {
+            name: "target".into(),
+            ty: IrType::Ptr,
+        },
+    ];
+    let nfields = fields.len();
+    t.defs.push(StructDef {
+        name: "$Func".into(),
+        fields,
+    });
+    t.kinds.push(StructKind::Value);
+    t.prefixes.push("$Func.".into());
+    t.ctors.push(Vec::new());
+    t.dtors.push(None);
+    t.methods.push(HashMap::new());
+    t.field_elems.push(vec![None; nfields]);
+    t.bases.push(None);
+    t.virtuals.push(Vec::new());
+    t.vslots.push(HashMap::new());
+    t.vimpls.push(Vec::new());
+    t.by_name.insert("$Func".into(), id);
+    id
 }
 
 /// Register a monomorphized instantiation as a fresh concrete type and return
@@ -7085,6 +7155,26 @@ fn generic_callee_name<'b>(base: &'b Expr, src: &'b str) -> Option<&'b str> {
 /// field of a monomorphized `Box<int>` becomes `i64`) and generic
 /// instantiations through the monomorphized symbol table (`Box<int>` → the
 /// registered `Box$i64`).
+/// Like [`lower_ty_env`], but a `function R(P)` in a *closure-carrying* position
+/// (a param, a local, or a return type) lowers to the two-word `$Func`
+/// value-struct (`Struct(func_struct)`) rather than a bare code pointer, so the
+/// function value's representation (`code` + `target`) travels with it under one
+/// uniform calling convention. Fields, casts, and extern callback tables
+/// (C-ABI function-pointer positions, e.g. `BfRtCallbacks`) must NOT use this —
+/// they keep calling `lower_ty_env`, which lowers `AstType::Function` to bare
+/// `Ptr`, preserving their layout.
+///
+/// FV-T1 only introduces this helper; it is not yet threaded into any call site
+/// (param/local/return threading lands in FV-T3), so it is currently unused.
+/// (Same pattern GM-A1 used to land `cur_type` ahead of its consumers.)
+#[allow(dead_code)] // wired into param/local/return sites in FV-T3
+fn lower_value_ty(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
+    if let AstType::Function { .. } = ty {
+        return IrType::Struct(structs.func_struct);
+    }
+    lower_ty_env(ty, src, structs, env)
+}
+
 fn lower_ty_env(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> IrType {
     match ty {
         AstType::Path { segments, .. } if segments.len() == 1 && segments[0].args.is_empty() => {
@@ -7210,4 +7300,123 @@ fn parse_float(text: &str) -> f64 {
         .trim_end_matches(['f', 'F', 'd', 'D'])
         .parse::<f64>()
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::SourceFile;
+    use newbf_parser::parse_file;
+
+    /// FV-T1: `$Func` is registered FIRST, so `func_struct == StructId(0)`, it is
+    /// named `$Func`, and it has exactly two `Ptr` fields `code`/`target`. This
+    /// pins the default-id hazard fix: `func_struct` defaults to `StructId(0)`,
+    /// which must genuinely be the `$Func` struct.
+    #[test]
+    fn func_struct_is_id_zero_with_two_ptr_fields() {
+        // `StructTable::build` does not load the corlib prelude itself
+        // (`lower_program` does), so an empty file list registers only `$Func`.
+        let t = StructTable::build(&[]);
+        assert_eq!(t.func_struct, StructId(0), "$Func must be StructId(0)");
+        let fd = &t.defs[t.func_struct.0 as usize];
+        assert_eq!(fd.name, "$Func");
+        assert_eq!(fd.fields.len(), 2, "$Func must have exactly two fields");
+        assert_eq!(fd.fields[0].name, "code");
+        assert_eq!(fd.fields[0].ty, IrType::Ptr);
+        assert_eq!(fd.fields[1].name, "target");
+        assert_eq!(fd.fields[1].ty, IrType::Ptr);
+        // The well-known name resolves back to the same id.
+        assert_eq!(t.by_name.get("$Func").copied(), Some(StructId(0)));
+        // It is a value struct.
+        assert!(matches!(t.kinds[0], StructKind::Value));
+    }
+
+    /// FV-T1 / Risk R5 (C-ABI layout regression): registering `$Func` at id 0 and
+    /// adding the (unused) `lower_value_ty` helper must NOT widen C-ABI
+    /// function-pointer *fields* to the 16-byte `$Func` struct. `lower_ty_env`'s
+    /// `AstType::Function` arm stays bare `Ptr`, so every function-pointer field
+    /// of a `BfRtCallbacks`-style table keeps its 8-byte `Ptr` layout. (This
+    /// mirrors the real `BfRtCallbacks` in beef-tests/corlib-slice/Runtime.bf,
+    /// which is exercised in full by the verify corpus.)
+    #[test]
+    fn cabi_function_pointer_fields_stay_bare_ptr() {
+        let src = r#"
+            struct BfRtCallbacksLike {
+                function void* (int x) mAlloc;
+                function void (void* p) mFree;
+                function int (int a, int b) mCombine;
+                int32 mTag;
+            }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+        let id = *t
+            .by_name
+            .get("BfRtCallbacksLike")
+            .expect("test struct must register");
+        let def = &t.defs[id.0 as usize];
+        // Every `function`-typed field stays a bare `Ptr` (not `Struct(func_struct)`):
+        // C-ABI layout unchanged. The trailing `int32` confirms ordinary fields
+        // are unaffected.
+        let func_fields: Vec<_> = def.fields.iter().filter(|f| f.name != "mTag").collect();
+        assert_eq!(func_fields.len(), 3, "three function-pointer fields");
+        for f in &func_fields {
+            assert_eq!(
+                f.ty,
+                IrType::Ptr,
+                "function-pointer field {} must stay bare Ptr (C-ABI), not $Func",
+                f.name
+            );
+            assert_ne!(
+                f.ty,
+                IrType::Struct(t.func_struct),
+                "field {} must NOT be widened to the $Func value-struct",
+                f.name
+            );
+        }
+        let tag = def.fields.iter().find(|f| f.name == "mTag").unwrap();
+        assert_eq!(tag.ty, IrType::I32);
+    }
+
+    /// FV-T1: the position-gated helper itself. `lower_value_ty` returns the
+    /// `$Func` struct for a `function` type, but `lower_ty_env` (used by
+    /// fields/casts/externs) still returns bare `Ptr` for the same type.
+    #[test]
+    fn lower_value_ty_yields_func_struct_only_at_value_positions() {
+        let src = "function int (int x) F;";
+        // Parse a struct whose single field is a function type, then pull the
+        // field's `AstType::Function` back out for the helper comparison.
+        let wrapper = "struct W { function int (int x) f; }";
+        let unit = parse_file(wrapper, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src: wrapper,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+        // Find the `function`-typed field's AST node.
+        let fn_ty = unit
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Type(td) => td.members.iter().find_map(|m| match m {
+                    Member::Field { ty, .. } if matches!(ty, AstType::Function { .. }) => Some(ty),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("function-typed field");
+        // Value position ⇒ `$Func`; type position (field/cast/extern) ⇒ bare `Ptr`.
+        assert_eq!(
+            lower_value_ty(fn_ty, wrapper, &t, &[]),
+            IrType::Struct(t.func_struct)
+        );
+        assert_eq!(lower_ty_env(fn_ty, wrapper, &t, &[]), IrType::Ptr);
+        let _ = src; // documents the bare type-decl form
+    }
 }

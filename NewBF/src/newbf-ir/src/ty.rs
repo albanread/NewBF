@@ -6,7 +6,7 @@
 /// Index into a [`crate::Module`]'s struct table (`module.structs`). Kept a
 /// plain `u32` so [`IrType`] stays `Copy`; the field layout lives in the
 /// module's [`crate::StructDef`], not on the type.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct StructId(pub u32);
 
 /// A concrete IR type. Every [`crate::Value`] has one.
