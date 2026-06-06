@@ -278,14 +278,25 @@ impl StructTable {
                 register_payload_enum_mono(*id, decl, decl_src, env, &mut t);
             }
         }
+        // 4c-bis. GM-B1: now the full type-mono table (`t.monos`) exists, index
+        //     each type monomorph's generic methods under `(Some(mono_id), name)`
+        //     using the *template's* decl, so an instance generic call on a
+        //     generic owner (`List<int32>.Map<R>`) resolves its decl (collection
+        //     below) and emission can re-find it. Must follow step 4 (monos
+        //     filled) and precede the second collection pass that records them.
+        index_gmethods_on_monos(&t.monos, &generics, &mut gmethods);
         // 4d. Second generic-instantiation pass, now that fields are filled
         //     (GM-A3a). A *field-receiver* instance generic call `this.f.M<T>(…)`
         //     needs `f`'s declared type, which `instance_recv_owner` reads from
-        //     `t.defs[owner].fields` — empty during step 3. Re-running with the
-        //     SAME `seen` set means no type monomorph is re-registered (all were
-        //     discovered syntactically in step 3, before fields mattered), and the
-        //     gen-method dedup (`gen_method_sigs.contains_key`) appends only the
-        //     newly-resolvable field-receiver monomorphs. The throwaway `monos`
+        //     `t.defs[owner].fields` — empty during step 3. Also records
+        //     generic-method monomorphs on generic owners (GM-B1), now that the
+        //     `(Some(mono_id), name)` decl entries exist (4c-bis above) and the
+        //     owner-mono env is available in `t.monos` for the combined env.
+        //     Re-running with the SAME `seen` set means no type monomorph is
+        //     re-registered (all were discovered syntactically in step 3, before
+        //     fields mattered), and the gen-method dedup
+        //     (`gen_method_sigs.contains_key`) appends only the newly-resolvable
+        //     field-receiver / generic-owner monomorphs. The throwaway `monos`
         //     stays empty (everything is already `seen`).
         let mut monos2: MonoList = Vec::new();
         for f in files {
@@ -428,6 +439,49 @@ fn index_generic_methods<'a>(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// GM-B1: index a generic *type* monomorph's generic methods under
+/// `(Some(mono_id), name)`, pointing at the **template's** decl.
+///
+/// A generic method on a generic owner (`List<int64>.Map<R>`) has its decl on
+/// the generic *template* `List<T>`, which is never registered (only its monos
+/// are) — so `index_generic_methods` files that decl only in the `(None, name)`
+/// bucket. To resolve an *instance* call `lst.Map<R>(…)` on a `List<int32>`
+/// receiver, both collection (`record_method_inst`) and emission (the gen-method
+/// loop) look the decl up under `(Some(owner_mono_id), name)`. This helper makes
+/// that key resolve by re-using the *template's* `(member, src)` for every type
+/// monomorph in `t.monos`, keyed at the monomorph's id.
+///
+/// **Ordering (doc §9 B1):** must run only *after* the full type-mono table
+/// (`t.monos`) exists — a `List<int32>` mono may be registered late in source
+/// order, so owner-mono prefixes can't be resolved during the first collection.
+/// Run once after step 4 (build) and once before the gen-method emission loop
+/// (lower_program). Idempotent re-runs only re-append identical `(member, src)`
+/// pairs; overload arity selection at the use site stays correct.
+fn index_gmethods_on_monos<'a>(
+    monos: &[MonoRecord],
+    generics: &GenericDecls<'a>,
+    out: &mut GenMethodDecls<'a>,
+) {
+    for (mono_id, gen_name, _env) in monos {
+        let Some(&(td, td_src)) = generics.get(gen_name) else {
+            continue;
+        };
+        for m in &td.members {
+            if let Member::Method {
+                name,
+                generic_params,
+                ..
+            } = m
+                && !generic_params.is_empty()
+            {
+                out.entry((Some(*mono_id), name.text(td_src).to_string()))
+                    .or_default()
+                    .push((m, td_src));
+            }
         }
     }
 }
@@ -876,11 +930,32 @@ fn record_method_inst(
     if t.gen_method_sigs.contains_key(&key) {
         return;
     }
-    let env: Vec<(String, IrType)> = generic_params
+    // The method's own type-parameter bindings (`R → int32`).
+    let method_env: Vec<(String, IrType)> = generic_params
         .iter()
         .zip(&argtys)
         .map(|(gp, ty)| (gp.name.text(mdecl_src).to_string(), *ty))
         .collect();
+    // GM-B1: when `owner` is itself a generic *type* monomorph (`List<int32>`),
+    // its type-param bindings (`T → i32`) live in `t.monos` (a `MonoRecord`).
+    // The method's emission env — and the env used to lower the method's sig
+    // (params/return/variadic, e.g. `Map<R>`'s `function R(T) f` needs *both*
+    // `T` and `R`) — is the OWNER mono's env followed by the method's own env.
+    // A non-mono owner (a concrete class) contributes no bindings, so `env`
+    // stays the method-only env (GM-A3a behaviour, byte-identical).
+    let env: Vec<(String, IrType)> = match owner {
+        Some(oid) => {
+            let mut combined: Vec<(String, IrType)> = t
+                .monos
+                .iter()
+                .find(|(id, _, _)| *id == oid)
+                .map(|(_, _, e)| e.clone())
+                .unwrap_or_default();
+            combined.extend(method_env.iter().cloned());
+            combined
+        }
+        None => method_env,
+    };
     // GM-A3a: an instance generic method (non-static, declared on a *concrete*
     // owner) takes a leading `this: Ref(owner)` and is dispatched with a real
     // receiver. A `None`-bucket entry (bare cross-class static) and a static
@@ -2550,15 +2625,35 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     for f in &all {
         index_generic_methods(&f.unit.items, f.src, &structs, &mut gmethods);
     }
+    // GM-B1: index each type monomorph's generic methods under
+    // `(Some(mono_id), name)` (from the template decl) so a generic-method
+    // monomorph on a generic owner (`List<int32>.Map<R>`) re-finds its decl
+    // below. Mirrors the same augmentation in `StructTable::build` (step 4c-bis).
+    index_gmethods_on_monos(&structs.monos, &generics, &mut gmethods);
     let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
     for mono in &structs.gen_method_monos {
+        // The number of the method's OWN type-parameters: the monomorph's `env`
+        // is `owner-mono bindings ++ method bindings` (GM-B1), so for an owner
+        // that is itself a type monomorph the leading entries are the owner's
+        // `T…` and must be excluded when matching the decl's `generic_params`.
+        let owner_tparams = match mono.owner {
+            Some(oid) => structs
+                .monos
+                .iter()
+                .find(|(id, _, _)| *id == oid)
+                .map(|(_, _, e)| e.len())
+                .unwrap_or(0),
+            None => 0,
+        };
+        let method_tparams = mono.env.len() - owner_tparams;
         // Re-find the decl via `(owner, name)`, picking the overload whose
-        // type-param arity matches this monomorph's env (mirrors the collector).
+        // type-param arity matches the method's OWN type-params (mirrors the
+        // collector's overload selection, combined-env aware).
         if let Some(&(member, mdecl_src)) = gmethods.get(&(mono.owner, mono.name.clone())).and_then(
             |v| {
                 v.iter().find(|(m, _)| {
                     matches!(m, Member::Method { generic_params, .. }
-                        if generic_params.len() == mono.env.len())
+                        if generic_params.len() == method_tparams)
                 })
             },
         ) && let Member::Method {
