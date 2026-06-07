@@ -975,9 +975,15 @@ fn compose_inheritance(id: StructId, t: &mut StructTable, composed: &mut [bool])
     }
 }
 
-/// The vtable global's symbol for a class prefix (`"Animal."` → `"Animal.$vtable"`).
-fn vtable_name(prefix: &str) -> String {
-    format!("{prefix}$vtable")
+/// The ClassVData global's symbol for a class prefix (`"Animal."` →
+/// `"Animal.$cvdata"`). RF-T2: the single canonical per-class header object —
+/// a `%ClassVData = { i32 mType, [N x ptr] vtbl }` global — replacing the bare
+/// `vtable_name` array. Every `StructKind::Ref` id gets one (entries empty when
+/// the class has no virtual/interface methods), and `new` always stores
+/// `&classvdata_name(id)` into `$header` (never `Null`). The same prefix
+/// convention as `vtable_name`, so monomorphs get distinct globals.
+fn classvdata_name(prefix: &str) -> String {
+    format!("{prefix}$cvdata")
 }
 
 /// Compose vtables across the table (recursive, memoized, base-first): inherit
@@ -1046,7 +1052,7 @@ fn abi_compatible(a: IrType, b: IrType) -> bool {
 /// `iface`: (1) `explicit_impls[(class, iface, name)]`; else (2) `pick_overload`
 /// over `methods[class]` (which includes INHERITED methods — `apply_inheritance`
 /// ran first); else (3) the interface default `idefaults[iface][k]`; else (4) an
-/// empty-string placeholder (→ `const_null` slot via `emit_vtables`). Before
+/// empty-string placeholder (→ `const_null` slot via `emit_classvdata`). Before
 /// wiring a chosen impl its non-pointer param/return types are asserted equal to
 /// the slot signature's (`abi_compatible`); a mismatch falls back to the null
 /// placeholder rather than an ill-typed `call_indirect` target.
@@ -1098,7 +1104,7 @@ fn apply_itables(t: &mut StructTable) {
                 // Grow `vimpls[class]` so `target_slot` is in range, null-padding
                 // the gap (between the class block and the first iface block, and
                 // between non-contiguous iface blocks) with empty strings —
-                // `emit_vtables` lowers an empty entry to `const_null`.
+                // `emit_classvdata` lowers an empty entry to `const_null`.
                 if t.vimpls[i].len() <= target_slot {
                     t.vimpls[i].resize(target_slot + 1, String::new());
                 }
@@ -4137,16 +4143,22 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         );
     }
     m.structs = structs.defs.clone();
-    // Emit a vtable global for each class that has virtual methods.
-    for i in 0..structs.vimpls.len() {
-        if !structs.vimpls[i].is_empty() {
-            m.add_vtable(VtableDef {
-                name: vtable_name(&structs.prefixes[i]),
-                entries: structs.vimpls[i].clone(),
-                // RF-T1: default 0; RF-T3 assigns the dense type-id here.
-                type_id: 0,
-            });
+    // RF-T2: register a ClassVData global for EVERY `StructKind::Ref` id (not
+    // just classes with virtuals). Each becomes a `%ClassVData = { i32 mType,
+    // [N x ptr] vtbl }` global in newbf-llvm; `entries` is empty (N = 0) when
+    // the class has no virtual/interface methods, so even a plain class gets a
+    // non-null header that `new` always stores and `is`/`as` compares against.
+    for i in 0..structs.defs.len() {
+        if !matches!(structs.kinds[i], StructKind::Ref) {
+            continue;
         }
+        m.add_vtable(VtableDef {
+            name: classvdata_name(&structs.prefixes[i]),
+            entries: structs.vimpls[i].clone(),
+            // RF-T1: default 0 (the i32 mType word); RF-T3 assigns the dense
+            // type-id here. RF-T2 keeps it 0 — behavior is unchanged.
+            type_id: 0,
+        });
     }
     // Emit a mutable module global for each `static` field.
     for (sym, ty) in &structs.statics {
@@ -8149,15 +8161,15 @@ impl<'a> Lowerer<'a> {
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
             let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
-            // Object header (ClassVData*) at offset 0: the class vtable when it
-            // has virtual methods, else null.
+            // Object header (ClassVData*) at offset 0. RF-T2: ALWAYS store
+            // `&classvdata_name(id)` — every `StructKind::Ref` now has a
+            // ClassVData global (entries empty when vimpls empty), so the header
+            // is never null. This is what `is`/`as` compares against and what
+            // `GetType()` (RF-T5) reads the type-id through.
             let hdr = self.fb.field_addr(p.clone(), id, 0);
-            let header = if self.structs.vimpls[id.0 as usize].is_empty() {
-                Value::Const(Const::Null)
-            } else {
-                self.fb
-                    .global_addr(vtable_name(&self.structs.prefixes[id.0 as usize]))
-            };
+            let header = self
+                .fb
+                .global_addr(classvdata_name(&self.structs.prefixes[id.0 as usize]));
             self.fb.store(hdr, header);
             // Apply constant field defaults (`int32 v = 9;`) for this class and its
             // bases before any constructor runs, so a ctor body can override them.
@@ -8222,8 +8234,13 @@ impl<'a> Lowerer<'a> {
         };
         let size = self.fb.size_of(id);
         let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
+        // RF-T2: store the ClassVData header (String is a `StructKind::Ref`, so
+        // it has a `classvdata_name` global), never null.
         let hdr = self.fb.field_addr(p.clone(), id, 0);
-        self.fb.store(hdr, Value::Const(Const::Null));
+        let header = self
+            .fb
+            .global_addr(classvdata_name(&self.structs.prefixes[id.0 as usize]));
+        self.fb.store(hdr, header);
         if let Some(ctor) = self.structs.ctor_for(id, 1) {
             self.fb
                 .call(ctor.full_name, vec![p.clone(), cstr], IrType::Void);
@@ -8243,11 +8260,15 @@ impl<'a> Lowerer<'a> {
         let Some(id) = self.structs.by_name.get("String").copied() else {
             return (undef(IrType::Ptr), IrType::Ptr);
         };
-        // new String(): newbf_alloc the body, null the header, run the 0-arg ctor.
+        // new String(): newbf_alloc the body, store the ClassVData header
+        // (RF-T2: never null — String is a `StructKind::Ref`), run the 0-arg ctor.
         let size = self.fb.size_of(id);
         let s = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
         let hdr = self.fb.field_addr(s.clone(), id, 0);
-        self.fb.store(hdr, Value::Const(Const::Null));
+        let header = self
+            .fb
+            .global_addr(classvdata_name(&self.structs.prefixes[id.0 as usize]));
+        self.fb.store(hdr, header);
         if let Some(ctor) = self.structs.ctor_for(id, 0) {
             self.fb.call(ctor.full_name, vec![s.clone()], IrType::Void);
         }
@@ -8765,9 +8786,11 @@ impl<'a> Lowerer<'a> {
         let hdr = self.fb.load(hdr_addr, IrType::Ptr);
         let mut acc: Option<Value> = None;
         for c in targets {
+            // RF-T2: compare `$header` against the ClassVData global `new` now
+            // stores (was the bare `vtable_name`), so `is`/`as` stay correct.
             let vt = self
                 .fb
-                .global_addr(vtable_name(&self.structs.prefixes[c.0 as usize]));
+                .global_addr(classvdata_name(&self.structs.prefixes[c.0 as usize]));
             let eq = self.fb.cmp(CmpPred::Eq, hdr.clone(), vt);
             acc = Some(match acc {
                 None => eq,
@@ -9091,6 +9114,37 @@ impl<'a> Lowerer<'a> {
         Some((r, sig.ret))
     }
 
+    /// RF-T2: the vtable base (the `[N x ptr]` array) reached from an object's
+    /// `$header`. The header now ALWAYS points at a `%ClassVData = { i32 mType,
+    /// [N x ptr] vtbl }` global, so the vtable slots are at field 1, shifted
+    /// past the `{ i32, pad }` prefix. This ONE helper routes every virtual +
+    /// interface dispatch through that shift so the three sites can never
+    /// diverge (the slot-shift miscompile guard). Read `$header` via a RAW
+    /// pointer-indexed GEP (offset 0) so it works even when `obj` is
+    /// interface-typed (an interface has an EMPTY StructDef — `field_addr` would
+    /// be invalid). The `VtableBase` inst is a struct-GEP into `%ClassVData`
+    /// field 1 in the backend (LLVM computes the padded offset — no hand-rolled
+    /// byte offset). Emitted inline at the dispatch use site, so the receiver
+    /// dominates (R9 SSA-dominance: no cross-block hoist).
+    fn load_vtable_base(&mut self, obj: Value) -> Value {
+        let hdr_addr = self
+            .fb
+            .elem_addr(obj, IrType::Ptr, Value::int(0, IrType::I64));
+        let hdr = self.fb.load(hdr_addr, IrType::Ptr);
+        self.fb.vtable_base(hdr)
+    }
+
+    /// RF-T2: the runtime type-id from an object's `$header` — `%ClassVData`
+    /// field 0 (`i32 mType`). The companion of [`Self::load_vtable_base`]; reads
+    /// the header via the same raw offset-0 GEP, then `load_type_id` (a struct-
+    /// GEP into `%ClassVData` field 0, loaded as i32). Sema does not yet emit
+    /// this for any program — `GetType()` wiring is RF-T5 — so it is allowed to
+    /// be unused until then.
+    #[allow(dead_code)]
+    fn load_type_id(&mut self, obj: Value) -> Value {
+        self.fb.load_type_id(obj)
+    }
+
     /// Emit an interface dispatch on an already-evaluated body pointer
     /// (itables.md §5/§5.6 / §5 T6). `body_ptr` is the object pointer whose
     /// *static* type is the interface `iface_id`; `mname` names a method in
@@ -9124,13 +9178,11 @@ impl<'a> Lowerer<'a> {
         let sig = self.structs.imethods[iface_id.0 as usize][midx].1.clone();
         let base_slot = self.structs.iface_slot_base[&iface_id];
         let slot = base_slot + midx;
-        // Header is at offset 0. An interface has an EMPTY StructDef (no
-        // `$header` field), so use a RAW pointer-indexed GEP (`elem_addr`
-        // body_ptr[0] : Ptr), NOT `field_addr` through the interface id.
-        let hdr = self
-            .fb
-            .elem_addr(body_ptr.clone(), IrType::Ptr, Value::int(0, IrType::I64));
-        let vtbl = self.fb.load(hdr, IrType::Ptr);
+        // RF-T2: route through `load_vtable_base` (reads `$header`, struct-GEPs
+        // `%ClassVData` field 1) so the slot index is relative to the vtable
+        // array, not the ClassVData header. `body_ptr` may be interface-typed
+        // (empty StructDef) — `load_vtable_base` uses a raw offset-0 GEP.
+        let vtbl = self.load_vtable_base(body_ptr.clone());
         let slotp = self
             .fb
             .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
@@ -9283,12 +9335,13 @@ impl<'a> Lowerer<'a> {
             }
             // Virtual dispatch: if the method occupies a vtable slot on the
             // receiver's static type, call through the object's `$header` vtable
-            // (the runtime type) so an override runs; else a direct call.
+            // (the runtime type) so an override runs; else a direct call. RF-T2:
+            // route through `load_vtable_base` (struct-GEP `%ClassVData` field 1)
+            // so the slot index is relative to the vtable array, not the header.
             if sig.is_instance
                 && let Some(&slot) = self.structs.vslots[owner_id.0 as usize].get(mname)
             {
-                let hdr = self.fb.field_addr(body_ptr, owner_id, 0);
-                let vtbl = self.fb.load(hdr, IrType::Ptr);
+                let vtbl = self.load_vtable_base(body_ptr);
                 let slotp =
                     self.fb
                         .elem_addr(vtbl, IrType::Ptr, Value::int(slot as i128, IrType::I64));
@@ -9423,12 +9476,13 @@ impl<'a> Lowerer<'a> {
                 }
                 call_args.extend(self.finish_args(&formal, sig.variadic, partial, args, src));
                 // Virtual dispatch through the object's vtable when the method
-                // occupies a slot on the receiver's static type; else a direct call.
+                // occupies a slot on the receiver's static type; else a direct
+                // call. RF-T2: route through `load_vtable_base` (struct-GEP
+                // `%ClassVData` field 1) — the slot-shift fix.
                 if sig.is_instance
                     && let Some(&vslot) = structs.vslots[owner_id.0 as usize].get(mname)
                 {
-                    let hdr = self.fb.field_addr(body_ptr, owner_id, 0);
-                    let vtbl = self.fb.load(hdr, IrType::Ptr);
+                    let vtbl = self.load_vtable_base(body_ptr);
                     let slotp = self.fb.elem_addr(
                         vtbl,
                         IrType::Ptr,
@@ -10820,8 +10874,9 @@ mod tests {
     /// implemented interface's methods into the class vtable at the global
     /// per-interface slot base.
     ///   - `Square` (no `virtual` of its own) gets a NON-EMPTY `vimpls` with its
-    ///     `Area` impl symbol at `iface_slot_base[IShape]` (so a vtable global is
-    ///     emitted for an otherwise-vtableless interface-only class);
+    ///     `Area` impl symbol at `iface_slot_base[IShape]` (RF-T2: every
+    ///     `StructKind::Ref` gets a ClassVData global regardless, but this still
+    ///     proves the interface-only class's vtable array is non-empty);
     ///   - `iface_slot_base[I] >= N` (the global class-vtable max) — the bounds
     ///     keystone that keeps no interface block overlapping a class block;
     ///   - `class C : Base, IFace` whose `IFace.M` is satisfied PURELY by an
@@ -10870,7 +10925,8 @@ mod tests {
         }
 
         // Square has NO virtual of its own, yet `apply_itables` gives it a
-        // non-empty vimpls — so `emit_vtables` emits a `Square$vtable` global.
+        // non-empty vimpls — so its `Square.$cvdata` ClassVData global carries a
+        // non-empty `[N x ptr]` vtable array (RF-T2 `emit_classvdata`).
         let sq_base = t.iface_slot_base[&ishape];
         assert!(
             !t.vimpls[square.0 as usize].is_empty(),

@@ -49,15 +49,26 @@ use newbf_ir::{
 pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> {
     let module = ctx.create_module(&ir.name);
     let builder = ctx.create_builder();
+    // RF-T2: the canonical `%ClassVData = { i32 mType, [0 x ptr] }` GEP type.
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    let classvdata_ty = ctx.opaque_struct_type("ClassVData");
+    classvdata_ty.set_body(
+        &[
+            ctx.i32_type().into(),
+            ptr_ty.array_type(0).into(),
+        ],
+        false,
+    );
     let mut cg = Codegen {
         ctx,
         module: &module,
         builder: &builder,
         struct_types: Vec::new(),
+        classvdata_ty,
     };
     cg.build_struct_types(ir);
     cg.declare_all(ir);
-    cg.emit_vtables(ir);
+    cg.emit_classvdata(ir);
     cg.emit_globals(ir);
     for f in &ir.funcs {
         if !f.is_extern {
@@ -93,6 +104,15 @@ struct Codegen<'ctx, 'a> {
     /// LLVM struct types indexed by `StructId.0`, built up front so any field
     /// can reference any struct (incl. forward/self refs).
     struct_types: Vec<StructType<'ctx>>,
+    /// RF-T2: the canonical `%ClassVData = { i32 mType, [0 x ptr] }` struct
+    /// type used to GEP an object's `$header`. The `[0 x ptr]` array makes
+    /// field 1 (the vtable base) sit at offset 8 (i32 + 4 pad → 8-aligned
+    /// array) — the SAME offset as any concrete `{ i32, [N x ptr] }`, since the
+    /// pointer array's alignment forces identical padding regardless of N. So a
+    /// struct-GEP through this one type reaches the vtable base of every class
+    /// (LLVM computes the padded offset; no hand-rolled byte offset). `mType`
+    /// (field 0) is read as i32 for `LoadTypeId`.
+    classvdata_ty: StructType<'ctx>,
 }
 
 impl<'ctx> Codegen<'ctx, '_> {
@@ -212,11 +232,20 @@ impl<'ctx> Codegen<'ctx, '_> {
         self.module.add_function(name, fty, None)
     }
 
-    /// Emit each class vtable as a constant global array of function pointers.
-    /// Functions are already declared, so each slot resolves to its pointer
-    /// (a missing entry — e.g. an abstract slot — becomes null).
-    fn emit_vtables(&self, ir: &IrModule) {
+    /// RF-T2: emit each class's ClassVData as a constant
+    /// `%ClassVData.<T> = { i32 mType, [N x ptr] vtbl }` global — the single
+    /// canonical per-class header object (replacing the bare `[N x ptr]` vtable
+    /// array). `mType` is `VtableDef.type_id` (the dense reflection type-id; 0
+    /// at RF-T2 — RF-T3 fills real ids). The `[N x ptr]` slots resolve from the
+    /// already-declared functions (a missing entry — an abstract/null slot —
+    /// becomes null). `new` stores `&<global>` into every object's `$header`;
+    /// virtual/interface dispatch reaches the vtable via a struct-GEP into
+    /// field 1 (`load_vtable_base` → `VtableBase`), so the `{i32, pad}` prefix
+    /// never causes a physical slot-shift. Every `StructKind::Ref` id has one
+    /// (entries empty ⇒ `{ i32, [0 x ptr] }`).
+    fn emit_classvdata(&self, ir: &IrModule) {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let i32_ty = self.ctx.i32_type();
         for vt in &ir.vtables {
             let entries: Vec<PointerValue<'ctx>> = vt
                 .entries
@@ -228,11 +257,19 @@ impl<'ctx> Codegen<'ctx, '_> {
                         .unwrap_or_else(|| ptr_ty.const_null())
                 })
                 .collect();
+            let arr_ty = ptr_ty.array_type(entries.len() as u32);
             let arr = ptr_ty.const_array(&entries);
-            let g = self
-                .module
-                .add_global(ptr_ty.array_type(entries.len() as u32), None, &vt.name);
-            g.set_initializer(&arr);
+            // The concrete per-class struct type `{ i32, [N x ptr] }`. Field 1
+            // sits at offset 8 for any N (i32 + 4 pad → 8-aligned array), so it
+            // is GEP-compatible with the canonical `%ClassVData` ({ i32, [0 x
+            // ptr] }) `VtableBase`/`LoadTypeId` index through.
+            let cvdata_ty = self
+                .ctx
+                .struct_type(&[i32_ty.into(), arr_ty.into()], false);
+            let mtype = i32_ty.const_int(vt.type_id as u64, false);
+            let init = cvdata_ty.const_named_struct(&[mtype.into(), arr.into()]);
+            let g = self.module.add_global(cvdata_ty, None, &vt.name);
+            g.set_initializer(&init);
             g.set_constant(true);
         }
     }
@@ -532,12 +569,41 @@ impl<'ctx> Codegen<'ctx, '_> {
             InstKind::SizeOf { struct_id } => self.struct_types[struct_id.0 as usize]
                 .size_of()
                 .map(Into::into),
-            // RF-T1 plumbing-only: no pass emits `LoadTypeId` yet (sema starts
-            // emitting it for `obj.GetType()` in RF-T5), so this arm is never
-            // reached by any corpus program. RF-T5 replaces it with the real
-            // lowering (load `$header` → `ClassVData` field 0 as i32).
-            InstKind::LoadTypeId { .. } => {
-                unimplemented!("LoadTypeId lowering is RF-T5")
+            // RF-T2: the vtable base from a loaded `$header` (a `%ClassVData*`).
+            // A struct-GEP into `%ClassVData` field 1 — LLVM computes the padded
+            // offset (8: i32 + 4 pad → 8-aligned `[N x ptr]`), the SAME for any
+            // N, so this canonical-type GEP reaches every class's vtable base.
+            // Never a hand-rolled byte offset.
+            InstKind::VtableBase { hdr } => {
+                let h = self.as_ptr(self.value_of(hdr, results, llvm_fn)?);
+                self.builder
+                    .build_struct_gep(self.classvdata_ty, h, 1, "vtbl")
+                    .ok()
+                    .map(Into::into)
+            }
+            // RF-T2: the runtime type-id from an object's `$header` — load the
+            // `$header` ptr from `obj` field 0 (raw offset-0 GEP, so it also
+            // works for interface-typed `obj` with an empty StructDef), then
+            // struct-GEP `%ClassVData` field 0 and `load i32` (the mType word).
+            // Result is i32 (the registry index width — never i64). Wired by
+            // sema for `obj.GetType()` in RF-T5; lowered here now so the inst is
+            // complete and the helper is exercisable.
+            InstKind::LoadTypeId { obj } => {
+                let o = self.as_ptr(self.value_of(obj, results, llvm_fn)?);
+                let hdr = self
+                    .builder
+                    .build_load(self.ctx.ptr_type(AddressSpace::default()), o, "hdr")
+                    .unwrap();
+                let hdrp = self.as_ptr(hdr);
+                let slot = self
+                    .builder
+                    .build_struct_gep(self.classvdata_ty, hdrp, 0, "mtypep")
+                    .ok()?;
+                Some(
+                    self.builder
+                        .build_load(self.ctx.i32_type(), slot, "mtype")
+                        .unwrap(),
+                )
             }
             InstKind::ElemAddr { base, elem, index } => {
                 let basep = self.as_ptr(self.value_of(base, results, llvm_fn)?);
@@ -1127,5 +1193,140 @@ mod tests {
         let ir = lower_to_string(&m);
         assert!(ir.contains("fmul double"), "{ir}");
         assert!(ir.contains("fadd double"), "{ir}");
+    }
+
+    /// RF-T2 SLOT-SHIFT DETECTOR (R2). The ONLY IR-level guard against a
+    /// verify-clean physical vtable slot-shift: the verify corpus and the itable
+    /// invariant harness operate on the logical slot model and CANNOT see the
+    /// `{ i32 mType, pad }` ClassVData prefix shifting every slot. This pins
+    /// both halves of the ABI:
+    ///   (a) the emitted ClassVData global is `%ClassVData = { i32, [N x ptr] }`
+    ///       — `i32 mType` FIRST, then the `[N x ptr]` vtable array;
+    ///   (b) a virtual/interface dispatch GEPs **field 1** (`i32 0, i32 1`) of
+    ///       the canonical `%ClassVData` type to reach the vtable base — NOT
+    ///       field 0 (which would dispatch through the type-id word).
+    /// A regression that drops the `i32` prefix, GEPs field 0, or emits a bare
+    /// `[N x ptr]` array trips this even when the run-corpus happens to miss the
+    /// affected class shape.
+    #[test]
+    fn classvdata_shape_and_field1_dispatch_emit() {
+        use newbf_ir::{FieldDef, StructDef, VtableDef};
+
+        let mut m = IrModule::new("t");
+        // class C { ptr $header; i32 x; } — field 0 is the $header (a
+        // ClassVData*), exactly as sema lays out a `StructKind::Ref`.
+        let c = m.add_struct(StructDef {
+            name: "C".into(),
+            fields: vec![
+                FieldDef {
+                    name: "$header".into(),
+                    ty: IrType::Ptr,
+                },
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        // Two virtual-slot impls so N = 2 ⇒ the vtable array is `[2 x ptr]`.
+        for sym in ["C.M0", "C.M1"] {
+            let g = FunctionBuilder::new(sym, vec![], IrType::I32);
+            m.add_function(g.finish());
+        }
+        // The ClassVData for C: `{ i32 mType (=0), [2 x ptr] }`.
+        m.add_vtable(VtableDef {
+            name: "C.$cvdata".into(),
+            entries: vec!["C.M0".into(), "C.M1".into()],
+            type_id: 0,
+        });
+
+        // A function doing a virtual dispatch on a `C*` receiver, exactly as
+        // sema's `load_vtable_base`: load `$header` (offset-0 ptr GEP), VtableBase
+        // (struct-GEP %ClassVData field 1), index slot 1, load + call_indirect.
+        let mut f = FunctionBuilder::new(
+            "dispatch",
+            vec![Param {
+                name: Some("obj".into()),
+                ty: IrType::Ref(c),
+            }],
+            IrType::I32,
+        );
+        let obj = f.param(0);
+        let hdr_addr = f.elem_addr(obj.clone(), IrType::Ptr, Value::int(0, IrType::I64));
+        let hdr = f.load(hdr_addr, IrType::Ptr);
+        let vtbl = f.vtable_base(hdr);
+        let slotp = f.elem_addr(vtbl, IrType::Ptr, Value::int(1, IrType::I64));
+        let fnptr = f.load(slotp, IrType::Ptr);
+        let r = f.call_indirect(fnptr, vec![obj], IrType::I32);
+        f.ret(Some(r));
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("ClassVData dispatch module verifies");
+        let ir = lower_to_string(&m);
+
+        // (a) The canonical %ClassVData GEP type leads with i32, then the
+        // pointer array — the type-id word FIRST.
+        assert!(
+            ir.contains("%ClassVData = type { i32, [0 x ptr] }"),
+            "canonical ClassVData GEP type must be {{ i32, [0 x ptr] }}:\n{ir}"
+        );
+        // (a) The emitted per-class global is `{ i32, [2 x ptr] }` (N = 2).
+        assert!(
+            ir.contains("@\"C.$cvdata\" = constant { i32, [2 x ptr] }"),
+            "ClassVData global must have shape {{ i32, [2 x ptr] }}:\n{ir}"
+        );
+        // (b) Dispatch GEPs FIELD 1 of %ClassVData (i32 0, i32 1) — the vtable
+        // base, past the mType word. A field-0 GEP here would be the slot-shift.
+        // (LLVM may print the GEP `inbounds`/`inbounds nuw`; match on the type +
+        // the field-1 index pair, which together pin the struct-GEP into field 1.)
+        assert!(
+            ir.contains("%ClassVData, ptr %load, i32 0, i32 1"),
+            "dispatch must struct-GEP %ClassVData field 1 (i32 0, i32 1):\n{ir}"
+        );
+    }
+
+    /// RF-T2 companion: `LoadTypeId` lowers to a load of `%ClassVData` field 0
+    /// (`i32 mType`) — the type-id read GEPs field 0, the COMPLEMENT of the
+    /// dispatch field-1 GEP. (Sema wires `obj.GetType()` to this in RF-T5; the
+    /// lowering is complete now so the helper is exercisable.)
+    #[test]
+    fn load_type_id_reads_classvdata_field0_i32() {
+        use newbf_ir::{FieldDef, StructDef};
+
+        let mut m = IrModule::new("t");
+        let c = m.add_struct(StructDef {
+            name: "C".into(),
+            fields: vec![
+                FieldDef {
+                    name: "$header".into(),
+                    ty: IrType::Ptr,
+                },
+                FieldDef {
+                    name: "x".into(),
+                    ty: IrType::I32,
+                },
+            ],
+        });
+        let mut f = FunctionBuilder::new(
+            "tid",
+            vec![Param {
+                name: Some("obj".into()),
+                ty: IrType::Ref(c),
+            }],
+            IrType::I32,
+        );
+        let obj = f.param(0);
+        let id = f.load_type_id(obj);
+        f.ret(Some(id));
+        m.add_function(f.finish());
+
+        verify_module(&m).expect("LoadTypeId module verifies");
+        let ir = lower_to_string(&m);
+        // field 0 GEP (i32 0, i32 0) then a 32-bit load — the mType word.
+        assert!(
+            ir.contains("%ClassVData, ptr %hdr, i32 0, i32 0"),
+            "LoadTypeId must struct-GEP %ClassVData field 0 (i32 0, i32 0):\n{ir}"
+        );
+        assert!(ir.contains("load i32"), "LoadTypeId loads i32 (the type-id):\n{ir}");
     }
 }

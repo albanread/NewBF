@@ -188,6 +188,20 @@ impl FunctionBuilder {
         self.emit(InstKind::CallIndirect { callee, args }, ret, None)
     }
 
+    /// The vtable base from a loaded `$header` value (a `%ClassVData*`): a
+    /// struct-GEP into `%ClassVData` field 1 (the `[N x ptr]` vtable array).
+    /// Result `ptr`. Vtable slot `k` is then `elem_addr(base, Ptr, k)`.
+    pub fn vtable_base(&mut self, hdr: Value) -> Value {
+        self.emit(InstKind::VtableBase { hdr }, IrType::Ptr, None)
+    }
+
+    /// The runtime type-id from an object's `$header`: `%ClassVData` field 0
+    /// loaded as **i32**. `obj` is a `Ref(_)` heap instance (its field 0 is the
+    /// `$header`). Result `I32`.
+    pub fn load_type_id(&mut self, obj: Value) -> Value {
+        self.emit(InstKind::LoadTypeId { obj }, IrType::I32, None)
+    }
+
     pub fn phi(&mut self, incomings: Vec<(BlockId, Value)>, ty: IrType) -> Value {
         self.emit(InstKind::Phi { incomings }, ty, None)
     }

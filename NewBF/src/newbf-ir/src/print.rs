@@ -156,6 +156,7 @@ impl Printer<'_> {
             } => format!("fieldaddr %s{}, {}, {field}", struct_id.0, self.value(base)),
             InstKind::SizeOf { struct_id } => format!("sizeof %s{}", struct_id.0),
             InstKind::LoadTypeId { obj } => format!("loadtypeid {}", self.value(obj)),
+            InstKind::VtableBase { hdr } => format!("vtablebase {}", self.value(hdr)),
             InstKind::ElemAddr { base, elem, index } => format!(
                 "elemaddr {}, {}, {}",
                 elem.mnemonic(),

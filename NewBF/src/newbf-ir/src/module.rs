@@ -26,12 +26,17 @@ pub struct StructDef {
     pub fields: Vec<FieldDef>,
 }
 
-/// A class vtable: a named global holding an ordered array of function
-/// pointers (one per virtual slot). `new` stores its address into the object's
-/// `$header`; a virtual call loads the slot and calls it indirectly.
+/// A class ClassVData: a named global `%ClassVData = { i32 mType, [N x ptr] }`
+/// holding the dense type-id word plus an ordered array of virtual-slot function
+/// pointers. RF-T2: `new` stores its address into the object's `$header` (every
+/// `StructKind::Ref` id gets one — entries empty ⇒ `[0 x ptr]`); a virtual /
+/// interface call reaches the vtable via a struct-GEP into field 1
+/// (`VtableBase`) then loads the slot and calls it indirectly. (Pre-RF-T2 this
+/// was a bare `[N x ptr]` array; the `i32 mType` prefix shifted every slot, so
+/// all dispatch routes through `VtableBase`.)
 #[derive(Clone, PartialEq, Debug)]
 pub struct VtableDef {
-    /// Global symbol name (e.g. `"Dog$vtable"`), referenced by `GlobalAddr`.
+    /// Global symbol name (e.g. `"Dog.$cvdata"`), referenced by `GlobalAddr`.
     pub name: String,
     /// Slot → implementing function name, in slot order.
     pub entries: Vec<String>,

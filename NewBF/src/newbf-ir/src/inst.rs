@@ -286,6 +286,16 @@ pub enum InstKind {
     LoadTypeId {
         obj: Value,
     },
+    /// The vtable base address from a `$header` pointer. `hdr` is a loaded
+    /// `$header` value (a `%ClassVData*`); the result is a `ptr` to the
+    /// `[N x ptr]` vtable array (RF-T2: `%ClassVData = { i32 mType, [N x ptr] }`,
+    /// so this is a struct-typed GEP into field 1 — the backend computes the
+    /// padded offset, never a hand-rolled byte offset). Vtable slot `k` is then
+    /// `elem_addr(result, Ptr, k)`. Routes every virtual/interface dispatch so
+    /// the `{i32, pad}` ClassVData prefix never causes a physical slot-shift.
+    VtableBase {
+        hdr: Value,
+    },
     /// A trap intrinsic. `debug: true` is a resumable breakpoint
     /// (`int3` / `@llvm.debugtrap`) — a Vectored/SEH handler can catch it,
     /// dump the stack, and continue. `debug: false` is a fatal illegal
