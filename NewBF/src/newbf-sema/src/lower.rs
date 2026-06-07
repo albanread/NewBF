@@ -3446,11 +3446,8 @@ struct MethodSig {
 /// `src` is unused in the first slice but kept in the signature: when
 /// `Expr::Named` (named call args) lands, this is the one place to look through
 /// `Named` to its value (§5.1 / §10).
-// TA-1 lands this classifier as the feature foundation; its first *production*
-// caller is the `has_pending` fork wired at the call sites in TA-2/TA-3. Until
-// then it is exercised only by the `arg_is_pending_classifies_dot_forms` unit
-// test, so `allow(dead_code)` keeps the build warning-clean (the standing gate).
-#[allow(dead_code)]
+// TA-1 lands this classifier as the feature foundation; TA-3 wires its first
+// production caller — the `has_pending` fork at the head of `lower_method_call`.
 fn arg_is_pending(e: &Expr, _src: &str) -> bool {
     match e {
         // bare `.Case`
@@ -3503,10 +3500,7 @@ enum ArgShape<'a> {
 /// shorthand is the `Call(DotIdent ".")` form; any other `Call(DotIdent name)`
 /// or a bare `DotIdent` is a case form (named `name`); a `DotIdent`-based
 /// `Initializer` is `.{ … }`.
-// Wired into the call sites' `has_pending` fork in TA-3 (via `lower_args_phase1`);
-// until then exercised only by the TA-2 unit tests, so `allow(dead_code)` keeps
-// the build warning-clean (the standing gate).
-#[allow(dead_code)]
+// Wired into the call sites' `has_pending` fork in TA-3 (via `lower_args_phase1`).
 fn pending_kind<'a>(e: &'a Expr, src: &'a str) -> Option<PendingKind<'a>> {
     match e {
         // bare `.Case`
@@ -6132,10 +6126,7 @@ impl<'a> Lowerer<'a> {
     ///
     /// Runs **exactly once** per call site (the resolved sub-path then calls
     /// `finish_args` once), so a pending arg is never lowered during a non-taken
-    /// resolution probe. Wired into the call sites in TA-3+.
-    // Unused until the call sites are forked in TA-3+; `allow(dead_code)` keeps the
-    // build warning-clean (exercised by the TA-2 unit tests only).
-    #[allow(dead_code)]
+    /// resolution probe. Wired into `lower_method_call`'s `has_pending` fork (TA-3).
     fn lower_args_phase1<'e>(
         &mut self,
         args: &'e [Expr],
@@ -6175,10 +6166,8 @@ impl<'a> Lowerer<'a> {
     /// unguarded `formal[i]` OOB. **Diagnostic recovery (§3.4):** a pending slot
     /// whose resolved param can't be target-typed recovers with `undef(param_ty)`
     /// (the *param* type, never a silent `undef(I64)` that would mis-coerce into a
-    /// struct slot). Runs **exactly once** per call. Wired into call sites in TA-3+.
-    // Unused until the call sites are forked in TA-3+; `allow(dead_code)` keeps the
-    // build warning-clean (exercised by the TA-2 unit tests only).
-    #[allow(dead_code)]
+    /// struct slot). Runs **exactly once** per call. Wired into `lower_method_call`'s
+    /// `has_pending` fork (TA-3).
     fn finish_args(
         &mut self,
         formal: &[IrType],
@@ -7812,6 +7801,16 @@ impl<'a> Lowerer<'a> {
         args: &[Expr],
         src: &str,
     ) -> (Value, IrType) {
+        // TA-3 fork (§3.7): the hot path is "no pending args" — a single O(args)
+        // syntactic scan gates the whole two-phase machinery. When any arg is a
+        // target-typed dot-form (`.(…)` / `.{ }` / `.Case[(…)]`), divert to the
+        // pending-aware lowerer (which shares ONE phase-1 + ONE finish_args across
+        // the base/static/instance sub-paths). Otherwise the existing eager path
+        // below runs verbatim — byte-identical to pre-TA-3 — so the run/verify/
+        // parser corpora (no pending args) are behavior-preserved.
+        if args.iter().any(|a| arg_is_pending(a, src)) {
+            return self.lower_method_call_pending(base, mname, args, src);
+        }
         // Evaluate arguments once: their types drive overload selection, their
         // values feed whichever site resolves. (Static and instance sites are
         // mutually exclusive — a type name isn't a receiver and vice versa — so
@@ -7939,6 +7938,150 @@ impl<'a> Lowerer<'a> {
             return (r, sig.ret);
         }
         // Unresolved — arguments were already evaluated for their effects.
+        (undef(IrType::I64), IrType::I64)
+    }
+
+    /// The `has_pending` fork of [`Self::lower_method_call`] (TA-3, §3.1/§3.8 #1):
+    /// the call has at least one target-typed dot-form arg (`.(…)` / `.{ }` /
+    /// `.Case[(…)]`) whose `IrType` is the formal param's, only known after
+    /// overload resolution.
+    ///
+    /// **Two-phase, single emission (the crux):**
+    /// - [`Self::lower_args_phase1`] runs **exactly once** at the top: it lowers
+    ///   every *concrete* arg eagerly in source order into a sparse `partial`
+    ///   cache (a `None` hole at each pending slot) and builds the sparse `shapes`
+    ///   vector. The base/static/instance sub-paths all **share** this one cache +
+    ///   shape vector — a pending arg is never lowered during a non-taken
+    ///   sub-path's resolution probe (`pick_overload_partial` only reads `shapes`).
+    /// - The resolving sub-path then calls [`Self::finish_args`] **exactly once**:
+    ///   it walks `0..n` in source order, takes each concrete slot's cached value
+    ///   (coerced to its resolved param) and lowers each pending slot NOW against
+    ///   its resolved param type, then packs variadics. So each pending arg is
+    ///   constructed exactly once (no double-emit) and the receiver `this` is
+    ///   prepended exactly as the eager path does.
+    ///
+    /// **Ordering rule (§3.1, correctness blocker #1):** concrete args emit in
+    /// Phase 1 in source order; pending args emit in Phase 2 in source order. The
+    /// only observable reorder vs the eager path is that a pending arg's
+    /// construction side effects are observed AFTER all concrete args of the same
+    /// call (a documented caveat — `targ_eval_order.bf` pins the concrete-args
+    /// guarantee). We do NOT claim full eval-order equivalence.
+    ///
+    /// **SSA dominance (§5.4, blocker #3):** every value (Phase-1 concrete and
+    /// Phase-2 pending constructions alike) is emitted into the *current* block —
+    /// the constructors (`construct_value_struct` / `build_enum_value` /
+    /// `lower_initializer`) only alloca/store/call in place, never branch — so the
+    /// fully-assembled `call_args` all dominate the single terminal `call`. For a
+    /// null-conditional `a?.M(.(…))` the current block is the `nonnull` block
+    /// (`lower_conditional_call` switched into it before calling here), which
+    /// dominates the call, so the pending construction stays on the non-null path.
+    fn lower_method_call_pending(
+        &mut self,
+        base: &Expr,
+        mname: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        // Phase 1 — ONCE. Concrete args lowered in source order into holes; the
+        // sparse `shapes` drive resolution across ALL three sub-paths below.
+        let (partial, shapes) = self.lower_args_phase1(args, src);
+        // `self.structs` is a shared `&'a StructTable` (lifetime independent of
+        // `self`), so copying the reference lets resolution read it without
+        // holding a `self` borrow across the later `&mut self` `finish_args` call.
+        let structs: &StructTable = self.structs;
+
+        // `base.Method(args)`: a direct (non-virtual) call to the nearest base
+        // class's `Method`, with the current `this`. Mirrors the eager base path,
+        // but resolves with the shared shapes and emits the final args via
+        // `finish_args` (pending slots lowered against the resolved param types).
+        if let Expr::Base(_) = base
+            && let Some((slot, this_ty @ IrType::Ref(cur_id))) = self.this_slot.clone()
+        {
+            let mut bid = structs.bases[cur_id.0 as usize];
+            while let Some(id) = bid {
+                let sig = structs.methods[id.0 as usize]
+                    .get(mname)
+                    .and_then(|cands| pick_overload_partial(cands, &shapes, true, structs))
+                    .cloned();
+                if let Some(sig) = sig {
+                    let this_v = self.fb.load(slot, this_ty);
+                    // Instance method: formal params exclude the leading `this`.
+                    let formal: Vec<IrType> = sig.params[1..].to_vec();
+                    let mut call_args = vec![this_v];
+                    call_args.extend(self.finish_args(&formal, sig.variadic, partial, args, src));
+                    let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                    return (r, sig.ret);
+                }
+                bid = structs.bases[id.0 as usize];
+            }
+        }
+
+        // Qualified static call `Type.Method(args)`: the base names a registered
+        // type (not a local). `members: false` keeps only static overloads.
+        if let Expr::Ident(s) = base {
+            let name = s.text(src);
+            if self.lookup(name).is_none()
+                && let Some(&id) = structs.by_name.get(name)
+            {
+                let sig = structs.methods[id.0 as usize]
+                    .get(mname)
+                    .and_then(|cands| pick_overload_partial(cands, &shapes, false, structs))
+                    .cloned();
+                if let Some(sig) = sig {
+                    // Static method: formals are the whole param list (no `this`).
+                    let formal: Vec<IrType> = sig.params.clone();
+                    let call_args = self.finish_args(&formal, sig.variadic, partial, args, src);
+                    let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                    return (r, sig.ret);
+                }
+            }
+        }
+
+        // Instance call `obj.Method(args)` / `this.Method(args)`. `members: true`
+        // admits instance overloads (matched past `this`) and statics. (Interface
+        // dispatch with a pending arg is out of the first slice — an abstract
+        // interface method has no body to target against here; such a call falls
+        // through to the unresolved diagnostic below rather than mis-dispatching.)
+        if let Some((body_ptr, owner_id)) = self.struct_base(base, src) {
+            let sig = structs.methods[owner_id.0 as usize]
+                .get(mname)
+                .and_then(|cands| pick_overload_partial(cands, &shapes, true, structs))
+                .cloned();
+            if let Some(sig) = sig {
+                // Formals exclude `this` for an instance method; a static method
+                // reached through an instance receiver takes the whole list.
+                let formal: Vec<IrType> = if sig.is_instance {
+                    sig.params[1..].to_vec()
+                } else {
+                    sig.params.clone()
+                };
+                let mut call_args = Vec::new();
+                if sig.is_instance {
+                    call_args.push(body_ptr.clone());
+                }
+                call_args.extend(self.finish_args(&formal, sig.variadic, partial, args, src));
+                // Virtual dispatch through the object's vtable when the method
+                // occupies a slot on the receiver's static type; else a direct call.
+                if sig.is_instance
+                    && let Some(&vslot) = structs.vslots[owner_id.0 as usize].get(mname)
+                {
+                    let hdr = self.fb.field_addr(body_ptr, owner_id, 0);
+                    let vtbl = self.fb.load(hdr, IrType::Ptr);
+                    let slotp = self.fb.elem_addr(
+                        vtbl,
+                        IrType::Ptr,
+                        Value::int(vslot as i128, IrType::I64),
+                    );
+                    let fnptr = self.fb.load(slotp, IrType::Ptr);
+                    let r = self.fb.call_indirect(fnptr, call_args, sig.ret);
+                    return (r, sig.ret);
+                }
+                let r = self.fb.call(sig.full_name, call_args, sig.ret);
+                return (r, sig.ret);
+            }
+        }
+        // Unresolved — concrete args were already evaluated for their effects in
+        // Phase 1 (matching the eager path's "args already evaluated" behavior).
         (undef(IrType::I64), IrType::I64)
     }
 
