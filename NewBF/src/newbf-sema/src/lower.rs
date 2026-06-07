@@ -65,6 +65,40 @@ enum AllocKind {
     Raw,
 }
 
+/// One `scope`-allocated instance tracked for automatic dtor+free at frame exit
+/// (MS-T4). Each `scope` alloc is recorded in **exactly one** of these variants
+/// — never both — so it is freed *exactly once* on every exit edge (the Stomp
+/// guard on the run-corpus is the live exactly-once detector: a double-free
+/// aborts, a use-after-free faults).
+#[derive(Clone)]
+enum ScopeAlloc {
+    /// The alloc **dominates** the frame's exit (it ran at statement level in the
+    /// frame's entry block, so it executes on every path through the frame). The
+    /// `Value` is the object pointer itself; cleanup frees it directly.
+    /// `bind_slot` is the storage slot of the local this `scope` value was bound
+    /// to (if a simple `T x = scope T();` local), used by `lower_delete` to
+    /// de-register an explicit `delete x` so the frame doesn't free it twice.
+    Direct {
+        val: Value,
+        id: StructId,
+        bind_slot: Option<Value>,
+    },
+    /// The alloc does **not** dominate the frame exit (it ran inside an `if`
+    /// branch / nested sub-expression). `slot` is an entry-block alloca,
+    /// null-initialized in the entry block; the allocating branch stores the
+    /// object pointer into it. Cleanup loads the slot and frees only if non-null,
+    /// so the not-taken path neither leaks nor double-frees, and the original SSA
+    /// `new` value never crosses a block edge (R9: SSA dominance is satisfied by
+    /// the entry-block slot + the loaded ptr-or-null, the only cross-block values).
+    /// `bind_slot` is as for `Direct`; an explicit `delete x` stores null into
+    /// `slot` so the null-guarded frame cleanup then frees nothing.
+    Slot {
+        slot: Value,
+        id: StructId,
+        bind_slot: Option<Value>,
+    },
+}
+
 fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
     match td.kind {
         TypeKind::Struct => Some(StructKind::Value),
@@ -6100,10 +6134,14 @@ struct Lowerer<'a> {
     methods: &'a HashMap<String, Vec<MethodSig>>,
     /// Value-struct layouts, for resolving `obj.field` and struct-typed locals.
     structs: &'a StructTable,
-    /// Enclosing-loop target stack: `(continue_target, break_target)`. The
-    /// innermost loop is last; `break`/`continue` branch to it. (Loop labels
-    /// aren't honoured yet — the kernel always targets the innermost loop.)
-    loops: Vec<(BlockId, BlockId)>,
+    /// Enclosing-loop target stack: `(continue_target, break_target,
+    /// scope_allocs_depth)`. The innermost loop is last; `break`/`continue`
+    /// branch to it. `scope_allocs_depth` is `scope_allocs.len()` captured at loop
+    /// entry — MS-T4: a `break`/`continue` runs the cleanup of the frames between
+    /// the current depth and this loop boundary before branching out, so each
+    /// frame's `scope` allocs are freed exactly once on the loop-exit edge. (Loop
+    /// labels aren't honoured yet — the kernel always targets the innermost loop.)
+    loops: Vec<(BlockId, BlockId, usize)>,
     /// The `this` slot in an instance method / ctor / dtor: a stack slot
     /// holding the `Ref` to the instance body. `None` in static contexts.
     this_slot: Option<(Value, IrType)>,
@@ -6133,14 +6171,19 @@ struct Lowerer<'a> {
     /// parameter types). A bare call to one lowers to a direct call to its symbol.
     local_fns: HashMap<String, (String, IrType, Vec<IrType>)>,
     /// Per-block stacks of `scope`-allocated class instances: each frame is
-    /// `(entry block, [(pointer, class id), …])`. Heap allocations with the
-    /// lifetime of the enclosing block. Parallel to `defers`; each block frees
-    /// its own (dtor + free) on normal exit, and a `return` frees every open
-    /// frame. Only allocations made in the frame's *entry* block are tracked, so
-    /// the freed value provably dominates the exit (SSA-safe); a `scope` in a
-    /// conditional sub-expression isn't tracked and leaks (a follow-on). (Like
-    /// `defer`, `break`/`continue` out of a block doesn't yet run cleanup.)
-    scope_allocs: Vec<(BlockId, Vec<(Value, StructId)>)>,
+    /// `(entry block, [ScopeAlloc, …])`. Heap allocations with the lifetime of
+    /// the enclosing block. Parallel to `defers`; each block frees its own
+    /// (dtor then free) on normal exit, a `return` frees every open frame, and a
+    /// `break`/`continue` frees the frames between the current depth and the loop
+    /// boundary (MS-T4). An alloc that dominates the frame exit (top-level in the
+    /// frame's entry block) is recorded as `ScopeAlloc::Direct` (freed directly);
+    /// one that does not dominate (inside an `if`/nested) is recorded as
+    /// `ScopeAlloc::Slot` — an entry-block null-init slot freed only when
+    /// non-null. Each alloc is in EXACTLY one variant, so it is freed exactly once
+    /// on every exit edge (R9: only the slot ptr and loaded-ptr-or-null cross
+    /// blocks). `lower_delete` de-registers an explicitly-`delete`d scope binding
+    /// so the frame does not free it again.
+    scope_allocs: Vec<(BlockId, Vec<ScopeAlloc>)>,
     /// Locals/params whose declared type is an int-backed `enum`: name → enum
     /// name. Int-backed enums lower to `int32`, losing their identity, so this
     /// recovers it — letting a bare `.Case` pattern in `switch (x)` resolve
@@ -6204,13 +6247,37 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Emit the dtor+free for one tracked `scope` allocation. A `Direct` entry
+    /// (it dominates this exit) frees its value unconditionally; a `Slot` entry
+    /// (it may not have run) loads the entry-block slot and frees only when
+    /// non-null — `if (ptr != null) { emit_destroy(ptr) }` — so the not-taken
+    /// path neither leaks nor double-frees (R9: the loaded ptr-or-null is the only
+    /// cross-block value, the original `new` SSA value never crosses a block).
+    fn free_scope_alloc(&mut self, a: &ScopeAlloc) {
+        match a {
+            ScopeAlloc::Direct { val, id, .. } => self.emit_destroy(val.clone(), *id),
+            ScopeAlloc::Slot { slot, id, .. } => {
+                let id = *id;
+                let ptr = self.fb.load(slot.clone(), IrType::Ptr);
+                let is_set = self.fb.cmp(CmpPred::Ne, ptr.clone(), Value::Const(Const::Null));
+                let free_b = self.fb.create_block("scope.free");
+                let join_b = self.fb.create_block("scope.join");
+                self.fb.cond_br(is_set, free_b, join_b);
+                self.fb.switch_to(free_b);
+                self.emit_destroy(ptr, id);
+                self.fb.br(join_b);
+                self.fb.switch_to(join_b);
+            }
+        }
+    }
+
     /// Free the current block's `scope`-allocated instances (dtor + free), in
     /// reverse allocation order. Called on a block's normal fall-through exit.
     fn free_scope_top(&mut self) {
         if let Some((_, frame)) = self.scope_allocs.last() {
-            let allocs: Vec<(Value, StructId)> = frame.iter().rev().cloned().collect();
-            for (v, id) in allocs {
-                self.emit_destroy(v, id);
+            let allocs: Vec<ScopeAlloc> = frame.iter().rev().cloned().collect();
+            for a in &allocs {
+                self.free_scope_alloc(a);
             }
         }
     }
@@ -6218,14 +6285,21 @@ impl<'a> Lowerer<'a> {
     /// Free every open frame's `scope`-allocated instances — innermost first,
     /// reverse within each — before a `return` unwinds the function.
     fn free_all_scopes(&mut self) {
-        let allocs: Vec<(Value, StructId)> = self
-            .scope_allocs
+        self.free_scopes_down_to(0);
+    }
+
+    /// Free the `scope`-allocated instances of every frame from the top down to
+    /// (but **not** including) `depth` — innermost first, reverse within each.
+    /// MS-T4: `break`/`continue` call this with the loop's entry depth so only
+    /// the frames being exited are cleaned up, exactly once, before the `br`.
+    fn free_scopes_down_to(&mut self, depth: usize) {
+        let allocs: Vec<ScopeAlloc> = self.scope_allocs[depth..]
             .iter()
             .rev()
             .flat_map(|(_, frame)| frame.iter().rev().cloned())
             .collect();
-        for (v, id) in allocs {
-            self.emit_destroy(v, id);
+        for a in &allocs {
+            self.free_scope_alloc(a);
         }
     }
 
@@ -6362,6 +6436,20 @@ impl<'a> Lowerer<'a> {
                 let declared = ty
                     .as_ref()
                     .map(|t| lower_value_ty(t, src, self.structs, self.env));
+                // MS-T4: remember whether this local is initialized directly from a
+                // `scope T()` so we can tag the just-pushed scope-alloc entry with
+                // this local's storage slot — letting `lower_delete` de-register an
+                // explicit `delete x` of a `scope`-bound local (no double-free).
+                let init_is_scope = matches!(
+                    init,
+                    Some(Expr::Prefix {
+                        kw: PrefixKw::Scope,
+                        ..
+                    })
+                );
+                // The number of scope-alloc entries on the top frame BEFORE the
+                // initializer runs — so we can spot the entry the `scope` push adds.
+                let scope_top_len_before = self.scope_allocs.last().map_or(0, |(_, f)| f.len());
                 let (init_val, init_ty) = match init {
                     Some(e) => {
                         let (v, t) = declared
@@ -6386,7 +6474,22 @@ impl<'a> Lowerer<'a> {
                 let elem = ty
                     .as_ref()
                     .and_then(|t| pointer_elem_env(t, src, self.structs, self.env));
-                self.bind(name.text(src), slot, slot_ty, elem);
+                self.bind(name.text(src), slot.clone(), slot_ty, elem);
+                // MS-T4: if this local was initialized from a `scope T()` and the
+                // scope lowering pushed a new tracking entry onto the top frame,
+                // tag that entry with this local's storage slot so an explicit
+                // `delete x` later can de-register it (preventing a double-free
+                // between the manual delete and the frame's scope cleanup).
+                if init_is_scope
+                    && let Some((_, frame)) = self.scope_allocs.last_mut()
+                    && frame.len() > scope_top_len_before
+                    && let Some(last) = frame.last_mut()
+                {
+                    match last {
+                        ScopeAlloc::Direct { bind_slot, .. }
+                        | ScopeAlloc::Slot { bind_slot, .. } => *bind_slot = Some(slot),
+                    }
+                }
                 if let Some(t) = ty {
                     self.note_enum_local(name.text(src), t, src);
                 }
@@ -6488,7 +6591,7 @@ impl<'a> Lowerer<'a> {
                 self.fb.cond_br(cond_v, body_b, exit);
                 self.terminated = true;
                 self.switch(body_b);
-                self.loops.push((head, exit)); // continue → re-test the head
+                self.loops.push((head, exit, self.scope_allocs.len())); // continue → re-test the head
                 self.stmt(body, src);
                 self.loops.pop();
                 if !self.terminated {
@@ -6503,7 +6606,7 @@ impl<'a> Lowerer<'a> {
                 let exit = self.fb.create_block("do.exit");
                 self.fb.br(body_b);
                 self.switch(body_b);
-                self.loops.push((cond_b, exit));
+                self.loops.push((cond_b, exit, self.scope_allocs.len()));
                 self.stmt(body, src);
                 self.loops.pop();
                 if !self.terminated {
@@ -6552,7 +6655,7 @@ impl<'a> Lowerer<'a> {
                 self.terminated = true;
                 // body → cont
                 self.switch(body_b);
-                self.loops.push((cont, exit));
+                self.loops.push((cont, exit, self.scope_allocs.len()));
                 self.stmt(body, src);
                 self.loops.pop();
                 if !self.terminated {
@@ -6614,7 +6717,7 @@ impl<'a> Lowerer<'a> {
                     self.fb.cond_br(test, body_b, exit);
                     self.terminated = true;
                     self.switch(body_b);
-                    self.loops.push((cont, exit));
+                    self.loops.push((cont, exit, self.scope_allocs.len()));
                     self.stmt(body, src);
                     self.loops.pop();
                     if !self.terminated {
@@ -6667,7 +6770,7 @@ impl<'a> Lowerer<'a> {
                     let ep = self.fb.elem_addr(base, elem_ty, iv);
                     let ev = self.fb.load(ep, elem_ty);
                     self.fb.store(var_slot.clone(), ev);
-                    self.loops.push((cont, exit));
+                    self.loops.push((cont, exit, self.scope_allocs.len()));
                     self.stmt(body, src);
                     self.loops.pop();
                     if !self.terminated {
@@ -6736,7 +6839,7 @@ impl<'a> Lowerer<'a> {
                         .fb
                         .call(get_sig.full_name.clone(), vec![cv, iv], elem_ty);
                     self.fb.store(var_slot.clone(), elem);
-                    self.loops.push((cont, exit));
+                    self.loops.push((cont, exit, self.scope_allocs.len()));
                     self.stmt(body, src);
                     self.loops.pop();
                     if !self.terminated {
@@ -6753,13 +6856,22 @@ impl<'a> Lowerer<'a> {
                 }
             }
             Stmt::Break { .. } => {
-                if let Some(&(_, brk)) = self.loops.last() {
+                if let Some(&(_, brk, depth)) = self.loops.last() {
+                    // MS-T4: free the `scope` allocations of the frames being
+                    // exited (everything pushed since loop entry) before branching
+                    // out — exactly once on this exit edge, mirroring how `return`
+                    // runs `free_all_scopes`, but bounded to the loop's depth range.
+                    self.free_scopes_down_to(depth);
                     self.fb.br(brk);
                     self.terminated = true;
                 }
             }
             Stmt::Continue { .. } => {
-                if let Some(&(cont, _)) = self.loops.last() {
+                if let Some(&(cont, _, depth)) = self.loops.last() {
+                    // MS-T4: a `continue` also exits the inner frames (the current
+                    // iteration's blocks) before re-testing — free their `scope`
+                    // allocs in the same depth-bounded, exactly-once way.
+                    self.free_scopes_down_to(depth);
                     self.fb.br(cont);
                     self.terminated = true;
                 }
@@ -6791,7 +6903,7 @@ impl<'a> Lowerer<'a> {
                     .position(|a| a.pattern.is_none())
                     .map(|i| body_blocks[i])
                     .unwrap_or(exit);
-                let cont = self.loops.last().map(|&(c, _)| c).unwrap_or(exit);
+                let cont = self.loops.last().map(|&(c, _, _)| c).unwrap_or(exit);
 
                 // An int-backed enum scrutinee (e.g. a `Color` local) lowers to
                 // `int32`, so a bare `.Case` pattern needs the enum name to
@@ -6850,7 +6962,7 @@ impl<'a> Lowerer<'a> {
                         self.switch(next);
                     }
                 }
-                self.loops.push((cont, exit));
+                self.loops.push((cont, exit, self.scope_allocs.len()));
                 for i in 0..arms.len() {
                     self.switch(body_blocks[i]);
                     for s in &arms[i].body {
@@ -7469,18 +7581,43 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 let (v, t) = self.lower_new(operand, src);
-                // Auto-free at scope exit only when the allocation is at statement
-                // level (its def block dominates the block's exit). A `scope` in a
-                // conditional sub-expression (ternary/short-circuit branch) is
-                // *not* tracked — freeing it at block exit would reference a value
-                // that doesn't dominate the exit (an SSA violation) — so it leaks
-                // for now (a documented follow-on needing real lifetime analysis).
+                // MS-T4: auto-free at scope exit on EVERY edge. Split by dominance
+                // so each alloc is tracked in exactly one mechanism (never both —
+                // double-free; never zero — leak):
+                //   * the alloc DOMINATES the frame exit (it ran at statement level
+                //     in the frame's entry block) → record `Direct(v)`, freed
+                //     directly (its SSA value provably dominates every exit);
+                //   * it does NOT dominate (inside an `if` branch / nested sub-
+                //     expression) → allocate an entry-block null-init slot, store
+                //     the object pointer into it here on the allocating path, and
+                //     record `Slot` — every exit frees it only if the slot is
+                //     non-null. This satisfies SSA dominance (R9): the original
+                //     `new` value never crosses a block edge; only the slot pointer
+                //     (entry-block, dominates) and the loaded ptr-or-null do.
                 let cur = self.fb.current_block();
-                if let IrType::Ref(id) = t
-                    && let Some((entry, frame)) = self.scope_allocs.last_mut()
-                    && cur == *entry
-                {
-                    frame.push((v.clone(), id));
+                if let IrType::Ref(id) = t {
+                    let entry = self.scope_allocs.last().map(|(e, _)| *e);
+                    if let Some(entry) = entry {
+                        if cur == entry {
+                            if let Some((_, frame)) = self.scope_allocs.last_mut() {
+                                frame.push(ScopeAlloc::Direct {
+                                    val: v.clone(),
+                                    id,
+                                    bind_slot: None,
+                                });
+                            }
+                        } else {
+                            let slot = self.fb.entry_null_slot();
+                            self.fb.store(slot.clone(), v.clone());
+                            if let Some((_, frame)) = self.scope_allocs.last_mut() {
+                                frame.push(ScopeAlloc::Slot {
+                                    slot,
+                                    id,
+                                    bind_slot: None,
+                                });
+                            }
+                        }
+                    }
                 }
                 (v, t)
             }
@@ -8657,7 +8794,7 @@ impl<'a> Lowerer<'a> {
             .position(|a| a.pattern.is_none())
             .map(|i| body_blocks[i])
             .unwrap_or(exit);
-        let cont = self.loops.last().map(|&(c, _)| c).unwrap_or(exit);
+        let cont = self.loops.last().map(|&(c, _, _)| c).unwrap_or(exit);
 
         let case_idxs: Vec<usize> = (0..arms.len())
             .filter(|&i| arms[i].pattern.is_some())
@@ -8716,7 +8853,7 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        self.loops.push((cont, exit));
+        self.loops.push((cont, exit, self.scope_allocs.len()));
         for i in 0..arms.len() {
             self.switch(body_blocks[i]);
             // A fresh scope so a payload binding doesn't leak across arms.
@@ -9650,11 +9787,67 @@ impl<'a> Lowerer<'a> {
         }
         let (v, t) = self.expr(operand, src);
         if let IrType::Ref(id) = t {
-            self.emit_destroy(v, id);
+            // MS-T4: an interface-typed `Ref` has no statically-known concrete
+            // class, so its dtor chain can't be walked (`emit_destroy` indexes
+            // `structs.bases[id]` assuming a concrete class). Take the bare
+            // `newbf_free` branch — memory-correct (the block is freed), at the
+            // cost of not running the dtor (resource cleanup lands with virtual
+            // dtors through the `$header` vtable, memory-safety.md §10). This keeps
+            // an interface id from ever reaching `emit_destroy` (asserted there).
+            if is_interface(self.structs, id) {
+                self.fb.call("newbf_free", vec![v], IrType::Void);
+            } else {
+                self.emit_destroy(v, id);
+            }
         } else {
             self.fb.call("newbf_free", vec![v], IrType::Void);
         }
+        // MS-T4: de-register an explicitly-`delete`d `scope`-bound local from the
+        // open scope frames so the automatic frame cleanup does NOT free it again
+        // (a now-fatal double-free under the Stomp guard). Match the binding's
+        // storage slot recorded at `Stmt::Local`: a `Direct` entry is removed from
+        // its frame's list; a `Slot` entry has its scope slot stored `null` (so the
+        // null-guarded cleanup frees nothing) — correct even if the `delete` is on
+        // a conditional path, since the not-deleted path leaves the slot non-null.
+        if let Expr::Ident(s) = operand
+            && let Some((bind_slot, _)) = self.lookup(s.text(src))
+        {
+            self.deregister_scope_binding(&bind_slot);
+        }
         (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
+    }
+
+    /// Remove the `scope`-tracking for the local whose storage slot is `bind_slot`
+    /// (MS-T4 delete de-registration). For a `Direct` entry, drop it from its
+    /// frame's list; for a `Slot` entry, emit `store null → slot` so the
+    /// null-guarded frame cleanup is a no-op. Searches every open frame (the
+    /// deleted binding may live in an outer frame than the current point).
+    fn deregister_scope_binding(&mut self, bind_slot: &Value) {
+        // Find which frame + which entry; collect the action, then apply it
+        // (avoids holding a mutable borrow across the `store`).
+        let mut found: Option<(usize, usize)> = None;
+        for (fi, (_, frame)) in self.scope_allocs.iter().enumerate() {
+            for (ei, a) in frame.iter().enumerate() {
+                let slot = match a {
+                    ScopeAlloc::Direct { bind_slot, .. } | ScopeAlloc::Slot { bind_slot, .. } => {
+                        bind_slot.as_ref()
+                    }
+                };
+                if slot == Some(bind_slot) {
+                    found = Some((fi, ei));
+                }
+            }
+        }
+        if let Some((fi, ei)) = found {
+            match self.scope_allocs[fi].1[ei].clone() {
+                ScopeAlloc::Direct { .. } => {
+                    self.scope_allocs[fi].1.remove(ei);
+                }
+                ScopeAlloc::Slot { slot, .. } => {
+                    self.fb.store(slot, Value::Const(Const::Null));
+                }
+            }
+        }
     }
 
     /// Run a class instance's destructor chain then free it: the derived dtor
@@ -9665,6 +9858,15 @@ impl<'a> Lowerer<'a> {
     /// object base (what `newbf_alloc` returned), so it frees correctly in both
     /// Thunk (CRT free) and Stomp (ledger keyed by base) modes.
     fn emit_destroy(&mut self, v: Value, id: StructId) {
+        // MS-T4: `emit_destroy` walks the dtor chain via `structs.bases[id]`,
+        // which is only meaningful for a CONCRETE class. An interface id would
+        // mis-walk the inheritance chain — callers (`lower_delete`, scope cleanup)
+        // must route interface-typed deletes to the bare `newbf_free` branch
+        // (memory-safety.md §6/§10). Fail loud if one ever reaches here.
+        debug_assert!(
+            !is_interface(self.structs, id),
+            "emit_destroy called with interface id {id:?} — interface deletes must take the bare newbf_free branch"
+        );
         let mut seen: Vec<String> = Vec::new();
         let mut cur = Some(id);
         while let Some(cid) = cur {

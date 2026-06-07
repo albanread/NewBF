@@ -130,6 +130,40 @@ impl FunctionBuilder {
         self.emit(InstKind::Alloca { elem }, IrType::Ptr, None)
     }
 
+    /// Emit an instruction into the **entry block** (block 0), regardless of the
+    /// currently-selected block. Instruction ids are arena-global, so the result
+    /// is well-formed; appending to the entry block's `insts` list places the
+    /// instruction *before* the entry terminator (the terminator is a separate
+    /// field), so the entry block stays well-terminated. Because block 0 always
+    /// executes first and dominates every other block, the result **dominates all
+    /// uses** anywhere in the function — the property MS-T4's per-site
+    /// null-guarded scope slots rely on.
+    fn emit_in_entry(&mut self, kind: InstKind, ty: IrType) -> Value {
+        let id = InstId(self.insts.len() as u32);
+        self.insts.push(InstData { kind, ty, span: None });
+        self.blocks[0].insts.push(id);
+        Value::Inst(id)
+    }
+
+    /// Allocate a pointer-sized slot in the **entry block** and store `null` into
+    /// it there, so the slot is null-initialized on *every* path to *every* exit
+    /// (alloca does not zero memory). Returns the slot pointer (an entry-block
+    /// value that dominates all blocks). Used for MS-T4 per-site null-guarded
+    /// `scope` cleanup: a `scope` allocation inside an `if` branch stores its
+    /// object pointer here when (and only when) the branch runs, and each exit
+    /// edge frees it only if the slot is non-null.
+    pub fn entry_null_slot(&mut self) -> Value {
+        let slot = self.emit_in_entry(InstKind::Alloca { elem: IrType::Ptr }, IrType::Ptr);
+        self.emit_in_entry(
+            InstKind::Store {
+                ptr: slot.clone(),
+                val: Value::Const(Const::Null),
+            },
+            IrType::Void,
+        );
+        slot
+    }
+
     pub fn load(&mut self, ptr: Value, ty: IrType) -> Value {
         self.emit(InstKind::Load { ptr }, ty, None)
     }
