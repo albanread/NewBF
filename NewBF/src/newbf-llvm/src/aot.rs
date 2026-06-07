@@ -20,7 +20,7 @@ use inkwell::targets::{
 };
 use newbf_ir::Module as IrModule;
 
-use crate::lower::emit_module;
+use crate::lower::emit_module_aot;
 
 fn init_native_target() {
     static ONCE: Once = Once::new();
@@ -52,7 +52,10 @@ fn host_target_machine() -> Result<(TargetMachine, TargetTriple), String> {
 /// (host target). The bytes are a COFF object on Windows, ELF on Linux, etc.
 pub fn emit_object_to_memory(ir: &IrModule) -> Result<Vec<u8>, String> {
     let ctx = Context::create();
-    let module = emit_module(&ctx, ir);
+    // MS-T3b: the AOT path emits the same module the JIT does PLUS a `.CRT$XCU`
+    // guard bootstrap (install crash handler + set guard mode + register the
+    // alloc-site table) that runs before `main` — see `emit_module_aot`.
+    let module = emit_module_aot(&ctx, ir);
     let (tm, triple) = host_target_machine()?;
     // The object's triple + data layout must match the target machine or the
     // linker (and LLVM's own layout assumptions) disagree with the codegen.
@@ -70,16 +73,29 @@ pub fn emit_object(ir: &IrModule, path: &Path) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// The profile target dir where cargo emits the `newbf-runtime` staticlib,
+/// captured by `build.rs` from this crate's `OUT_DIR` (`target/<profile>/`).
+/// `link_executable` joins the OS-specific staticlib name onto it.
+const RUNTIME_LIB_DIR: &str = env!("NEWBF_RUNTIME_LIB_DIR");
+
 /// Link `objects` (+ any `extra_libs`, e.g. `"user32.lib"`) into a native
 /// console `.exe` at `output`, driving MSVC `link.exe`. The CRT entry
-/// `mainCRTStartup` runs the C `main` our codegen emits.
+/// `mainCRTStartup` runs the C `main` our codegen emits — and, before it, the
+/// `.CRT$XCU` guard bootstrap `emit_module_aot` planted (MS-T3b).
 ///
 /// `cc::windows_registry::find` locates `link.exe` with `%LIB%` populated, so
 /// the SDK/CRT import libs below resolve without a Developer Command Prompt —
-/// the same trick NewOpenDylan's driver uses. The runtime staticlib (which
-/// will provide `newbf_install_crash_handler` + the AOT entry stub) joins this
-/// arg list when it lands; for now the CRT alone suffices for a freestanding
-/// `main`.
+/// the same trick NewOpenDylan's driver uses.
+///
+/// **MS-T3b — the runtime staticlib is now live in AOT.** We link
+/// `newbf_runtime.lib` (the stomp guard + the bootstrap C-ABI:
+/// `newbf_install_crash_handler` / `newbf_set_guard_mode` /
+/// `newbf_register_alloc_sites` + the real `newbf_alloc`/`newbf_free`). Its real
+/// definitions supersede the MS-T2 `/ALTERNATENAME` bridge — so the bridge is
+/// dropped (cleaner; it was only a stand-in until the staticlib landed). The
+/// `std` the runtime uses (HashMap, atomics, stderr, VirtualAlloc) drags in the
+/// usual Win32 import libs, added to the link set below. CRT init is preserved:
+/// `/ENTRY:mainCRTStartup` is unchanged; the guard arms via `.CRT$XCU`.
 pub fn link_executable(
     objects: &[&Path],
     output: &Path,
@@ -98,18 +114,6 @@ pub fn link_executable(
     cmd.arg("/SUBSYSTEM:CONSOLE");
     cmd.arg("/ENTRY:mainCRTStartup");
     cmd.arg("/MACHINE:X64");
-    // MS-T2 bridge until MS-T3 links the runtime staticlib: the alloc path now
-    // emits `newbf_alloc`/`newbf_free` (memory-safety.md §A1). The real runtime
-    // (with the stomp guard + the `/ENTRY:newbf_entry` bootstrap) joins the link
-    // at MS-T3; until then, resolve these to the CRT thunks the guard's *default
-    // Thunk mode* already defines them as (`newbf_alloc`≡`malloc`,
-    // `newbf_free`≡`free`, mod.rs route_alloc/route_free). `/ALTERNATENAME` is a
-    // *fallback*: when MS-T3 supplies a real `newbf_alloc` definition it wins and
-    // these are ignored. On x64 the extra `type_id`/`site_id` args sit in
-    // RDX/R8, which `malloc` ignores — the size is in RCX, so the thunk is
-    // ABI-safe.
-    cmd.arg("/ALTERNATENAME:newbf_alloc=malloc");
-    cmd.arg("/ALTERNATENAME:newbf_free=free");
     // Modern Windows security defaults (link.exe warns without them).
     cmd.arg("/NXCOMPAT");
     cmd.arg("/DYNAMICBASE");
@@ -117,14 +121,30 @@ pub fn link_executable(
     // Emit a `.map` (symbol → Rva+Base) next to the exe so crash-dump IPs can
     // be named offline via `symbolicate` (our own frames, no dbghelp/PDB).
     cmd.arg(format!("/MAP:{}.map", output.display()));
-    // The CRT + kernel import libs a freestanding `main` needs; %LIB% (set by
-    // the discovered link.exe) resolves them from the SDK.
+    // The `newbf-runtime` staticlib first, so its real `newbf_alloc`/`newbf_free`
+    // + the bootstrap lifecycle resolve before any CRT fallback. The path comes
+    // from build.rs (`target/<profile>/newbf_runtime.lib`).
+    cmd.arg(format!("{RUNTIME_LIB_DIR}\\newbf_runtime.lib"));
+    // The CRT + kernel import libs a freestanding `main` needs, plus the Win32
+    // import libs Rust's `std` (linked via the runtime staticlib) requires
+    // (synchronization/process/registry/sockets/crypto). %LIB% (set by the
+    // discovered link.exe) resolves them from the SDK.
     for lib in [
         "kernel32.lib",
         "msvcrt.lib",
         "ucrt.lib",
         "vcruntime.lib",
         "legacy_stdio_definitions.lib",
+        // std (newbf-runtime) dependencies on Windows:
+        "advapi32.lib",
+        "ntdll.lib",
+        "userenv.lib",
+        "ws2_32.lib",
+        "bcrypt.lib",
+        "synchronization.lib",
+        "dbghelp.lib",
+        "ole32.lib",
+        "oleaut32.lib",
     ] {
         cmd.arg(lib);
     }
@@ -137,9 +157,13 @@ pub fn link_executable(
     if out.status.success() {
         Ok(())
     } else {
+        // link.exe writes its `LNKxxxx` diagnostics to **stdout** (not stderr),
+        // so include both — an empty message otherwise hides unresolved-external
+        // errors.
         Err(format!(
-            "link.exe failed ({}): {}",
+            "link.exe failed ({}):\nstdout: {}\nstderr: {}",
             out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ))
     }

@@ -88,6 +88,41 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
     module
 }
 
+/// Lower `ir` for the **AOT** path (MS-T3b): the same module [`emit_module`]
+/// produces, plus a `.CRT$XCU` static-initializer **guard bootstrap** that runs
+/// the runtime guard's startup sequence BEFORE the program's `main`
+/// (memory-safety.md §A7 "the AOT entry stub").
+///
+/// The JIT path keeps using [`emit_module`] (no bootstrap): each JIT host calls
+/// `install_crash_handler` / `set_guard_mode` / `register_alloc_sites_from_jit`
+/// itself in Rust (see `guard_runner` / the run-corpus harness). In AOT there is
+/// no Rust host around the program, so the bootstrap must live *in the module*.
+///
+/// **Why a `.CRT$XCU` global ctor and NOT `/ENTRY:newbf_entry`** (the load-bearing
+/// CRT-init decision): swapping `/ENTRY` would REPLACE `mainCRTStartup` and skip
+/// CRT initialization, leaving the linked Rust runtime's `std` (HashMap, atomics,
+/// stderr, VirtualAlloc via extern) running on an uninitialized CRT. Instead we
+/// KEEP `/ENTRY:mainCRTStartup` (full CRT init) and register the bootstrap in
+/// `@llvm.global_ctors`, which LLVM lowers to a `.CRT$XCU` entry — a C/C++-style
+/// global constructor the CRT runs, after CRT init, BEFORE the codegen `main`.
+pub fn emit_module_aot<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> {
+    let module = emit_module(ctx, ir);
+    let builder = ctx.create_builder();
+    let target_data = host_data_layout();
+    let cg = Codegen {
+        ctx,
+        module: &module,
+        builder: &builder,
+        struct_types: Vec::new(),
+        classvdata_ty: module
+            .get_struct_type("ClassVData")
+            .unwrap_or_else(|| ctx.opaque_struct_type("ClassVData")),
+        target_data,
+    };
+    cg.emit_aot_bootstrap(ir);
+    module
+}
+
 /// RF-T4: the host's `TargetData` (for concrete struct sizes), falling back to a
 /// standard x86-64 layout when no native target is registered. The two agree on
 /// scalar/pointer layout (the only shapes reflectable structs use), so `mSize`
@@ -660,6 +695,115 @@ impl<'ctx> Codegen<'ctx, '_> {
     /// to the bare address.
     #[cfg(not(debug_assertions))]
     fn emit_alloc_sites(&self, _ir: &IrModule) {}
+
+    /// MS-T3b: emit the AOT **guard bootstrap** — a `.CRT$XCU` static initializer
+    /// that arms the runtime memory guard BEFORE the program's `main` runs
+    /// (memory-safety.md §A5 / §A7). It calls, in order:
+    ///
+    ///   1. `newbf_install_crash_handler()` — arm the SEH crash dump so a UAF
+    ///      faults into a dump (not a silent death) and the guard's double-free
+    ///      `abort()` is diagnosed.
+    ///   2. `newbf_set_guard_mode(MODE)` — `1` (Stomp, the debug guard) when the
+    ///      **compiler** is a debug build, `0` (Thunk, plain malloc/free) in a
+    ///      release compiler. This matches the per-profile policy of §A5 and the
+    ///      debug-only `__newbf_alloc_sites` table emission above: a debug
+    ///      toolchain ships the live guard; a release toolchain ships the strip.
+    ///   3. `newbf_register_alloc_sites(&__newbf_alloc_sites, count)` — wire the
+    ///      module's site table (emitted by `emit_alloc_sites`, debug only) so a
+    ///      fault / double-free / leak report names `<function> @ file:line`
+    ///      (MS-T7's AOT half). Skipped in a release compiler (no table emitted).
+    ///
+    /// The three are runtime C-ABI symbols supplied by the linked `newbf-runtime`
+    /// **staticlib** (`aot.rs::link_executable`). The bootstrap is registered via
+    /// `@llvm.global_ctors`, which LLVM lowers to a `.CRT$XCU` pointer the CRT runs
+    /// during startup — so `/ENTRY:mainCRTStartup` (and thus full CRT init) is
+    /// preserved.
+    fn emit_aot_bootstrap(&self, ir: &IrModule) {
+        let void_ty = self.ctx.void_type();
+        let i32_ty = self.ctx.i32_type();
+        let i64_ty = self.ctx.i64_type();
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+
+        // Runtime C-ABI declarations (resolved from the linked staticlib).
+        let install = self.module.get_function("newbf_install_crash_handler").unwrap_or_else(|| {
+            self.module.add_function(
+                "newbf_install_crash_handler",
+                void_ty.fn_type(&[], false),
+                None,
+            )
+        });
+        let set_mode = self.module.get_function("newbf_set_guard_mode").unwrap_or_else(|| {
+            self.module.add_function(
+                "newbf_set_guard_mode",
+                void_ty.fn_type(&[i32_ty.into()], false),
+                None,
+            )
+        });
+
+        // The ctor body: install + set mode (+ register the site table in debug).
+        let ctor_ty = void_ty.fn_type(&[], false);
+        let ctor = self.module.add_function("__newbf_aot_bootstrap", ctor_ty, None);
+        let entry = self.ctx.append_basic_block(ctor, "entry");
+        self.builder.position_at_end(entry);
+
+        self.builder.build_call(install, &[], "").ok();
+
+        // Mode per the *compiler's* build profile: debug → Stomp(1), release →
+        // Thunk(0). Decoupled from the runtime crate's own profile (the runtime is
+        // mode-agnostic; the flag is set here).
+        let mode_val: u64 = if cfg!(debug_assertions) { 1 } else { 0 };
+        self.builder
+            .build_call(set_mode, &[i32_ty.const_int(mode_val, false).into()], "")
+            .ok();
+
+        // MS-T7 AOT half: register the emitted `__newbf_alloc_sites` table so a
+        // report names the site. The table + count globals exist only in a debug
+        // compiler (emit_alloc_sites is `#[cfg(debug_assertions)]`); reference them
+        // by name to avoid coupling to the emission order.
+        if cfg!(debug_assertions)
+            && let (Some(table_g), Some(_count_g)) = (
+                self.module.get_global("__newbf_alloc_sites"),
+                self.module.get_global("__newbf_alloc_sites_count"),
+            )
+        {
+            let register = self
+                .module
+                .get_function("newbf_register_alloc_sites")
+                .unwrap_or_else(|| {
+                    self.module.add_function(
+                        "newbf_register_alloc_sites",
+                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+                        None,
+                    )
+                });
+            let table_ptr = table_g.as_pointer_value();
+            let count = i64_ty.const_int(ir.alloc_sites.len() as u64, false);
+            self.builder
+                .build_call(register, &[table_ptr.into(), count.into()], "")
+                .ok();
+        }
+
+        self.builder.build_return(None).ok();
+
+        // Register the ctor in `@llvm.global_ctors` so the CRT runs it (via
+        // `.CRT$XCU`) before `main`. The element type is the canonical
+        // `{ i32 priority, ptr ctor, ptr data }`; priority 65535 (default), null
+        // associated-data.
+        let ctor_entry_ty = self
+            .ctx
+            .struct_type(&[i32_ty.into(), ptr_ty.into(), ptr_ty.into()], false);
+        let entry_val = ctor_entry_ty.const_named_struct(&[
+            i32_ty.const_int(65535, false).into(),
+            ctor.as_global_value().as_pointer_value().into(),
+            ptr_ty.const_null().into(),
+        ]);
+        let arr = ctor_entry_ty.const_array(&[entry_val]);
+        let global_ctors = self
+            .module
+            .add_global(arr.get_type(), None, "llvm.global_ctors");
+        global_ctors.set_initializer(&arr);
+        global_ctors.set_linkage(inkwell::module::Linkage::Appending);
+    }
 
     /// Emit each `static` field as a mutable, zero-initialized module global.
     /// Only scalar globals (int/float/bool/ptr/ref) are emitted; an aggregate
