@@ -22,6 +22,11 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         // layout mirrors the emitted `%struct.Type`; uses `char8*`, so it lands
         // after Internal/String and before any consumer.
         ("Type.bf", include_str!("../bf/Type.bf")),
+        // System.Compiler — the comptime emission surface (comptime-breadth
+        // §3.2, CB-T3). A `static class` whose `EmitTypeBody(text)` call sema
+        // rewrites to the `__newbf_ct_emit` host shim; rides the prelude like
+        // Type.bf (a duplicate corpus `Compiler` is skipped at registration).
+        ("Compiler.bf", include_str!("../bf/Compiler.bf")),
         ("Console.bf", include_str!("../bf/Console.bf")),
         ("Pool.bf", include_str!("../bf/Pool.bf")),
         ("Handle.bf", include_str!("../bf/Handle.bf")),

@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, FieldMeta, Function,
+    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, EmitJob, FieldDef, FieldMeta, Function,
     FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam, ReflectPolicy,
     StructDef, StructId, TypeMeta, Value, VtableDef,
 };
@@ -4923,6 +4923,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             &[],
             None,
             None,
+            None, // CB-T3: not an emit generator (generic-method monomorph).
         ) {
             m.add_function(func);
         }
@@ -5022,6 +5023,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 &[],
                 mono.owner,
                 ret_fn_sig_of_ty(return_ty, mdecl_src, &structs, &mono.env),
+                None, // CB-T3: not an emit generator (generic-method monomorph).
             ) {
                 m.add_function(func);
             }
@@ -5521,6 +5523,51 @@ fn lower_type_at(
                 if has_comptime_attr(attributes, src) {
                     m.comptime.push(full_name.clone());
                 }
+                // CB-T3: a `[Comptime, EmitGenerator]` method is a comptime member
+                // *emission* generator. Record an `EmitJob` keyed by the owner's
+                // qualified name (the cross-round routing key — StructIds shift
+                // between emission rounds, names do not) and the generator's
+                // mangled symbol (which CB-T4 will JIT-run). It is STILL pushed to
+                // `m.comptime` above so the fold/strip sweep drops it from the
+                // final program. `emit_owner` is then passed to `lower_method` so
+                // the body's `Compiler.EmitTypeBody(text)` calls rewrite to the
+                // `__newbf_ct_emit` host shim. (Empty for every current corpus
+                // program — no corpus uses `[EmitGenerator]` — so this is inert.)
+                let emit_owner = if comptime_emitter_of(attributes, src) {
+                    // The owner's qualified name is `new_prefix` minus its
+                    // trailing `.` (e.g. `Demo.Vec2.` → `Demo.Vec2`).
+                    let owner_qual_name =
+                        new_prefix.strip_suffix('.').unwrap_or(new_prefix).to_string();
+                    m.emit_jobs.push(EmitJob {
+                        owner_qual_name,
+                        symbol: full_name.clone(),
+                    });
+                    // Declare the host emit shim once, with the EXACT C ABI the
+                    // rewritten call lowers to and `newbf_comptime::__newbf_ct_emit`
+                    // expects: `void __newbf_ct_emit(i32 owner, char8* ptr, i32
+                    // len)`. The LLVM backend would `get_or_declare` it anyway, but
+                    // an explicit, single declaration makes the IR self-describing
+                    // (and `dump-ir` shows the shim that CB-T4 strips).
+                    if !m.funcs.iter().any(|f| f.name == "__newbf_ct_emit") {
+                        m.declare_extern(
+                            "__newbf_ct_emit",
+                            vec![
+                                IrParam { name: None, ty: IrType::I32 },
+                                IrParam { name: None, ty: IrType::Ptr },
+                                IrParam { name: None, ty: IrType::I32 },
+                            ],
+                            IrType::Void,
+                        );
+                    }
+                    // The owner-id literal sema injects into the rewritten call is
+                    // the owner's current dense `StructId` (resolved back to the
+                    // qual-name via CB-T4's per-round `name → id` map). A generator
+                    // with no resolvable owner id (e.g. an interface/template
+                    // context) records the job but skips the body rewrite.
+                    owner_id
+                } else {
+                    None
+                };
                 if let Some(func) = lower_method(
                     full_name,
                     ret,
@@ -5534,6 +5581,7 @@ fn lower_type_at(
                     &[],
                     owner_id,
                     ret_fn_sig_of_ty(return_ty, src, structs, env),
+                    emit_owner,
                 ) {
                     m.add_function(func);
                 }
@@ -5559,6 +5607,7 @@ fn lower_type_at(
                         &[],
                         owner_id,
                         None,
+                        None, // CB-T3: a constructor is never an emit generator.
                     ) {
                         m.add_function(func);
                     }
@@ -5581,6 +5630,7 @@ fn lower_type_at(
                         &[],
                         owner_id,
                         None,
+                        None, // CB-T3: a destructor is never an emit generator.
                     ) {
                         m.add_function(func);
                     }
@@ -5640,6 +5690,7 @@ fn lower_type_at(
                             &[],
                             owner_id,
                             None,
+                            None, // CB-T3: a property accessor is never an emit generator.
                         ) {
                             m.add_function(func);
                         }
@@ -5684,6 +5735,7 @@ fn lower_type_at(
                             &[("value", pty)],
                             owner_id,
                             None,
+                            None, // CB-T3: a property accessor is never an emit generator.
                         ) {
                             m.add_function(func);
                         }
@@ -5742,6 +5794,11 @@ fn lower_method(
     // otherwise), so a lambda in a `return` position can be target-typed. Set on
     // the `Lowerer` below; see `Lowerer.ret_fn_sig`.
     ret_fn_sig: Option<(IrType, Vec<IrType>)>,
+    // CB-T3: `Some(owner_id)` when this method is a `[Comptime, EmitGenerator]`
+    // generator owned by `owner_id`; the body's `Compiler.EmitTypeBody(text)`
+    // calls are then rewritten to `__newbf_ct_emit(<owner_id as i32>, text.Ptr,
+    // text.Len)`. `None` for every ordinary method/ctor/dtor (no rewrite).
+    emit_owner: Option<StructId>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -5772,6 +5829,7 @@ fn lower_method(
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
     let mut lw = Lowerer::new(fb, ret, methods, structs, env, cur_type);
     lw.ret_fn_sig = ret_fn_sig;
+    lw.emit_owner = emit_owner;
 
     // Spill `this` into a slot at entry, recorded for `Expr::This`.
     let base = if this_ty.is_some() { 1 } else { 0 };
@@ -6007,6 +6065,13 @@ struct Lowerer<'a> {
     /// untyped params from the declared return sig (recorded into
     /// `inline_lambda_sigs` so the emit pass binds the lambda body's params).
     ret_fn_sig: Option<(IrType, Vec<IrType>)>,
+    /// CB-T3: `Some(owner_id)` when lowering a `[Comptime, EmitGenerator]`
+    /// generator body, else `None`. When set, a `Compiler.EmitTypeBody(text)`
+    /// call in this body is rewritten to the host emit shim
+    /// `__newbf_ct_emit(<owner_id as i32 literal>, text.Ptr, text.Len)` instead
+    /// of being lowered as an ordinary method call — so when CB-T4 JIT-runs the
+    /// generator the emitted text lands in the comptime sink keyed by the owner.
+    emit_owner: Option<StructId>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -6036,6 +6101,7 @@ impl<'a> Lowerer<'a> {
             scope_allocs: vec![(BlockId(0), Vec::new())],
             enum_locals: HashMap::new(),
             ret_fn_sig: None,
+            emit_owner: None,
         }
     }
 
@@ -7091,6 +7157,14 @@ impl<'a> Lowerer<'a> {
                 }
                 // Method call on a receiver: `obj.Method(args)` / `this.M(args)`.
                 if let Expr::Member { base, name, .. } = &**callee {
+                    // CB-T3: inside a `[Comptime, EmitGenerator]` body, rewrite
+                    // `Compiler.EmitTypeBody(text)` to the host emit shim
+                    // `__newbf_ct_emit(<owner-id literal>, text.Ptr, text.Len)`.
+                    if let Some(r) =
+                        self.try_lower_emit_type_body(base, name.text(src), args, src)
+                    {
+                        return r;
+                    }
                     // `Enum.Case(payload)` for a payload enum constructs its struct.
                     if let Some(r) = self.try_enum_construct(base, name.text(src), args, src) {
                         return r;
@@ -8813,6 +8887,63 @@ impl<'a> Lowerer<'a> {
             self.fb.store(ep, cv);
         }
         (elems, IrType::Ptr)
+    }
+
+    /// CB-T3: inside a `[Comptime, EmitGenerator]` body, rewrite a
+    /// `Compiler.EmitTypeBody(text)` call into the host emit shim
+    /// `__newbf_ct_emit(<owner-id literal>, text.Ptr, text.Len)`
+    /// (comptime-breadth §3.3) so that when CB-T4 JIT-runs the generator, the
+    /// emitted text lands in `EMIT_SINK` keyed by the owner.
+    ///
+    /// Returns `None` (no rewrite — the call lowers normally) unless **all** of:
+    ///   * `self.emit_owner` is `Some(owner_id)` (we're in an emit generator);
+    ///   * the receiver `base` is exactly `Compiler` and `name == "EmitTypeBody"`;
+    ///   * there is exactly one argument that is a **string literal** (the v1
+    ///     surface — comptime-breadth §1.1 / §8). A non-literal text argument
+    ///     declines (falls through to the harmless `Compiler.EmitTypeBody` stub).
+    ///
+    /// The emitted call's signature is EXACTLY `void __newbf_ct_emit(i32, ptr,
+    /// i32)` — matching `newbf_comptime::__newbf_ct_emit(i32 owner_type_id,
+    /// *const u8 ptr, i32 len)`. The owner-id literal is the owner's dense
+    /// `StructId` (the per-round id CB-T4 resolves back to the qual-name).
+    /// `text.Ptr` is the string literal's `char8*` (a `Const::Str`, the same
+    /// construct ordinary string literals lower to); `text.Len` is its decoded
+    /// byte length as an `i32`. The LLVM backend `get_or_declare`s
+    /// `__newbf_ct_emit` from the call's argument types, so no explicit extern
+    /// declaration is required for the IR/LLVM to be well-formed.
+    fn try_lower_emit_type_body(
+        &mut self,
+        base: &Expr,
+        name: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        let owner_id = self.emit_owner?;
+        if name != "EmitTypeBody" {
+            return None;
+        }
+        // Receiver must be the bare `Compiler` static class.
+        let Expr::Ident(b) = base else { return None };
+        if b.text(src) != "Compiler" {
+            return None;
+        }
+        // v1: exactly one string-literal text argument.
+        let [Expr::Str(s)] = args else { return None };
+        let text = decode_string_literal(s.text(src));
+        let len = text.len() as i128;
+        let ptr = Value::str(text);
+        // void __newbf_ct_emit(i32 owner, char8* ptr, i32 len)
+        self.fb.call(
+            "__newbf_ct_emit",
+            vec![
+                Value::int(owner_id.0 as i128, IrType::I32),
+                ptr,
+                Value::int(len, IrType::I32),
+            ],
+            IrType::Void,
+        );
+        // `EmitTypeBody` is `void`; an expression-statement use discards this.
+        Some((Value::int(0, IrType::I32), IrType::Void))
     }
 
     /// `a.Count` / `a.Length` for a heap-array local → load the length header
@@ -10831,6 +10962,29 @@ fn has_comptime_attr(attrs: &[Attribute], src: &str) -> bool {
     })
 }
 
+/// Whether a member carries the bare `[EmitGenerator]` marker attribute. Read
+/// only together with `[Comptime]` (see [`comptime_emitter_of`]); a method with
+/// `[EmitGenerator]` alone is not an emission generator.
+fn has_emit_generator_attr(attrs: &[Attribute], src: &str) -> bool {
+    attrs.iter().any(|a| {
+        matches!(&a.name,
+            AstType::Path { segments, .. }
+                if segments.last().map(|s| s.name.text(src)) == Some("EmitGenerator"))
+    })
+}
+
+/// Whether a method is a **comptime emission generator** (comptime-breadth §3.3,
+/// CB-T3): it must carry **both** `[Comptime]` and `[EmitGenerator]`. The bare
+/// `[EmitGenerator]` marker parses with the existing attribute grammar (CB-T2);
+/// requiring both means an ordinary `[Comptime]` fold function (which the corpus
+/// uses heavily) is never misclassified — so `emit_jobs` stays empty for every
+/// current corpus program and emission is a no-op there. When this is true, sema
+/// records an [`EmitJob`] and rewrites the generator body's
+/// `Compiler.EmitTypeBody(text)` calls into the `__newbf_ct_emit` host shim.
+fn comptime_emitter_of(attrs: &[Attribute], src: &str) -> bool {
+    has_comptime_attr(attrs, src) && has_emit_generator_attr(attrs, src)
+}
+
 /// RF-T3: the module-wide default reflection policy for a type with **no**
 /// `[Reflect]` / `[AlwaysInclude]` attribute (reflection.md §5.2). v1 default is
 /// `TYPE` — name + id + size are always available, but field/method tables are
@@ -11257,6 +11411,7 @@ fn parse_float(text: &str) -> f64 {
 mod tests {
     use super::*;
     use crate::build::SourceFile;
+    use newbf_ir::InstKind;
     use newbf_parser::parse_file;
 
     /// FV-T1: `$Func` is registered FIRST, so `func_struct == StructId(0)`, it is
@@ -12750,6 +12905,157 @@ mod tests {
         assert_ne!(
             ty.fields[0].name, "$header",
             "corlib `Type` must be a value struct (no $header), else field indices shift"
+        );
+    }
+
+    /// CB-T3: a `[Comptime, EmitGenerator]` method must (a) record an `EmitJob`
+    /// keyed by its owner's qualified name + its mangled symbol, (b) STILL appear
+    /// in `module.comptime` (the generator is also a comptime fn — the strip/fold
+    /// sweep drops it), and (c) have its `Compiler.EmitTypeBody("...")` call
+    /// REWRITTEN in the lowered body to `call __newbf_ct_emit(i32, ptr, i32)`,
+    /// with NO `Compiler.EmitTypeBody` method call left behind.
+    #[test]
+    fn cb_t3_emit_generator_records_job_and_rewrites_body() {
+        let emit_text = "public int SumXY() { return this.x + this.y; }";
+        let src = format!(
+            r#"
+            class Vec2 {{
+                public int x;
+                public int y;
+
+                [Comptime, EmitGenerator]
+                public static void Generate() {{
+                    Compiler.EmitTypeBody("{emit_text}");
+                }}
+            }}
+        "#
+        );
+        let (unit, pd) = parse_file(&src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src: &src, unit: &unit }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // (a) exactly one EmitJob, with the right owner qual-name + symbol.
+        assert_eq!(
+            module.emit_jobs.len(),
+            1,
+            "expected one EmitJob, got {:?}",
+            module.emit_jobs
+        );
+        let job = &module.emit_jobs[0];
+        assert_eq!(job.owner_qual_name, "Vec2", "owner qual-name routes emission");
+        assert_eq!(
+            job.symbol, "Vec2.Generate",
+            "EmitJob.symbol is the generator's mangled symbol (CB-T4 JIT-runs it)"
+        );
+
+        // (b) the generator is STILL a recorded comptime fn (dropped by the
+        // fold/strip sweep that reads `module.comptime`).
+        assert!(
+            module.comptime.iter().any(|c| c == "Vec2.Generate"),
+            "the generator must still be in module.comptime, have: {:?}",
+            module.comptime
+        );
+
+        // (c) the lowered generator body calls `__newbf_ct_emit(i32, ptr, i32)`
+        // and contains NO residual `Compiler.EmitTypeBody` call.
+        let gen_fn = module
+            .funcs
+            .iter()
+            .find(|f| f.name == "Vec2.Generate")
+            .expect("the generator function is lowered");
+
+        let mut saw_ct_emit = false;
+        for inst in &gen_fn.insts {
+            if let InstKind::Call { callee, args } = &inst.kind {
+                assert!(
+                    !callee.name.contains("EmitTypeBody"),
+                    "no `Compiler.EmitTypeBody` call may remain after the rewrite (saw `{}`)",
+                    callee.name
+                );
+                if callee.name == "__newbf_ct_emit" {
+                    saw_ct_emit = true;
+                    // void __newbf_ct_emit(i32 owner, char8* ptr, i32 len)
+                    assert_eq!(inst.ty, IrType::Void, "the shim returns void");
+                    assert_eq!(args.len(), 3, "shim takes (owner_id, ptr, len)");
+                    // arg0: the owner id as an i32 literal (Vec2's StructId).
+                    assert!(
+                        matches!(args[0], Value::Const(Const::Int(_, IrType::I32))),
+                        "arg0 must be an i32 owner-id literal, got {:?}",
+                        args[0]
+                    );
+                    // arg1: the emitted text as a `char8*` string constant.
+                    assert!(
+                        matches!(&args[1], Value::Const(Const::Str(s)) if s == emit_text),
+                        "arg1 must be the emitted text as a Str constant, got {:?}",
+                        args[1]
+                    );
+                    // arg2: the byte length as an i32 literal.
+                    assert!(
+                        matches!(
+                            args[2],
+                            Value::Const(Const::Int(n, IrType::I32)) if n == emit_text.len() as i128
+                        ),
+                        "arg2 must be the i32 byte length, got {:?}",
+                        args[2]
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_ct_emit,
+            "the generator body must contain a `call __newbf_ct_emit(i32, ptr, i32)` (the rewrite)"
+        );
+
+        // The shim extern is declared with the exact C ABI emit.rs expects.
+        let shim = module
+            .funcs
+            .iter()
+            .find(|f| f.name == "__newbf_ct_emit")
+            .expect("__newbf_ct_emit extern declared on the module");
+        assert!(shim.is_extern, "__newbf_ct_emit is a body-less extern");
+        assert_eq!(shim.ret, IrType::Void);
+        assert_eq!(
+            shim.params.iter().map(|p| p.ty).collect::<Vec<_>>(),
+            vec![IrType::I32, IrType::Ptr, IrType::I32],
+            "shim signature must be void(i32, ptr, i32)"
+        );
+    }
+
+    /// CB-T3 behavior-preservation: a plain `[Comptime]` method (NO
+    /// `[EmitGenerator]`) is NOT an emission generator — `emit_jobs` stays empty,
+    /// and a `Compiler.EmitTypeBody(...)` call inside an *ordinary* (non-emit)
+    /// method is NOT rewritten (it stays an ordinary method call). This pins that
+    /// the corpus (which uses `[Comptime]` + `Compiler.EmitTypeBody` heavily but
+    /// never `[EmitGenerator]`) is untouched.
+    #[test]
+    fn cb_t3_plain_comptime_is_not_an_emit_generator() {
+        let src = r#"
+            class Vec2 {
+                [Comptime]
+                public static void NotAGenerator() {
+                    Compiler.EmitTypeBody("public int Z() { return 0; }");
+                }
+            }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        assert!(
+            module.emit_jobs.is_empty(),
+            "a plain [Comptime] method must NOT record an EmitJob, have: {:?}",
+            module.emit_jobs
+        );
+        // It is still a comptime fn.
+        assert!(module.comptime.iter().any(|c| c == "Vec2.NotAGenerator"));
+        // And no `__newbf_ct_emit` shim was synthesized.
+        assert!(
+            !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+            "no emit shim should be declared without an [EmitGenerator]"
         );
     }
 }
