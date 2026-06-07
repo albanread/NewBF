@@ -18,8 +18,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, Function, FunctionBuilder,
-    GlobalDef, IrType, Module, Param as IrParam, StructDef, StructId, Value, VtableDef,
+    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, FieldDef, FieldMeta, Function,
+    FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam, ReflectPolicy,
+    StructDef, StructId, TypeMeta, Value, VtableDef,
 };
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
@@ -231,6 +232,15 @@ struct StructTable {
     /// in [`StructTable::build`] (one copy per file, in file-slice order); READ by
     /// MX-T3 (which slices the body's spans against `srcs[def.src_file]`).
     srcs: Vec<String>,
+    /// RF-T3: the per-id reflection **strip policy**, parallel to `defs`. Computed
+    /// from each type's `[Reflect(flags)]` / `[AlwaysInclude]` attributes (the
+    /// module default for an un-annotated type) by [`reflect_policy`] at the
+    /// id-minting site, and read in `lower_program` when populating
+    /// `Module::type_meta` (which metadata tables a type emits). Synthetic ids
+    /// (`$Func`, tuples, monos, enums) default to [`ReflectPolicy::TYPE`] — the
+    /// always-on minimum (name+id+size, no fields/methods), since they carry no
+    /// user attributes.
+    policies: Vec<ReflectPolicy>,
 }
 
 /// MX-T2: a collected mixin declaration — owned data only (no lifetime), so the
@@ -524,6 +534,14 @@ impl StructTable {
                 && fd.fields[1].ty == IrType::Ptr,
             "$Func must have exactly two Ptr fields (code, target)"
         );
+        // RF-T3: the per-id `policies` Vec must stay in lockstep with `defs` (one
+        // entry per minted struct id), so `policies[id]` is always valid when
+        // populating `Module::type_meta`.
+        debug_assert_eq!(
+            t.policies.len(),
+            t.defs.len(),
+            "RF-T3: policies must be parallel to defs (lockstep at every id-minting site)"
+        );
         t
     }
 
@@ -766,6 +784,9 @@ fn register_func_struct(t: &mut StructTable) -> StructId {
     t.iface_bases.push(Vec::new());
     t.imethods.push(Vec::new());
     t.idefaults.push(Vec::new());
+    // RF-T3: a synthetic value struct carries no user attributes ⇒ the always-on
+    // minimum policy (name+id+size, no field/method tables).
+    t.policies.push(ReflectPolicy::TYPE);
     t.by_name.insert("$Func".into(), id);
     id
 }
@@ -792,6 +813,10 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     t.iface_bases.push(Vec::new());
     t.imethods.push(Vec::new());
     t.idefaults.push(Vec::new());
+    // RF-T3: a monomorph / tuple / synthetic struct carries no user attributes
+    // here (a generic *template*'s attributes are NOT yet propagated to its
+    // monomorphs — a v1 simplification), so it gets the always-on minimum policy.
+    t.policies.push(ReflectPolicy::TYPE);
     t.by_name.insert(mangled.to_string(), id);
     id
 }
@@ -2407,6 +2432,12 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             t.iface_bases.push(Vec::new());
             t.imethods.push(Vec::new());
             t.idefaults.push(Vec::new());
+            // RF-T3: compute this type's reflection strip policy from its
+            // `[Reflect(flags)]` / `[AlwaysInclude]` attributes (the module
+            // default for an un-annotated type). Recorded per-id and read when
+            // populating `Module::type_meta`.
+            t.policies
+                .push(reflect_policy(&td.attributes, src, reflect_default()));
             t.by_name.insert(name, id);
         }
     }
@@ -2689,6 +2720,9 @@ fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
             t.iface_bases.push(Vec::new());
             t.imethods.push(Vec::new());
             t.idefaults.push(Vec::new());
+            // RF-T3: a payload (tagged-union) enum struct gets the always-on
+            // minimum policy (its `[Reflect]` attributes are not yet plumbed).
+            t.policies.push(ReflectPolicy::TYPE);
             t.by_name.insert(enum_name.clone(), id);
             t.payload_enums.insert(enum_name, id);
             t.enum_cases.insert(id, cases);
@@ -4599,6 +4633,132 @@ fn expr_references_this(e: &Expr) -> bool {
     }
 }
 
+/// RF-T3: the simple type name a [`TypeMeta`] records — the trailing segment of
+/// the type's `defs[id].name`. A monomorph's `defs` name is already its mangled
+/// form (`Box$int`); a plain class's is the simple name (`Dog`). We strip any
+/// leading namespace path (`A.B.C` → `C`) so `TypeMeta.name` is the *simple*
+/// name reflection.md §5.2 specifies.
+fn type_meta_simple_name(full: &str) -> String {
+    full.rsplit('.').next().unwrap_or(full).to_string()
+}
+
+/// RF-T3: the number of *explicit* parameters a method exposes — its ABI param
+/// count minus the leading `this` carried by an instance method. Used to fill
+/// [`MethodMeta::param_count`] (the reflected, source-level arity).
+fn explicit_param_count(sig: &MethodSig) -> u32 {
+    let n = sig.params.len();
+    if sig.is_instance {
+        n.saturating_sub(1) as u32
+    } else {
+        n as u32
+    }
+}
+
+/// RF-T3: assign dense, name-sorted runtime type-ids to every reflectable type,
+/// register its ClassVData (`VtableDef`) with the assigned id, and record its
+/// [`TypeMeta`] into the module (reflection.md §5.2 / §4.6).
+///
+/// **Reflectable set** = every `StructKind::Ref` id (classes + interfaces with a
+/// nominal id). This is exactly the set that already carries a `ClassVData`
+/// header (RF-T2), so every emitted `VtableDef` gets a real `type_id` and the
+/// registry (RF-T4) is dense over the compact reflectable id-space.
+///
+/// **Stability** = the ids are assigned in **mangled-name (`prefix`) order**, not
+/// raw struct-id order. The prefix is unique per id (`"Dog."`, `"Box$int."`) and
+/// independent of where a type lands in the corlib-prepended struct table, so a
+/// newly-added corlib class shifts only the ids at/after its sort position — it
+/// never renumbers an unrelated type's id arbitrarily. RF-T4/T5's registry
+/// accessor indexes by this id, so the stability is load-bearing.
+///
+/// **Policy-gating**: `fields` is recorded only when `policy.has(FIELDS)`, and
+/// `methods` only when `policy.has(METHODS)` (else left empty) — so the strip
+/// policy is observable in `type_meta` (and downstream emission) without the
+/// backend re-deriving it. The synthetic `$header` field (a class's offset-0
+/// `ClassVData*`) is never recorded — only user-declared fields are reflected.
+fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
+    // 1. Collect the reflectable ids (every `Ref`), then sort by mangled name
+    //    (the per-id prefix) so the dense ids are deterministic and stable.
+    let mut reflectable: Vec<StructId> = (0..structs.defs.len() as u32)
+        .map(StructId)
+        .filter(|id| matches!(structs.kinds[id.0 as usize], StructKind::Ref))
+        .collect();
+    reflectable.sort_by(|a, b| {
+        structs.prefixes[a.0 as usize].cmp(&structs.prefixes[b.0 as usize])
+    });
+
+    // 2. The dense id map: reflectable struct id -> its name-sorted dense type-id.
+    let mut type_id_of: HashMap<StructId, u32> = HashMap::with_capacity(reflectable.len());
+    for (dense, id) in reflectable.iter().enumerate() {
+        type_id_of.insert(*id, dense as u32);
+    }
+
+    // 3. Register each reflectable type's ClassVData with its real type-id, in
+    //    DENSE id order so `m.vtables` is ordered by type-id (the registry layout
+    //    RF-T4 expects), and record its `TypeMeta`.
+    for id in &reflectable {
+        let i = id.0 as usize;
+        let type_id = type_id_of[id];
+        let policy = structs.policies[i];
+
+        // ClassVData (RF-T2's per-`Ref` header) — now with the real dense id.
+        m.add_vtable(VtableDef {
+            name: classvdata_name(&structs.prefixes[i]),
+            entries: structs.vimpls[i].clone(),
+            type_id,
+        });
+
+        // Fields — policy-gated. Skip the synthetic `$header` (offset-0
+        // `ClassVData*`); record only user-declared fields, with their physical
+        // field index in the struct body (the index the backend uses for the
+        // GEP offset).
+        let fields: Vec<FieldMeta> = if policy.has(ReflectPolicy::FIELDS) {
+            structs.defs[i]
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.name != "$header")
+                .map(|(idx, f)| FieldMeta {
+                    name: f.name.clone(),
+                    ty: f.ty,
+                    field_index: idx as u32,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Methods — policy-gated. One `MethodMeta` per overload (each distinct
+        // mangled symbol), sorted by `(name, symbol)` so the recorded order is
+        // deterministic (the `methods` map iterates in unspecified order).
+        let methods: Vec<MethodMeta> = if policy.has(ReflectPolicy::METHODS) {
+            let mut ms: Vec<MethodMeta> = Vec::new();
+            for (name, sigs) in &structs.methods[i] {
+                for sig in sigs {
+                    ms.push(MethodMeta {
+                        name: name.clone(),
+                        symbol: sig.full_name.clone(),
+                        param_count: explicit_param_count(sig),
+                    });
+                }
+            }
+            ms.sort_by(|a, b| (&a.name, &a.symbol).cmp(&(&b.name, &b.symbol)));
+            ms
+        } else {
+            Vec::new()
+        };
+
+        m.add_type_meta(TypeMeta {
+            type_id,
+            struct_id: *id,
+            name: type_meta_simple_name(&structs.defs[i].name),
+            policy,
+            is_ref: true,
+            fields,
+            methods,
+        });
+    }
+}
+
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Prepend the corlib prelude as source — parsed, then composed at the AST
     // and lowered once with the user program (STDLIB.md). The prelude units are
@@ -4651,23 +4811,16 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         );
     }
     m.structs = structs.defs.clone();
-    // RF-T2: register a ClassVData global for EVERY `StructKind::Ref` id (not
-    // just classes with virtuals). Each becomes a `%ClassVData = { i32 mType,
-    // [N x ptr] vtbl }` global in newbf-llvm; `entries` is empty (N = 0) when
-    // the class has no virtual/interface methods, so even a plain class gets a
-    // non-null header that `new` always stores and `is`/`as` compares against.
-    for i in 0..structs.defs.len() {
-        if !matches!(structs.kinds[i], StructKind::Ref) {
-            continue;
-        }
-        m.add_vtable(VtableDef {
-            name: classvdata_name(&structs.prefixes[i]),
-            entries: structs.vimpls[i].clone(),
-            // RF-T1: default 0 (the i32 mType word); RF-T3 assigns the dense
-            // type-id here. RF-T2 keeps it 0 — behavior is unchanged.
-            type_id: 0,
-        });
-    }
+    // RF-T3: assign each reflectable type a dense, **name-sorted** runtime
+    // type-id, then register its ClassVData (with the real id) and record its
+    // reflection metadata. Reflectable = every `StructKind::Ref` id (the set that
+    // already gets a ClassVData header — RF-T2); name-sort makes the ids stable
+    // across corlib growth (a new corlib class doesn't renumber unrelated types
+    // arbitrarily). The dense id is what goes into both `VtableDef.type_id` (the
+    // `i32 mType` word) and `TypeMeta.type_id`. Behavior-preserving for RF-T3:
+    // nothing reads `mType`/`type_meta` yet (RF-T4/T5 wire them), so only the
+    // emitted ClassVData constant changes from 0 to the dense id.
+    assign_type_ids_and_meta(&structs, &mut m);
     // Emit a mutable module global for each `static` field.
     for (sym, ty) in &structs.statics {
         m.add_global(GlobalDef {
@@ -10609,6 +10762,92 @@ fn has_comptime_attr(attrs: &[Attribute], src: &str) -> bool {
     })
 }
 
+/// RF-T3: the module-wide default reflection policy for a type with **no**
+/// `[Reflect]` / `[AlwaysInclude]` attribute (reflection.md §5.2). v1 default is
+/// `TYPE` — name + id + size are always available, but field/method tables are
+/// **stripped** unless the type opts in. (This is the differential the strip
+/// tests pin: a `[Reflect(.Fields)]` class emits its field table, an unmarked
+/// class does not.)
+fn reflect_default() -> ReflectPolicy {
+    ReflectPolicy::TYPE
+}
+
+/// RF-T3: the simple (last-segment) name of an attribute, e.g. `Reflect`,
+/// `AlwaysInclude`, `Comptime`. `None` for a non-path attribute name.
+fn attr_simple_name<'a>(a: &Attribute, src: &'a str) -> Option<&'a str> {
+    match &a.name {
+        AstType::Path { segments, .. } => segments.last().map(|s| s.name.text(src)),
+        _ => None,
+    }
+}
+
+/// RF-T3: map a single `[Reflect(...)]` enum-flag argument's identifier text to
+/// the policy bit(s) it sets (reflection.md §5.2). RF-T0 captured `.Fields` as an
+/// `Expr::DotIdent { name }`; a bare flag identifier (`Fields`) arrives as an
+/// `Expr::Ident`. Unknown flags contribute nothing (forward-compatible).
+fn reflect_flag_bits(arg: &Expr, src: &str) -> ReflectPolicy {
+    let ident = match arg {
+        Expr::DotIdent { name, .. } => Some(name.text(src)),
+        Expr::Ident(s) => Some(s.text(src)),
+        _ => None,
+    };
+    match ident {
+        Some("Fields") => ReflectPolicy::FIELDS,
+        Some("Methods") => ReflectPolicy::METHODS,
+        // `.All` ⇒ everything (fields + methods + type minimum).
+        Some("All") => ReflectPolicy::ALL,
+        _ => ReflectPolicy(0),
+    }
+}
+
+/// RF-T3: compute a type's reflection **strip policy** from its attributes
+/// (reflection.md §5.2). Pure string/enum matching — no comptime, no LLVM:
+///   * `[AlwaysInclude]` ⇒ `ALL` (every table emitted).
+///   * `[Reflect]` (no args) ⇒ `TYPE | FIELDS | METHODS` (the full default opt-in).
+///   * `[Reflect(.Fields)]` / `[Reflect(.Methods)]` / `[Reflect(.All)]` ⇒ the
+///     `TYPE` minimum OR'd with the named flag bit(s) (multiple args OR together,
+///     e.g. `[Reflect(.Fields, .Methods)]`).
+///   * none of the above ⇒ the module `default`.
+/// `[Reflect]` and `[AlwaysInclude]` are additive: the strongest wins (their bits
+/// are OR'd), so an explicit flag never *demotes* below the `default`.
+fn reflect_policy(attrs: &[Attribute], src: &str, default: ReflectPolicy) -> ReflectPolicy {
+    let mut policy = ReflectPolicy::NONE;
+    let mut saw_reflect_attr = false;
+    for a in attrs {
+        match attr_simple_name(a, src) {
+            Some("AlwaysInclude") => {
+                saw_reflect_attr = true;
+                policy = ReflectPolicy(policy.0 | ReflectPolicy::ALL.0);
+            }
+            Some("Reflect") => {
+                saw_reflect_attr = true;
+                if a.args.is_empty() {
+                    // Bare `[Reflect]` ⇒ the full opt-in (type + fields + methods).
+                    policy = ReflectPolicy(
+                        policy.0
+                            | ReflectPolicy::TYPE.0
+                            | ReflectPolicy::FIELDS.0
+                            | ReflectPolicy::METHODS.0,
+                    );
+                } else {
+                    // `[Reflect(.Fields | .Methods | .All)]` ⇒ the TYPE minimum
+                    // OR'd with each named flag.
+                    policy = ReflectPolicy(policy.0 | ReflectPolicy::TYPE.0);
+                    for arg in &a.args {
+                        policy = ReflectPolicy(policy.0 | reflect_flag_bits(arg, src).0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_reflect_attr {
+        policy
+    } else {
+        default
+    }
+}
+
 fn extern_symbol(attrs: &[Attribute], src: &str) -> Option<String> {
     for a in attrs {
         let aname = match &a.name {
@@ -12223,6 +12462,166 @@ mod tests {
             mixin_expandable(dbl, &site(2), dt.srcs[dbl.src_file].as_str()),
             Err(MixinDecline::UnsupportedParamKind),
             "arity mismatch → DECLINE"
+        );
+    }
+
+    /// RF-T3: `reflect_policy` maps attribute flags to bits, and `lower_program`
+    /// records a correct `TypeMeta` per reflectable class with dense, name-sorted
+    /// type-ids.
+    ///
+    /// A `[Reflect(.Fields)]`-marked class gets the `FIELDS` policy and its
+    /// user-declared fields recorded (the synthetic `$header` is excluded); an
+    /// un-annotated class gets the module default (`TYPE`) and — because fields
+    /// are policy-gated — an EMPTY field list even though it has the same shape.
+    /// This is the differential the strip tests pin (RF-T4): marked emits its
+    /// fields, unmarked does not. The two classes' type-ids are dense (0..N) and
+    /// assigned in name-sorted order, so they are stable across corlib growth.
+    #[test]
+    fn rf_t3_records_policy_gated_type_meta_with_dense_name_sorted_ids() {
+        // First: the pure-policy function maps the captured RF-T0 attr args to
+        // bits exactly (no module / lowering needed).
+        let none = ReflectPolicy::NONE;
+        let dflt = ReflectPolicy::TYPE;
+        // `[Reflect(.Fields)]` → TYPE | FIELDS.
+        let dotident = |name_text: &str, full: &str| -> ReflectPolicy {
+            // Build a one-arg `[Reflect(.X)]` attribute over a tiny source so the
+            // `Expr::DotIdent { name }` span resolves to `name_text`.
+            let unit = parse_file(full, FileId(0)).0;
+            let td = unit
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Type(td) => Some(td),
+                    _ => None,
+                })
+                .expect("a type decl");
+            let _ = name_text;
+            reflect_policy(&td.attributes, full, none)
+        };
+        let p_fields = dotident("Fields", "[Reflect(.Fields)] class C { public int32 x; }");
+        assert!(p_fields.has(ReflectPolicy::TYPE), "TYPE minimum is set");
+        assert!(p_fields.has(ReflectPolicy::FIELDS), ".Fields sets FIELDS");
+        assert!(!p_fields.has(ReflectPolicy::METHODS), ".Fields must NOT set METHODS");
+        let p_methods = dotident("Methods", "[Reflect(.Methods)] class C { }");
+        assert!(p_methods.has(ReflectPolicy::METHODS), ".Methods sets METHODS");
+        assert!(!p_methods.has(ReflectPolicy::FIELDS), ".Methods must NOT set FIELDS");
+        let p_all = dotident("All", "[Reflect(.All)] class C { }");
+        assert_eq!(p_all, ReflectPolicy::ALL, ".All ⇒ ALL");
+        let p_bare = dotident("", "[Reflect] class C { }");
+        assert!(
+            p_bare.has(ReflectPolicy::FIELDS) && p_bare.has(ReflectPolicy::METHODS),
+            "bare [Reflect] ⇒ TYPE|FIELDS|METHODS"
+        );
+        let p_always = dotident("", "[AlwaysInclude] class C { }");
+        assert_eq!(p_always, ReflectPolicy::ALL, "[AlwaysInclude] ⇒ ALL");
+        // No reflection attribute ⇒ the module default.
+        let unit = parse_file("class Plain { }", FileId(0)).0;
+        let td = unit.items.iter().find_map(|it| match it {
+            Item::Type(td) => Some(td),
+            _ => None,
+        });
+        assert_eq!(
+            reflect_policy(&td.unwrap().attributes, "class Plain { }", dflt),
+            dflt,
+            "no [Reflect] ⇒ module default (TYPE)"
+        );
+
+        // Now the end-to-end recording: build a module with a marked + unmarked
+        // class and inspect `module.type_meta`.
+        let src = r#"
+            [Reflect(.Fields)]
+            class Marked { public int32 mX; public int32 mY; }
+            class Unmarked { public int32 mX; public int32 mY; }
+            class Program { public static int32 Main() { return 0; } }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        let find = |name: &str| -> &TypeMeta {
+            module
+                .type_meta
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("type_meta entry for {name} (have: {:?})",
+                    module.type_meta.iter().map(|t| &t.name).collect::<Vec<_>>()))
+        };
+
+        let marked = find("Marked");
+        assert!(marked.is_ref, "Marked is a class (Ref)");
+        assert!(
+            marked.policy.has(ReflectPolicy::FIELDS),
+            "Marked has FIELDS policy"
+        );
+        assert_eq!(
+            marked.fields.len(),
+            2,
+            "Marked records its 2 user fields ($header excluded)"
+        );
+        assert_eq!(marked.fields[0].name, "mX");
+        assert_eq!(marked.fields[1].name, "mY");
+        // The `$header` is excluded but field_index is the PHYSICAL body index
+        // (offset-0 $header pushes user fields to index 1, 2).
+        assert_eq!(marked.fields[0].field_index, 1);
+        assert_eq!(marked.fields[1].field_index, 2);
+
+        let unmarked = find("Unmarked");
+        assert!(unmarked.is_ref, "Unmarked is a class (Ref)");
+        assert_eq!(
+            unmarked.policy,
+            ReflectPolicy::TYPE,
+            "Unmarked gets the default (TYPE) policy"
+        );
+        assert!(
+            unmarked.fields.is_empty(),
+            "Unmarked's fields are policy-gated empty (the strip differential)"
+        );
+
+        // Dense + name-sorted ids: every type-id is in 0..N (dense), the
+        // VtableDef.type_id matches the TypeMeta.type_id for the same class, and
+        // a name-sort means a class that sorts earlier has a strictly smaller id.
+        let n = module.type_meta.len() as u32;
+        let mut ids: Vec<u32> = module.type_meta.iter().map(|t| t.type_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len() as u32,
+            n,
+            "type-ids are unique (one per reflectable type)"
+        );
+        assert_eq!(*ids.first().unwrap(), 0, "dense ids start at 0");
+        assert_eq!(*ids.last().unwrap(), n - 1, "dense ids are contiguous 0..N");
+
+        // VtableDef.type_id == the matching TypeMeta.type_id (same dense id feeds
+        // both the ClassVData mType word and the metadata).
+        for tm in &module.type_meta {
+            let want = classvdata_name(&format!("{}.", tm.name));
+            // The simple-name prefix may be namespaced for corlib types; match by
+            // the user classes whose prefix is exactly "<name>.".
+            if let Some(vt) = module.vtables.iter().find(|v| v.name == want) {
+                assert_eq!(
+                    vt.type_id, tm.type_id,
+                    "VtableDef.type_id must equal TypeMeta.type_id for {}",
+                    tm.name
+                );
+            }
+        }
+
+        // Name-sort stability: among the user classes, the dense ids honor the
+        // mangled-name (prefix) order. "Marked" < "Program" < "Unmarked"
+        // lexicographically among user types, but corlib types interleave by
+        // name, so assert the RELATIVE order holds (Marked before Unmarked).
+        assert!(
+            marked.type_id < unmarked.type_id,
+            "name-sort: Marked ({}) must get a smaller id than Unmarked ({})",
+            marked.type_id,
+            unmarked.type_id
         );
     }
 }
