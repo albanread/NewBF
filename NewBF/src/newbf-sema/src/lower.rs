@@ -4287,10 +4287,34 @@ enum MixinDecline {
 /// MX-T3 expansion-depth ceiling (mixins.md §3.6/§10): a self/mutually-recursive
 /// mixin chain is bounded; on overflow the gate declines (graceful skip). Defined
 /// here so the predicate and MX-T3's `MixinFrame` share one constant.
-//
-// Consumed by MX-T3's depth guard; unread until then.
-#[allow(dead_code)]
 const MIXIN_MAX_DEPTH: usize = 64;
+
+/// MX-T3: one active mixin splice on the `Lowerer.mixin_stack` (mixins.md §3.3
+/// step 3 / §3.6). The stack tracks the live splice chain so the depth guard can
+/// bound recursion (`depth <= MIXIN_MAX_DEPTH`) and so the unconditional
+/// post-splice truncation (R5) can restore the pre-splice stack length even when
+/// the body escaped via `return`/`break`/`continue` (the §3.6 desync fix). The
+/// caller snapshots (`caller_ret_ty`, `caller_loops_len`) are recorded for
+/// MX-T4's escape-hardening; the depth field is what the guard reads.
+//
+// The fields are snapshots consumed by MX-T4 (escape + empty-loop guards); MX-T3
+// only reads `mixin_stack.len()` for the depth guard, so the per-frame fields are
+// not yet individually read. Allow dead_code (cited to MX-T4) until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct MixinFrame {
+    /// The caller's `ret_ty` at the splice point — a `return` inside the body
+    /// coerces to THIS (it's the live caller's, reused as-is). Snapshotted for
+    /// MX-T4 escape verification; not mutated by the splice.
+    caller_ret_ty: IrType,
+    /// The caller's `loops` depth at the splice point — a `break`/`continue`
+    /// inside the body targets `self.loops.last()` (the caller's innermost loop).
+    /// Snapshotted for MX-T4's empty-loop guard verification.
+    caller_loops_len: usize,
+    /// The nesting depth of this splice (1 at the outermost mixin call, +1 per
+    /// nested `Name!(…)` inside a spliced body). Bounded by `MIXIN_MAX_DEPTH`.
+    depth: usize,
+}
 
 /// MX-T2.5: the call-site facts the strict gate needs that are NOT on the
 /// `MixinDef` (those come from collection). MX-T3 fills this from the live
@@ -4616,6 +4640,70 @@ fn expr_has_free_name(e: &Expr, bound: &HashSet<String>, src: &str) -> bool {
         Expr::Tuple { elems, .. } => elems.iter().any(|a| expr_has_free_name(a, bound, src)),
         Expr::Named { value, .. } => expr_has_free_name(value, bound, src),
         _ => false,
+    }
+}
+
+/// MX-T3 gate-widening companion to [`expr_has_free_name`]: COLLECT (rather than
+/// just test) every bare free VALUE name (an `Expr::Ident` or member base not in
+/// `bound`) into `out`. The widened gate (mixins.md §3.4, `Lowerer::
+/// all_free_names_resolve`) then checks each collected name resolves in the live
+/// caller scope. Same traversal rules as `expr_has_free_name` (callee names are
+/// the method/mixin namespace, not value names — skipped; args are walked).
+fn collect_free_names(e: &Expr, bound: &HashSet<String>, src: &str, out: &mut Vec<String>) {
+    match e {
+        Expr::Ident(s) => {
+            let n = s.text(src);
+            if !bound.contains(n) {
+                out.push(n.to_string());
+            }
+        }
+        Expr::Member { base, .. } => collect_free_names(base, bound, src, out),
+        Expr::Paren { inner, .. } => collect_free_names(inner, bound, src, out),
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => collect_free_names(operand, bound, src, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_free_names(lhs, bound, src, out);
+            collect_free_names(rhs, bound, src, out);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_free_names(target, bound, src, out);
+            collect_free_names(value, bound, src, out);
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            collect_free_names(cond, bound, src, out);
+            collect_free_names(then, bound, src, out);
+            collect_free_names(els, bound, src, out);
+        }
+        Expr::Call { args, .. } | Expr::MixinCall { args, .. } => {
+            for a in args {
+                collect_free_names(a, bound, src, out);
+            }
+        }
+        Expr::Generic { base, .. } => collect_free_names(base, bound, src, out),
+        Expr::Index { base, args, .. } => {
+            collect_free_names(base, bound, src, out);
+            for a in args {
+                collect_free_names(a, bound, src, out);
+            }
+        }
+        Expr::Initializer { base, entries, .. } => {
+            collect_free_names(base, bound, src, out);
+            for a in entries {
+                collect_free_names(a, bound, src, out);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for a in elems {
+                collect_free_names(a, bound, src, out);
+            }
+        }
+        Expr::Named { value, .. } => collect_free_names(value, bound, src, out),
+        _ => {}
     }
 }
 
@@ -6072,6 +6160,13 @@ struct Lowerer<'a> {
     /// of being lowered as an ordinary method call — so when CB-T4 JIT-runs the
     /// generator the emitted text lands in the comptime sink keyed by the owner.
     emit_owner: Option<StructId>,
+    /// MX-T3: the active mixin splices (mixins.md §3.3/§3.6). Empty outside any
+    /// `Name!(…)` expansion; `expand_mixin` pushes a [`MixinFrame`] for the
+    /// duration of each splice and (R5) truncates back to the pre-splice length
+    /// UNCONDITIONALLY afterwards, so a body that escaped via `return`/`break`
+    /// never desyncs the stack. Its length is the recursion depth the guard
+    /// bounds by `MIXIN_MAX_DEPTH`. Reset empty per method in `Lowerer::new`.
+    mixin_stack: Vec<MixinFrame>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -6102,6 +6197,10 @@ impl<'a> Lowerer<'a> {
             enum_locals: HashMap::new(),
             ret_fn_sig: None,
             emit_owner: None,
+            // MX-T3: no splice is active at method entry — each `Name!(…)`
+            // expansion pushes/truncates this; it must start empty so no frame
+            // leaks across methods (mixins.md §4 "reset empty in `Lowerer::new`").
+            mixin_stack: Vec::new(),
         }
     }
 
@@ -6218,7 +6317,28 @@ impl<'a> Lowerer<'a> {
                 self.scopes.pop();
             }
             Stmt::Expr { expr, .. } => {
-                self.expr(expr, src);
+                // MX-T3: a STATEMENT-context mixin call `Name!(args);` splices in
+                // statement position (mixins.md §3.5) — its body's statements run
+                // for effect (e.g. `mixin_stmt_basic` mutating a caller local) and
+                // any trailing yielded value is DISCARDED. We pass a `Void` target
+                // so `expand_mixin` takes the no-value (`want_value = false`) path;
+                // a declined shape returns `None` and falls through to the ordinary
+                // expression lowering (the synthetic-`Call` fallback). All other
+                // expressions lower as before.
+                if let Expr::MixinCall {
+                    callee,
+                    type_args,
+                    args,
+                    ..
+                } = expr
+                    && self
+                        .expand_mixin(callee, type_args, args, Some(IrType::Void), false, src)
+                        .is_some()
+                {
+                    // Expanded in statement position; nothing more to do.
+                } else {
+                    self.expr(expr, src);
+                }
             }
             Stmt::Empty(_) => {}
             // A multi-declarator group `int a = 1, b = 2;` — lower each in the
@@ -7296,17 +7416,17 @@ impl<'a> Lowerer<'a> {
                 }
             }
             // A mixin call `Name!(args)` / `scope::Name!(args)` /
-            // `Name!<T>(args)` (MX-T1). Mixin EXPANSION is MX-T3; here we only
-            // introduce the shape and IGNORE the mixin-ness, lowering to EXACTLY
-            // the verifiable path the pre-MX-T1 parse took. Before MX-T1 a
-            // `Name!(args)` was an `Expr::Call { callee, args }` and a
-            // `Name!<T>(args)` was a `Call { callee: Generic { base, args: T },
-            // args }` (the `!`/`::` were dropped). We reconstruct that exact old
-            // shape and delegate to the `Expr::Call` lowering, so the emitted IR
-            // is byte-identical to before — keeping `Mixins.bf`/`VarArgs.bf`
-            // verify-clean (R7). The `scope_qualifier` (`::`) was discarded by
-            // the old parser, so it is discarded here too. (MX-T3 replaces this
-            // arm with real `expand_mixin` before the unresolved-default.)
+            // `Name!<T>(args)`. MX-T3: try the real SPLICE first (`expand_mixin`).
+            // It returns `Some` only for the v1-supported shapes (mixins.md §3.8)
+            // and `None` for everything else (generic, lambda-in-body, place-
+            // yield, var-write-back, cross-file, …) — every shape `Mixins.bf`
+            // uses — which then falls through to the EXISTING verifiable path: the
+            // synthetic `Expr::Call` the pre-MX-T1 parse took (the `!`/`::`/
+            // `<T>` recombined exactly as before), keeping `Mixins.bf` verify-
+            // clean (R7). This arm is reached with NO call-site target (a bare
+            // sub-expression), so a value mixin infers its result type from the
+            // trailing yield; a targeted position (`Local`/`Return`/typed arg)
+            // routes through `lower_arg_targeted` with the slot type instead.
             Expr::MixinCall {
                 span,
                 callee,
@@ -7314,6 +7434,9 @@ impl<'a> Lowerer<'a> {
                 args,
                 ..
             } => {
+                if let Some(r) = self.expand_mixin(callee, type_args, args, None, false, src) {
+                    return r;
+                }
                 let synthetic_callee: Expr = if type_args.is_empty() {
                     (**callee).clone()
                 } else {
@@ -8000,10 +8123,345 @@ impl<'a> Lowerer<'a> {
         e: &Expr,
         src: &str,
     ) -> Option<(Value, IrType)> {
+        // MX-T3: a value-yielding mixin call in a TARGET-typed position
+        // (`int32 a = Double!(15)`, `return .Ok(Try!(…))`, a typed call arg) —
+        // splice with `target` so the result slot is sized/target-typed correctly
+        // (mixins.md §3.5). `expand_mixin` returns `None` for a declined shape, so
+        // we fall through to the other dot-form guards (a `MixinCall` is none of
+        // them — they return `None` too — and the bare `expr` path then takes the
+        // synthetic-`Call` fallback).
+        if let Expr::MixinCall {
+            callee,
+            type_args,
+            args,
+            ..
+        } = e
+            && let Some(r) = self.expand_mixin(callee, type_args, args, Some(target), false, src)
+        {
+            return Some(r);
+        }
         self.try_target_typed_enum(target, e, src)
             .or_else(|| self.try_target_typed_tuple(target, e, src))
             .or_else(|| self.try_target_typed_ctor(target, e, src))
             .or_else(|| self.try_target_typed_initializer(target, e, src))
+    }
+
+    /// MX-T3 — the mixin splice (mixins.md §3.3/§3.4/§3.5/§3.6). Expand a
+    /// `Name!(args)` call by SPLICING the resolved mixin's body into the CURRENT
+    /// lowering (reusing `self`, the live `Lowerer`), so `return`/`break`/
+    /// `continue` in the body escape to the CALLER for free and every spliced SSA
+    /// value dominates naturally. Returns:
+    ///   - `Some((value, ty))` when the call was expanded — for a value-yielding
+    ///     mixin `value` is the loaded result slot; for a statement-context call
+    ///     (no yield needed) `(undef(Void), Void)` (the caller discards it).
+    ///   - `None` when the strict gate (§3.8) DECLINES — the caller then falls
+    ///     through to the EXISTING verifiable path (the synthetic-`Call`), so
+    ///     every shape `Mixins.bf` uses lowers exactly as before (R7).
+    ///
+    /// `target` is the call-site target type (a `Local`/`Return`/typed-arg slot)
+    /// when known — it sizes the result slot for a value-yielding mixin (§3.5). In
+    /// the v1 first slice an untargeted value mixin (`None` target) infers the
+    /// slot type from the trailing-yield expression's lowered type (single-pass:
+    /// we lower the yield once into the slot and take its own type as the slot
+    /// type), which covers the corpus shapes; a genuinely-ambiguous untargeted
+    /// position simply yields whatever the trailing expr lowers to.
+    fn expand_mixin(
+        &mut self,
+        callee: &Expr,
+        type_args: &[AstType],
+        args: &[Expr],
+        target: Option<IrType>,
+        cascade: bool,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        // 1. Resolve the mixin's simple name from the callee. v1 resolves a bare
+        //    `Name!(…)` or a qualified `Recv.Name!(…)` by the trailing segment
+        //    (mixins are a separate namespace, §10). A non-name callee (an
+        //    expression result) is not a mixin reference → decline.
+        let name = match callee {
+            Expr::Ident(s) => s.text(src),
+            Expr::Member { name, .. } => name.text(src),
+            _ => return None,
+        };
+        let overloads = self.structs.mixins.get(name)?;
+        // Pick the overload whose arity matches the call (v1 resolves by arity).
+        let def = overloads
+            .iter()
+            .find(|d| d.params.len() == args.len())
+            .cloned()?;
+
+        // 2. The caller's file index in `srcs` (v1 same-file gate). The Lowerer
+        //    is handed the borrowed `src` of the file it is lowering; find the
+        //    matching owned copy in `structs.srcs` by content (the prelude +
+        //    user files are few; this runs only at a mixin call site). A miss
+        //    (shouldn't happen) declines.
+        let caller_src_file = self.structs.srcs.iter().position(|s| s == src)?;
+
+        // 3. Build the call-site facts and run the strict gate. `has_this` is
+        //    whether the live caller has a `this` slot (an instance context).
+        let site = MixinCallSite {
+            has_type_args: !type_args.is_empty(),
+            arg_count: args.len(),
+            has_this: self.this_slot.is_some(),
+            caller_src_file,
+            // The const/comptime context is NOT reachable through `expr` lowering
+            // (a const-field initializer never lowers a `MixinCall` — §3.8 belt-
+            // and-braces note), so it is `false` here.
+            in_const_or_comptime: false,
+            cascade,
+        };
+        // The body's declaring source (mixins.md §3.2: `srcs[def.src_file]`). In
+        // v1 (same-file gate) this equals `src`; threaded faithfully so MX-T7 can
+        // relax the gate. Copy the `&'a StructTable` reference out first so the
+        // borrowed source has the Lowerer's `'a` lifetime (NOT a borrow of `self`)
+        // — it must stay valid across the `&mut self` body-lowering calls below.
+        let structs: &'a StructTable = self.structs;
+        let body_src: &'a str = structs.srcs[def.src_file].as_str();
+        match mixin_expandable(&def, &site, body_src) {
+            Ok(()) => {}
+            // WIDEN the gate (mixins.md §3.4, MX-T2.5's deferred relaxation): a
+            // body free name that RESOLVES to a caller local/param in the live
+            // Lowerer scope is the SUPPORTED caller-binding case — the splice
+            // reuses the live scope where those names ARE bound (e.g.
+            // `mixin_stmt_basic` mutating a caller local). Only re-admit when
+            // EVERY free name resolves via `self.lookup`; an owner field/static
+            // bare name (`MixA`'s `mA`, `MixC`'s `sA`) does NOT (`Expr::Ident`
+            // resolves only locals/params, never an implicit `this.field`), so
+            // those stay declined and `Mixins.bf` stays verify-clean (R7).
+            Err(MixinDecline::FreeNameInBody) => {
+                if !self.all_free_names_resolve(&def, body_src) {
+                    return None;
+                }
+            }
+            // Every OTHER decline (generic, lambda/local-fn, place-yield,
+            // unsupported param kind, var-write-back, static-`this`, cascade,
+            // const-context, cross-file, depth) keeps the existing path.
+            Err(_) => return None,
+        }
+
+        // 4. Depth guard (§3.3 step 3 / §3.6): the new splice's depth is the
+        //    current stack length + 1. On overflow, decline (graceful skip — a
+        //    recursive mixin chain falls back to the existing path).
+        let depth = self.mixin_stack.len() + 1;
+        if depth > MIXIN_MAX_DEPTH {
+            return None;
+        }
+
+        // The result slot type for a value-yielding mixin: the call-site target
+        // when known (§3.5 common case). When untargeted, we discover it from the
+        // trailing yield's lowered type below (so we alloca *after* learning it).
+        // A statement-context call passes `target == None` AND has no yield-store
+        // because its trailing value is discarded — distinguished by the body
+        // form at splice time (§3.5).
+
+        // 5. Snapshot the lockstep stack depths BEFORE pushing anything (§3.3
+        //    step 4) — the unconditional truncation (step 8 / R5) restores these
+        //    even on an escaping body.
+        let scopes_snap = self.scopes.len();
+        let defers_snap = self.defers.len();
+        let scope_allocs_snap = self.scope_allocs.len();
+        let mixin_snap = self.mixin_stack.len();
+
+        // 6. Push the lockstep frame (mirrors `Stmt::Block`, 6200-6202) so params
+        //    + body-locals live in a fresh scope and don't leak into the caller.
+        self.scopes.push(HashMap::new());
+        self.defers.push(Vec::new());
+        self.scope_allocs
+            .push((self.fb.current_block(), Vec::new()));
+        self.mixin_stack.push(MixinFrame {
+            caller_ret_ty: self.ret_ty,
+            caller_loops_len: self.loops.len(),
+            depth,
+        });
+
+        // 7. PARAM-BIND-ONCE (§3.3 step 6): evaluate each arg EXACTLY ONCE in the
+        //    caller's context, store into a fresh alloca, and bind the param name
+        //    as an ordinary local in the splice scope. The body referencing the
+        //    param then loads the bound slot — args are never re-evaluated per use
+        //    (proven by `mixin_arg_once`). `VarInfer` infers the slot type from
+        //    the arg's lowered type (no declared-type coercion).
+        for (p, a) in def.params.iter().zip(args.iter()) {
+            // A declared (non-`var`) param type target-types the arg (so a typed
+            // slot picks the right monomorph / coercion); a `var` param infers.
+            let declared = match p.kind {
+                MixinParamKind::VarInfer => None,
+                _ => p
+                    .ty
+                    .as_ref()
+                    .map(|t| lower_value_ty(t, src, self.structs, self.env)),
+            };
+            let (v, t) = declared
+                .and_then(|target| self.lower_arg_targeted(target, a, src))
+                .unwrap_or_else(|| self.expr(a, src));
+            let slot_ty = declared.unwrap_or(t);
+            let slot = self.fb.alloca(slot_ty);
+            let cv = self.coerce(v, t, slot_ty);
+            self.fb.store(slot.clone(), cv);
+            self.bind(&p.name, slot, slot_ty, None);
+        }
+
+        // 8. SPLICE the body, capturing the yield for a value-yielding call.
+        //    The body form drives statement-vs-expression (§3.5):
+        //      - `MethodBody::Expr(e)`  → the operand `e` is the yield.
+        //      - `MethodBody::Block`    → lower the leading statements normally;
+        //        the trailing bare `Stmt::Expr` is the yield (block-trailing-yield).
+        //    `want_value` is whether the call is in expression position (a value
+        //    is needed). In statement position the trailing value is discarded.
+        let want_value = !matches!(target, Some(IrType::Void));
+        let yielded = self.splice_body(&def.body, want_value, target, body_src);
+
+        // 9. UNCONDITIONAL stack truncation back to the snapshot (§3.3 step 8 /
+        //    R5) — even when the body escaped via `return`/`break` and
+        //    `self.terminated` is set. A paired pop would be skipped on the
+        //    escape path; truncation is not, so the stack never desyncs.
+        self.scopes.truncate(scopes_snap);
+        self.defers.truncate(defers_snap);
+        self.scope_allocs.truncate(scope_allocs_snap);
+        self.mixin_stack.truncate(mixin_snap);
+
+        // 10. Result. A value-yielding call returns the captured yield (or, after
+        //     an always-escaping body where `terminated` is set, a dead-code
+        //     `undef` of the result type — §3.6). A statement-context call
+        //     returns unit/Void.
+        match yielded {
+            Some((v, t)) => Some((v, t)),
+            None => Some((undef(IrType::Void), IrType::Void)),
+        }
+    }
+
+    /// MX-T3 splice helper: lower a mixin body into the current lowering and, when
+    /// `want_value`, capture its yield into a pre-alloca'd result slot guarded by
+    /// `!terminated` (mixins.md §3.5/§3.6). Returns `Some((loaded, ty))` for a
+    /// value-yielding splice, `None` for a statement-context splice (no yield).
+    ///
+    /// Block-trailing-yield: a `MethodBody::Block` lowers every statement BEFORE
+    /// the trailing one normally; the trailing bare `Stmt::Expr` is NOT discarded
+    /// (the normal block behavior) but lowered and STORED into the result slot,
+    /// guarded by `!self.terminated` (so a `return`/`break` earlier in the block
+    /// doesn't store dead). An `=> expr` body stores its single operand likewise.
+    fn splice_body(
+        &mut self,
+        body: &MethodBody,
+        want_value: bool,
+        target: Option<IrType>,
+        body_src: &str,
+    ) -> Option<(Value, IrType)> {
+        // The trailing yield expression (the value form) and the leading
+        // statements to lower first.
+        let (lead, trailing): (&[Stmt], Option<&Expr>) = match body {
+            MethodBody::Expr(e) => (&[], Some(e)),
+            MethodBody::Block(Stmt::Block { stmts, .. }) => match stmts.split_last() {
+                Some((Stmt::Expr { expr, .. }, head)) => (head, Some(expr)),
+                // A block whose last statement is NOT a bare expr (e.g. ends in a
+                // `return`): no trailing yield — lower every statement as-is.
+                _ => (stmts.as_slice(), None),
+            },
+            // A non-block, non-expr body (a single `Stmt` from a local mixin that
+            // is not a block): lower it as one statement, no yield.
+            MethodBody::Block(single) => {
+                self.stmt(single, body_src);
+                return None;
+            }
+            MethodBody::None => return None,
+        };
+
+        if !want_value {
+            // Statement context (§3.5): splice all statements; discard the
+            // trailing value (lower it for side-effects only). No result slot.
+            for s in lead {
+                self.stmt(s, body_src);
+                if self.terminated {
+                    return None;
+                }
+            }
+            if let Some(e) = trailing
+                && !self.terminated
+            {
+                self.expr(e, body_src);
+            }
+            return None;
+        }
+
+        // Expression context: lower the leading statements first, then the yield.
+        // We need the result slot type before storing. If the call site gave a
+        // target type, alloca it up front; otherwise discover it from the yield's
+        // lowered type (single-pass: lower the yield, then alloca its type).
+        for s in lead {
+            self.stmt(s, body_src);
+            if self.terminated {
+                // The body escaped before the yield (e.g. an unconditional
+                // `return` in a leading statement). The post-splice load is dead
+                // code; yield an `undef` of the best-known result type (§3.6).
+                let ty = target.unwrap_or(IrType::I64);
+                return Some((undef(ty), ty));
+            }
+        }
+        let Some(yield_expr) = trailing else {
+            // A value was wanted but the block has no trailing yield (it ended in
+            // a terminator handled above, or was empty). Dead/degenerate: yield a
+            // default of the target type.
+            let ty = target.unwrap_or(IrType::I64);
+            return Some((undef(ty), ty));
+        };
+
+        match target {
+            Some(slot_ty) => {
+                let slot = self.fb.alloca(slot_ty);
+                if !self.terminated {
+                    let (v, t) = self
+                        .lower_arg_targeted(slot_ty, yield_expr, body_src)
+                        .unwrap_or_else(|| self.expr(yield_expr, body_src));
+                    let cv = self.coerce(v, t, slot_ty);
+                    if !self.terminated {
+                        self.fb.store(slot.clone(), cv);
+                    }
+                }
+                // Load only when reachable; otherwise a dead `undef` (§3.6).
+                if self.terminated {
+                    Some((undef(slot_ty), slot_ty))
+                } else {
+                    Some((self.fb.load(slot, slot_ty), slot_ty))
+                }
+            }
+            None => {
+                // Untargeted: lower the yield to learn its type, alloca that, and
+                // round-trip through the slot (keeps the value an alloca-backed
+                // load — uniform with the targeted path; the store/load dominate).
+                let (v, t) = self.expr(yield_expr, body_src);
+                if self.terminated {
+                    return Some((undef(t), t));
+                }
+                let slot = self.fb.alloca(t);
+                self.fb.store(slot.clone(), v);
+                Some((self.fb.load(slot, t), t))
+            }
+        }
+    }
+
+    /// MX-T3 gate-widening helper (mixins.md §3.4): whether EVERY free value name
+    /// in `def`'s body resolves to a caller local/param in the LIVE Lowerer scope.
+    /// `body_has_free_name` (the static gate) declines any bare value ident that
+    /// is neither a param nor a body-local; this re-admits exactly the supported
+    /// caller-binding case — a free name that names a caller local/param the
+    /// splice can bind because it reuses the live scope. Returns `false` (decline
+    /// stands) if any free name is unresolved (an owner field/static like `mA`/
+    /// `sA`, or a genuinely-undefined name).
+    fn all_free_names_resolve(&self, def: &MixinDef, body_src: &str) -> bool {
+        // The names bound INSIDE the body (its params + block-body locals) — the
+        // same set `body_has_free_name` excludes.
+        let mut bound: HashSet<String> = def.params.iter().map(|p| p.name.clone()).collect();
+        if let MethodBody::Block(s) = &def.body {
+            collect_body_local_names(s, body_src, &mut bound);
+        }
+        let mut free: Vec<String> = Vec::new();
+        let mut collect = |e: &Expr| collect_free_names(e, &bound, body_src, &mut free);
+        match &def.body {
+            MethodBody::Expr(e) => collect(e),
+            MethodBody::Block(s) => for_each_stmt_expr(s, &mut collect),
+            MethodBody::None => {}
+        }
+        // Every free name must resolve as a caller local/param.
+        free.iter().all(|n| self.lookup(n).is_some())
     }
 
     /// Phase 1 of two-phase target-typed arg resolution (§3.1): walk `args`

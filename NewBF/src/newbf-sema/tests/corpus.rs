@@ -319,3 +319,62 @@ fn mixins_bf_parses_to_mixin_variants_and_still_verifies() {
     let module = lower_program(&srcs, &program);
     newbf_llvm::verify_module(&module).expect("MX-T1 R7: Mixins.bf must still verify clean");
 }
+
+/// Parse → analyze → lower → LLVM-verify a single in-memory program.
+fn verify_src(src: &str) -> Result<(), String> {
+    let (unit, _pdiags) = parse_file(src, FileId(0));
+    let srcs = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let program = analyze(&srcs);
+    let module = lower_program(&srcs, &program);
+    newbf_llvm::verify_module(&module)
+}
+
+/// MX-T3 decline pin #1 (mixins.md §3.4 static-caller guard): a mixin body that
+/// references `this` while the CALLER is a static method declines
+/// (`ReferencesThisStatically`) — `Expr::This` would otherwise yield `undef(Ptr)`.
+/// The gate returns `None` and the call falls back to the existing verifiable path
+/// (the synthetic `Call`), so the module still verifies clean (no panic, no novel
+/// IR). This pins that turning expansion ON does NOT regress the static-`this`
+/// shape.
+#[test]
+fn mx_t3_static_this_mixin_declines_and_verifies() {
+    let src = "\
+class C {
+	int32 field = 5;
+	static mixin Touch() {
+		this.field += 1;
+	}
+	public static int32 Main() {
+		Touch!();
+		return 0;
+	}
+}
+";
+    verify_src(src).expect("MX-T3: a static-context `this`-mixin call declines and verifies clean");
+}
+
+/// MX-T3 decline pin #2 (mixins.md §3.5): a generic mixin used as an UNTARGETED
+/// sub-expression (`Wrap!<int32>(x) + 1`) declines (`Generic`, via the call's
+/// `type_args`) and falls back to the existing verifiable path — the untargeted
+/// expression-mixin position lowers without panic and the module verifies clean.
+/// (A non-generic untargeted sub-expression instead EXPANDS via the single-pass
+/// inferred-type path, §3.5 — also verifiable; this pin uses the generic form to
+/// exercise the decline-and-fallback at an untargeted position specifically.)
+#[test]
+fn mx_t3_untargeted_subexpr_mixin_declines_and_verifies() {
+    let src = "\
+class C {
+	static mixin Wrap<T>(T x) => x;
+	public static int32 Main() {
+		int32 y = Wrap!<int32>(20) + 1;
+		return y;
+	}
+}
+";
+    verify_src(src)
+        .expect("MX-T3: an untargeted (generic) sub-expression mixin declines and verifies clean");
+}
