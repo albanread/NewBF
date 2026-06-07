@@ -43,13 +43,47 @@ use newbf_sema::{analyze, lower_program, SourceFile};
 
 use newbf_lexer::FileId;
 
-/// Anti-cycle backstop only (comptime-breadth §3.4 / CB-T5 hardens it): the
-/// dedup `seen` set makes identical emissions idempotent, so a well-behaved
-/// generator stabilizes in 1–3 rounds. This caps the *number* of rounds for a
-/// generator that returns normally but emits divergent text each round, turning
-/// a would-be infinite loop into an error rather than a hang. (An emitter with
-/// an *internal* infinite loop still hangs — bounded execution is deferred.)
-const MAX_EMIT_ROUNDS: u32 = 16;
+/// Default anti-cycle backstop (comptime-breadth §3.4): the dedup `seen` set
+/// makes identical emissions idempotent, so a well-behaved generator stabilizes
+/// in 1–3 rounds. This caps the *number* of rounds for a generator that returns
+/// normally but emits divergent text each round, turning a would-be infinite
+/// loop into a **diagnostic** rather than a hang. (An emitter with an *internal*
+/// infinite loop still hangs — bounded execution is deferred.) Overridable via
+/// [`EmitConfig::max_rounds`].
+pub const DEFAULT_MAX_EMIT_ROUNDS: u32 = 16;
+
+/// Default total-emitted-bytes cap across all rounds (comptime-breadth §3.4): a
+/// generous 1 MiB. The dedup set catches a generator that re-emits *identical*
+/// text, but a generator that emits **unique growing** text each round defeats
+/// dedup (every emission is new) and would only be bounded by the round cap;
+/// the byte cap additionally bounds a generator that emits a lot of *new* text
+/// within the round budget. Overridable via [`EmitConfig::max_bytes`].
+pub const DEFAULT_MAX_EMIT_BYTES: usize = 1 << 20;
+
+/// Tunable termination caps for the emission fixpoint loop (comptime-breadth
+/// §3.4). Both guards are **anti-cycle backstops**, not correctness guarantees:
+/// a legitimate generator that genuinely needs more rounds / bytes must raise
+/// the relevant cap explicitly. Defaults keep the corpus unaffected (the corpus
+/// has no divergent emitters, so neither cap is ever approached).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EmitConfig {
+    /// Hard cap on fixpoint rounds before a non-convergence diagnostic is
+    /// emitted and the loop stops (default [`DEFAULT_MAX_EMIT_ROUNDS`]).
+    pub max_rounds: u32,
+    /// Hard cap on the total bytes of emitted text accumulated across all
+    /// rounds before a runaway-growth diagnostic is emitted and the loop stops
+    /// (default [`DEFAULT_MAX_EMIT_BYTES`]).
+    pub max_bytes: usize,
+}
+
+impl Default for EmitConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: DEFAULT_MAX_EMIT_ROUNDS,
+            max_bytes: DEFAULT_MAX_EMIT_BYTES,
+        }
+    }
+}
 
 /// The base FileId for synthesized `extension` units, well clear of the prelude
 /// band (`10_000+`, see `lower_program`) and user files (`0..n`).
@@ -161,11 +195,23 @@ fn normalize(text: &str) -> String {
 }
 
 /// Drive comptime member emission to a fixpoint and return the final,
-/// codegen-ready module (comptime-breadth §3.1, §5.3).
+/// codegen-ready module (comptime-breadth §3.1, §5.3), using the default
+/// termination caps ([`EmitConfig::default`]). This is the entry point the
+/// driver and run-corpus harness call.
+///
+/// Equivalent to [`run_emission_with`]`(base, &EmitConfig::default())` — see it
+/// for the full loop, guard, and strip semantics.
+pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), String> {
+    run_emission_with(base, &EmitConfig::default())
+}
+
+/// Drive comptime member emission to a fixpoint with explicit termination caps
+/// ([`EmitConfig`]) and return the final, codegen-ready module
+/// (comptime-breadth §3.1, §5.3).
 ///
 /// `base` is the user's parsed source (the same `&[SourceFile]` the driver and
 /// run-corpus harness build and hand to `analyze` / `lower_program`).
-/// `run_emission` re-analyzes + re-lowers internally — lowering is a pure
+/// `run_emission_with` re-analyzes + re-lowers internally — lowering is a pure
 /// `source → Module` function, so the loop just augments the source set with
 /// `extension Owner { … }` units and re-lowers until no new member is emitted.
 ///
@@ -180,14 +226,51 @@ fn normalize(text: &str) -> String {
 /// a sandbox clone with [`__newbf_ct_emit`] bound via `add_absolute_symbol`,
 /// drain [`EMIT_SINK`], resolve each owner id → qualified name via the per-round
 /// `StructId → qual` map, normalize + dedup, splice as `extension Owner { … }`,
-/// and re-lower. Stops at fixpoint (nothing new) or trips [`MAX_EMIT_ROUNDS`].
+/// and re-lower.
+///
+/// **Termination + diagnostics (CB-T5, load-bearing).** The loop is
+/// triple-guarded and a tripped guard is reported, **never** swallowed and
+/// **never** a hang or crash:
+///   * the `seen` normalized-text dedup makes identical re-emissions idempotent
+///     (the fixpoint exit);
+///   * a **round cap** ([`EmitConfig::max_rounds`]) bounds a generator that
+///     returns but emits divergent text each round — on trip the loop **stops**
+///     and pushes a structured non-convergence diagnostic into
+///     [`EmitOutcome::diagnostics`], returning the module-so-far (not an `Err`);
+///   * a **byte cap** ([`EmitConfig::max_bytes`]) bounds total emitted bytes
+///     across rounds — a generator emitting *unique growing* text defeats dedup
+///     (every emission is new) but trips this cap with the same
+///     stop-with-diagnostic behavior.
+///
+/// Additionally, if **re-analyzing the spliced sources** produces analyze
+/// diagnostics (the EMITTED code is malformed — e.g. a duplicate member), those
+/// are surfaced into [`EmitOutcome::diagnostics`] and the loop **stops** (abort
+/// on generated-code analyze diagnostics — not a silent miscompile, not an
+/// infinite loop). A parse error in generated source still aborts via `Err`
+/// (a parse failure is structural, not a recoverable program diagnostic).
 ///
 /// **The strip (R6, load-bearing).** Before returning, every emitter generator
 /// (a `module.comptime` symbol that transitively references `__newbf_ct_emit`)
 /// and the `__newbf_ct_emit` extern itself are removed — the app/run JIT and the
 /// AOT link never register the shim, so a survivor would fail `lookup`/link. The
 /// emitted members (ordinary reparsed source) stay.
-pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), String> {
+pub fn run_emission_with(
+    base: &[SourceFile<'_>],
+    config: &EmitConfig,
+) -> Result<(IrModule, EmitOutcome), String> {
+    run_emission_inner(base, config, run_generators)
+}
+
+/// The shared fixpoint loop, parameterized by the generator-runner so tests can
+/// inject a deterministic emitter (e.g. one that returns normally but emits
+/// **divergent / growing** text each round, to exercise the round/byte caps
+/// without depending on a non-deterministic JIT'd generator). Production calls
+/// it with [`run_generators`] (which JITs the real generators in a sandbox).
+fn run_emission_inner(
+    base: &[SourceFile<'_>],
+    config: &EmitConfig,
+    mut run_gens: impl FnMut(&IrModule) -> Result<Vec<(i32, String)>, String>,
+) -> Result<(IrModule, EmitOutcome), String> {
     // The owned synthesized `extension` units, kept alive for the whole loop so
     // each round's borrowed `SourceFile` set can reference them (comptime-breadth
     // §3.4 ownership model). `String` (source) + `CompUnit` (its parse tree).
@@ -195,6 +278,10 @@ pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), 
     // Normalized (owner, text) pairs already spliced — the idempotency guard.
     let mut seen: HashSet<EmitKey> = HashSet::new();
     let mut rounds: u32 = 0;
+    // Total bytes of emitted text accumulated across all rounds — the byte cap's
+    // running total (a runaway emitter that emits unique growing text each round
+    // defeats `seen` dedup but is bounded here).
+    let mut total_emitted_bytes: usize = 0;
 
     loop {
         // (a) Build the round's source set = base + generated, then lower it.
@@ -215,6 +302,35 @@ pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), 
             });
         }
         let program = analyze(&files);
+
+        // (a') Abort on generated-code analyze diagnostics (comptime-breadth
+        //      §3.4 step 1 / CB-T5). Only relevant once we have spliced
+        //      `generated` units: a diagnostic now means the EMITTED source is
+        //      malformed (e.g. a duplicate member). Surface every analyze
+        //      diagnostic into the outcome and STOP — don't lower garbage IR
+        //      (a silent miscompile) and don't loop forever. Base-program
+        //      diagnostics (round 0, no generated units) are the driver's job to
+        //      surface via its own `analyze`, so we don't double-report them.
+        if !generated.is_empty() && !program.diagnostics.is_empty() {
+            let mut diagnostics: Vec<String> = vec![format!(
+                "comptime: generated source produced {} analyze diagnostic(s); \
+                 aborting emission (the emitted code is malformed)",
+                program.diagnostics.len()
+            )];
+            diagnostics.extend(
+                program
+                    .diagnostics
+                    .iter()
+                    .map(|d| format!("comptime: generated-code diagnostic: {}", d.message)),
+            );
+            // Lower so the strip + return produce a settled module (the emitted
+            // members are still present as best-effort IR; the diagnostics tell
+            // the driver to fail, so this module is never codegen'd in practice).
+            let module = lower_program(&files, &program);
+            let final_module = strip_emitter_and_shim(module);
+            return Ok((final_module, EmitOutcome { rounds, diagnostics }));
+        }
+
         let module = lower_program(&files, &program);
 
         // (b) Fast path / fixpoint exit: no generators recorded → done.
@@ -223,13 +339,23 @@ pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), 
             return Ok((final_module, EmitOutcome { rounds, diagnostics: Vec::new() }));
         }
 
-        // Anti-cycle backstop: a generator that returns but emits divergent text
-        // each round never reaches the fixpoint; cap the rounds (CB-T5 also adds
-        // a byte cap + surfaces this as a structured diagnostic).
-        if rounds >= MAX_EMIT_ROUNDS {
-            return Err(format!(
-                "comptime: emission did not reach a fixpoint within {MAX_EMIT_ROUNDS} rounds \
-                 (a generator likely emits divergent text each round)"
+        // (b') Round cap — anti-cycle backstop (comptime-breadth §3.4). A
+        //      generator that returns but emits divergent text each round never
+        //      reaches the fixpoint; cap the rounds, STOP, and surface a
+        //      structured non-convergence diagnostic (NOT an `Err`, NOT a hang).
+        //      The module-so-far is stripped + returned so the driver can still
+        //      report cleanly.
+        if rounds >= config.max_rounds {
+            let diag = format!(
+                "comptime: emission did not converge within {} round(s) — a generator \
+                 likely emits divergent text each round (raise EmitConfig::max_rounds \
+                 if the generator legitimately needs more)",
+                config.max_rounds
+            );
+            let final_module = strip_emitter_and_shim(module);
+            return Ok((
+                final_module,
+                EmitOutcome { rounds, diagnostics: vec![diag] },
             ));
         }
         rounds += 1;
@@ -244,13 +370,17 @@ pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), 
         // (d) Run every generator (deterministic order) via one nullary wrapper
         //     in a sandbox clone, then drain the sink.
         let _ = drain_emit_sink(); // discard any residue from a prior call/thread
-        let emissions = run_generators(&module)?;
+        let emissions = run_gens(&module)?;
 
         // (e) Resolve + normalize + dedup; splice each NEW emission as an
         //     `extension`. Process in a deterministic order so the next round's
         //     StructId assignment (and thus any further emission) is reproducible.
         let mut new_units: Vec<(String, String)> = Vec::new();
         for (owner_id, text) in emissions {
+            // Account every emitted byte toward the byte cap *before* dedup, so a
+            // generator that emits unique growing text (defeating dedup) is
+            // bounded by total output, not just by distinct-unit count.
+            total_emitted_bytes = total_emitted_bytes.saturating_add(text.len());
             let Some(qual) = id_to_qual.get(&owner_id) else {
                 return Err(format!(
                     "comptime: emitted text routed to unknown owner id {owner_id} \
@@ -263,6 +393,26 @@ pub fn run_emission(base: &[SourceFile<'_>]) -> Result<(IrModule, EmitOutcome), 
             }
         }
         new_units.sort();
+
+        // (e') Byte cap — anti-cycle backstop for *growth* (comptime-breadth
+        //      §3.4). A generator emitting unique text each round defeats the
+        //      `seen` dedup (every emission is new), so the round cap alone could
+        //      let it emit a great deal before tripping; the byte cap bounds the
+        //      total. On trip, STOP with a structured diagnostic (NOT an `Err`,
+        //      NOT a hang). Checked after accounting this round's emissions.
+        if total_emitted_bytes > config.max_bytes {
+            let diag = format!(
+                "comptime: emission exceeded the {}-byte total-output cap after {} round(s) \
+                 ({} bytes emitted) — a generator likely emits growing text each round \
+                 (raise EmitConfig::max_bytes if this is intended)",
+                config.max_bytes, rounds, total_emitted_bytes
+            );
+            let final_module = strip_emitter_and_shim(module);
+            return Ok((
+                final_module,
+                EmitOutcome { rounds, diagnostics: vec![diag] },
+            ));
+        }
 
         // (f) Fixpoint reached if nothing new was emitted this round.
         if new_units.is_empty() {
@@ -426,8 +576,8 @@ fn strip_emitter_and_shim(mut module: IrModule) -> IrModule {
 #[cfg(test)]
 mod tests {
     use super::{
-        __newbf_ct_emit, drain_emit_sink, normalize, run_emission, strip_emitter_and_shim,
-        EmitOutcome,
+        __newbf_ct_emit, drain_emit_sink, normalize, owner_id_to_qual, run_emission,
+        run_emission_inner, strip_emitter_and_shim, EmitConfig, EmitOutcome,
     };
     use newbf_ir::{FunctionBuilder, IrType, Module as IrModule, Param, Value};
     use newbf_lexer::FileId;
@@ -621,5 +771,224 @@ mod tests {
             vec![(OWNER_ID, text.to_string())],
             "the host shim received (owner_id, text) from JIT'd code"
         );
+    }
+
+    // ── CB-T5: fixpoint guards + diagnostics ──────────────────────────────────
+
+    /// A base program with a real `[Comptime, EmitGenerator]` so the lowered
+    /// module records a non-empty `emit_jobs` (the loop only invokes the
+    /// generator-runner when generators exist). The integration tests inject a
+    /// *synthetic* generator-runner via `run_emission_inner` to drive the
+    /// round/byte caps deterministically (a JIT'd generator cannot emit
+    /// per-round-divergent text without host state — comptime-breadth §3.4).
+    const DIVERGENT_BASE_SRC: &str = r#"
+        class Bag {
+            public int32 mN;
+            [Comptime, EmitGenerator]
+            public static void Generate() {
+                Compiler.EmitTypeBody("public int32 Tag0() { return this.mN; }");
+            }
+        }
+        class Program { public static int32 Main() { return 0; } }
+    "#;
+
+    /// Build the borrowed `SourceFile` set for a one-file base program, calling
+    /// `run_emission_inner` with a caller-supplied generator-runner + caps.
+    fn run_inner(
+        src: &str,
+        config: EmitConfig,
+        run_gens: impl FnMut(&IrModule) -> Result<Vec<(i32, String)>, String>,
+    ) -> (IrModule, EmitOutcome) {
+        let (unit, pdiags) = parse_file(src, FileId(0));
+        assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        run_emission_inner(&files, &config, run_gens).expect("inner emission returns Ok")
+    }
+
+    /// Resolve a valid owner id for the round (the id `Bag` is registered under),
+    /// so the synthetic emitter routes its text to a real type.
+    fn an_owner_id(module: &IrModule) -> i32 {
+        *owner_id_to_qual(module)
+            .keys()
+            .next()
+            .expect("the lowered module has at least one emit-job owner")
+    }
+
+    /// **The round-cap diagnostic (CB-T5 acceptance — returning-but-divergent).**
+    /// A generator that returns normally but emits **unique text each round**
+    /// never reaches the `seen`-dedup fixpoint. With a small round cap the loop
+    /// must STOP and surface a structured non-convergence diagnostic — **no
+    /// crash, no hang, no `Err`**.
+    #[test]
+    fn divergent_emitter_trips_round_cap_with_diagnostic() {
+        let mut n = 0u32;
+        let (_module, outcome) = run_inner(
+            DIVERGENT_BASE_SRC,
+            EmitConfig {
+                max_rounds: 4,
+                // Generous byte cap so the ROUND cap is the thing under test.
+                max_bytes: 1 << 30,
+            },
+            |module| {
+                let owner = an_owner_id(module);
+                // A unique (small) method each round → always "new" → never dedups.
+                let text = format!("public int32 R{n}() {{ return {n}; }}");
+                n += 1;
+                Ok(vec![(owner, text)])
+            },
+        );
+        assert_eq!(
+            outcome.rounds, 4,
+            "the loop stops exactly at the round cap (no hang)"
+        );
+        assert_eq!(
+            outcome.diagnostics.len(),
+            1,
+            "exactly one round-cap diagnostic, got: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            outcome.diagnostics[0].contains("did not converge"),
+            "the diagnostic names non-convergence: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// **The byte-cap diagnostic (CB-T5 acceptance — runaway growth).** A
+    /// generator that emits a large chunk of *unique* text each round defeats the
+    /// `seen` dedup (every emission is new) but is bounded by the total-output
+    /// byte cap: the loop STOPs with a structured runaway-growth diagnostic
+    /// **before** the round cap, with no hang/crash.
+    #[test]
+    fn growing_emitter_trips_byte_cap_with_diagnostic() {
+        let mut n = 0u32;
+        let (_module, outcome) = run_inner(
+            DIVERGENT_BASE_SRC,
+            EmitConfig {
+                // High round cap so the BYTE cap trips first.
+                max_rounds: 1000,
+                max_bytes: 4096,
+            },
+            |module| {
+                let owner = an_owner_id(module);
+                // ~2 KiB of unique text per round → the 4 KiB cap trips by round 3.
+                let filler = "x".repeat(2000);
+                let text = format!("public int32 Big{n}() {{ /* {filler} */ return {n}; }}");
+                n += 1;
+                Ok(vec![(owner, text)])
+            },
+        );
+        assert!(
+            outcome.rounds < 1000,
+            "the byte cap stops the loop well before the round cap (rounds={})",
+            outcome.rounds
+        );
+        assert_eq!(
+            outcome.diagnostics.len(),
+            1,
+            "exactly one byte-cap diagnostic, got: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            outcome.diagnostics[0].contains("byte"),
+            "the diagnostic names the byte cap: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// **Idempotency / fixpoint (CB-T5 dedup).** A generator that re-emits the
+    /// **same** (normalized) text every round converges via the `seen` dedup: it
+    /// is spliced once, the next round emits the identical (now-deduped) text, and
+    /// the loop reaches a clean fixpoint with NO diagnostics — even under a tiny
+    /// round cap that a divergent emitter would trip.
+    #[test]
+    fn idempotent_emitter_converges_no_diagnostic() {
+        let (_module, outcome) = run_inner(
+            DIVERGENT_BASE_SRC,
+            EmitConfig {
+                max_rounds: 3,
+                max_bytes: 1 << 20,
+            },
+            |module| {
+                let owner = an_owner_id(module);
+                // Identical text every round (only cosmetic whitespace varies, which
+                // `normalize` collapses) → deduped after the first splice → fixpoint.
+                Ok(vec![(
+                    owner,
+                    "public int32 Stable()  {  return 1;  }".to_string(),
+                )])
+            },
+        );
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "an idempotent emitter converges with no diagnostic, got: {:?}",
+            outcome.diagnostics
+        );
+        // 2 rounds: round 1 splices the member, round 2 emits the identical text
+        // (deduped → nothing new) → fixpoint.
+        assert!(
+            outcome.rounds <= 2,
+            "idempotent emission reaches the fixpoint in ≤2 rounds (got {})",
+            outcome.rounds
+        );
+    }
+
+    /// **Abort on generated-code analyze diagnostics (CB-T5 acceptance).** A
+    /// generator emits a member that, once spliced as `extension Bag { … }`,
+    /// produces an **analyze diagnostic** (here a duplicate field — what this
+    /// compiler's `analyze` catches; see the report's deviation note). The loop
+    /// must surface the analyze diagnostic into the outcome and STOP — not lower
+    /// garbage IR (a silent miscompile) and not loop forever.
+    #[test]
+    fn generated_code_analyze_diagnostic_aborts_with_diagnostic() {
+        let (_module, outcome) = run_inner(
+            DIVERGENT_BASE_SRC,
+            EmitConfig::default(),
+            |module| {
+                let owner = an_owner_id(module);
+                // Two identical fields in ONE emitted extension unit → analyze's
+                // `check_duplicate_members` fires `duplicate member`.
+                Ok(vec![(
+                    owner,
+                    "public int32 dupF; public int32 dupF;".to_string(),
+                )])
+            },
+        );
+        assert!(
+            !outcome.diagnostics.is_empty(),
+            "a malformed (analyze-erroring) emission must surface a diagnostic"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("generated source produced")),
+            "an abort header names generated-source analyze diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("duplicate member")),
+            "the underlying analyze diagnostic is surfaced verbatim: {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// The default caps leave a well-behaved (no-generator) program completely
+    /// unaffected — the fast path runs zero rounds with no diagnostics, and the
+    /// `EmitConfig` defaults match the documented values (corpus unaffected).
+    #[test]
+    fn default_config_matches_documented_caps() {
+        let cfg = EmitConfig::default();
+        assert_eq!(cfg.max_rounds, super::DEFAULT_MAX_EMIT_ROUNDS);
+        assert_eq!(cfg.max_bytes, super::DEFAULT_MAX_EMIT_BYTES);
+        assert_eq!(cfg.max_rounds, 16);
+        assert_eq!(cfg.max_bytes, 1 << 20);
     }
 }

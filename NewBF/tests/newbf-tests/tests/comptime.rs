@@ -283,3 +283,55 @@ fn comptime_emit_dead_member_still_links() {
     let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
     assert_eq!(main(), 7);
 }
+
+// ── CB-T5: fixpoint guards + diagnostics (public-API integration) ─────────────
+
+/// **Abort on generated-code analyze diagnostics (CB-T5 acceptance), full
+/// frontend through the public `run_emission`.** A `[Comptime, EmitGenerator]`
+/// emits MALFORMED member text: two identical fields. Once spliced as
+/// `extension Bag { … }` and re-analyzed, this trips analyze's duplicate-member
+/// check, so emission must STOP and surface the analyze diagnostic in
+/// `EmitOutcome.diagnostics` — NOT lower garbage IR (a silent miscompile) and
+/// NOT loop forever.
+///
+/// NOTE: the comptime-breadth doc frames this as a "missing-field" emission, but
+/// this compiler's `analyze` does not resolve method bodies (it checks usings,
+/// duplicate types, duplicate fields/cases, generic-method guards), so a missing
+/// field surfaces only at lowering (as `undef`), not as an analyze diagnostic.
+/// A duplicate field is the equivalent analyze-catchable malformed emission; the
+/// abort MECHANISM under test (generated-code analyze diagnostics → surface +
+/// stop) is identical regardless of which analyze rule the bad emission trips.
+#[test]
+fn comptime_emit_malformed_aborts_with_analyze_diagnostic() {
+    let src = r#"
+        class Bag {
+            public int32 mN;
+            [Comptime, EmitGenerator]
+            public static void Generate() {
+                Compiler.EmitTypeBody("public int32 dupF; public int32 dupF;");
+            }
+        }
+        class Program {
+            public static int32 Main() { return 0; }
+        }
+    "#;
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    // Emission returns Ok (no crash, no hang, no Err) but with diagnostics — the
+    // driver/harness surfaces those as a failure.
+    let (_module, outcome) = run_emission(&files).expect("emission returns Ok (diagnostics, not Err)");
+    assert!(
+        !outcome.diagnostics.is_empty(),
+        "a malformed (analyze-erroring) emission surfaces a diagnostic, not a silent miscompile"
+    );
+    assert!(
+        outcome.diagnostics.iter().any(|d| d.contains("duplicate member")),
+        "the underlying analyze diagnostic is surfaced: {:?}",
+        outcome.diagnostics
+    );
+}

@@ -44,8 +44,16 @@ fn run(src: &str) -> i32 {
     // the final module JIT-links clean. For the generator-free programs (the
     // entire current corpus) this is the no-op fast path: it lowers once and
     // returns verbatim, so behavior is unchanged.
-    let (module, _emit) =
+    let (module, emit) =
         newbf_comptime::run_emission(&files).expect("comptime emission succeeds");
+    // Positive corpus programs must converge cleanly: any emission diagnostic (a
+    // tripped round/byte cap or a generated-code analyze diagnostic) is a failure
+    // here (CB-T5 — the harness surfaces emission diagnostics like the driver).
+    assert!(
+        emit.diagnostics.is_empty(),
+        "comptime emission produced diagnostics: {:?}",
+        emit.diagnostics
+    );
     let jit = OrcJit::from_ir(&module).expect("jit builds");
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     // SAFETY: corpus entries are `static int32 Main()` — a nullary `i32` fn.

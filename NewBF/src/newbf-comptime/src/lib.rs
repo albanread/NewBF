@@ -26,7 +26,10 @@ mod emit;
 mod eval;
 mod fold;
 
-pub use emit::{run_emission, EmitOutcome, __newbf_ct_emit};
+pub use emit::{
+    run_emission, run_emission_with, EmitConfig, EmitOutcome, DEFAULT_MAX_EMIT_BYTES,
+    DEFAULT_MAX_EMIT_ROUNDS, __newbf_ct_emit,
+};
 pub use eval::{eval_const, eval_const_i64, EvalError};
 pub use fold::fold_comptime;
 

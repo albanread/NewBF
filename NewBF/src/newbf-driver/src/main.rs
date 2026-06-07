@@ -301,13 +301,23 @@ fn dump_ir(input: &str) {
     // strips the emitter/shim before returning (a no-op fast path when the
     // program records no emit generators). Runs before value folding: emission
     // changes the program's *shape*, folding its values.
-    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
+    let (mut module, emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dump-ir: comptime emission failed: {e}");
             std::process::exit(1);
         }
     };
+    // Merge emission diagnostics (a divergent/erroring emitter — the round/byte
+    // caps or a generated-code analyze diagnostic) into the diagnostic stream,
+    // surfaced like parse/sema diagnostics: report and fail rather than codegen a
+    // module from a non-converged or malformed emission (CB-T5).
+    if !emit.diagnostics.is_empty() {
+        for d in &emit.diagnostics {
+            eprintln!("dump-ir: {d}");
+        }
+        std::process::exit(1);
+    }
     // Fold comptime call sites so the IR report reflects the real compiled
     // output (a no-op for programs without `[Comptime]`).
     if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
@@ -368,13 +378,22 @@ fn dump_llvm(input: &str) {
     // Drive comptime member emission to a fixpoint (CB-T4): analyze + lower +
     // splice emitted `extension`s + strip the emitter/shim, internally (a no-op
     // fast path when no emit generators are recorded). Runs before value folding.
-    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
+    let (mut module, emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dump-llvm: comptime emission failed: {e}");
             std::process::exit(1);
         }
     };
+    // Merge emission diagnostics into the diagnostic stream (CB-T5): a tripped
+    // round/byte cap or a generated-code analyze diagnostic is reported and fails
+    // the build rather than being silently codegen'd.
+    if !emit.diagnostics.is_empty() {
+        for d in &emit.diagnostics {
+            eprintln!("dump-llvm: {d}");
+        }
+        std::process::exit(1);
+    }
     // Fold comptime call sites so the LLVM report reflects the real compiled
     // output (a no-op for programs without `[Comptime]`).
     if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
@@ -442,13 +461,23 @@ fn compile(input: &str, output: Option<&str>) {
     // internally (a no-op fast path when no emit generators are recorded).
     // Emission changes the program's *shape* (new members); it must run before
     // value folding, which collapses values.
-    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
+    let (mut module, emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("compile: comptime emission failed: {e}");
             std::process::exit(1);
         }
     };
+    // Merge emission diagnostics into the diagnostic stream (CB-T5): a tripped
+    // round/byte cap or a generated-code analyze diagnostic is reported and fails
+    // the compile rather than producing a binary from a non-converged or
+    // malformed emission.
+    if !emit.diagnostics.is_empty() {
+        for d in &emit.diagnostics {
+            eprintln!("compile: {d}");
+        }
+        std::process::exit(1);
+    }
 
     // Evaluate `[Comptime]` functions and fold their call sites into literals
     // (then drop them) before codegen — they are compile-time-only.
