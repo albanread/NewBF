@@ -44,6 +44,26 @@ enum StructKind {
     Interface,
 }
 
+/// The shape of a heap allocation, used by [`Lowerer::heap_alloc`] to pick the
+/// `type_id` it passes to `newbf_alloc` (memory-safety.md §A2). The guard uses
+/// the shape (via `type_id`) for per-kind reporting; the alloc *return* is
+/// always the allocation base (malloc-like) regardless of kind.
+///   * `Object(id)` — a `new T()` class instance (incl. String): `type_id =
+///     id.0`. The user pointer the program holds *is* the base.
+///   * `Array { header_bytes }` — a length-prefixed array block: `type_id = -1`.
+///     The program stores the length in the first `header_bytes` and holds
+///     `base + header_bytes` as its elements pointer; **`delete` reconstructs
+///     `base = elements − header_bytes` and frees the base** (the pointer
+///     `newbf_alloc` returned), which is required in Thunk mode (CRT free) and
+///     matches the MS-T1 ledger key (the alloc base).
+///   * `Raw` — a closure-environment block (capturing lambda): `type_id = -1`.
+#[derive(Clone, Copy)]
+enum AllocKind {
+    Object(StructId),
+    Array { header_bytes: u32 },
+    Raw,
+}
+
 fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
     match td.kind {
         TypeKind::Struct => Some(StructKind::Value),
@@ -6262,9 +6282,9 @@ impl<'a> Lowerer<'a> {
                 // is stored at index `i`. `emit_closure` reads them back at
                 // `$self[i]`.
                 let words = caps.len() as i128;
-                let env = self.fb.call(
-                    "malloc",
-                    vec![Value::int(words * 8, IrType::I64)],
+                let env = self.heap_alloc(
+                    Value::int(words * 8, IrType::I64),
+                    AllocKind::Raw,
                     IrType::Ptr,
                 );
                 for (i, (_n, slot, ty)) in caps.iter().enumerate() {
@@ -7941,17 +7961,55 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Route a heap allocation through the guard-routable `newbf_alloc` symbol
+    /// (memory-safety.md §A1/§A2), replacing the bare `malloc` call. It emits
+    /// `newbf_alloc(size: i64, type_id: i32, site_id: i32) -> ptr`.
+    ///
+    /// `size` is the i64 size value exactly as the old `malloc` call passed it,
+    /// and the return `IrType` is preserved per-site (some sites want `Ptr`,
+    /// object sites want `Ref(id)`) so downstream typing is unchanged. The
+    /// return is the allocation **base** (malloc-like) for every kind — array
+    /// header offsetting and the `delete`-side `base = elements − header` stay
+    /// at the call sites (the ledger keys, and Thunk-mode CRT free, both want
+    /// the base). The constant guard-metadata args are set per `kind`:
+    ///
+    /// * `type_id = StructId.0` for `Object`, `-1` for `Array`/`Raw`;
+    /// * `site_id = 0` (named sites are MS-T7).
+    fn heap_alloc(&mut self, size: Value, kind: AllocKind, ret_ty: IrType) -> Value {
+        let type_id = match kind {
+            AllocKind::Object(id) => id.0 as i32,
+            AllocKind::Array { header_bytes } => {
+                // The header width is part of the array ABI contract; it is
+                // applied at the alloc/free call sites (not here — `newbf_alloc`
+                // is shape-agnostic and returns the base). Bind it so the field
+                // is read (documenting the contract) without altering behavior.
+                let _ = header_bytes;
+                -1
+            }
+            AllocKind::Raw => -1,
+        };
+        self.fb.call(
+            "newbf_alloc",
+            vec![
+                size,
+                Value::int(type_id as i128, IrType::I32),
+                Value::int(0, IrType::I32),
+            ],
+            ret_ty,
+        )
+    }
+
     /// Allocate a length-prefixed array block of `count` elements of type `elem`:
-    /// `malloc(8 + count·sizeof(elem))`, store the length in the first 8 bytes,
-    /// and yield a pointer to the *elements* (8 bytes past the block). So `a[i]`
-    /// is an ordinary typed-pointer index and `a.Count` reads `ptr[-1]`.
+    /// `newbf_alloc(8 + count·sizeof(elem))`, store the length in the first 8
+    /// bytes, and yield a pointer to the *elements* (8 bytes past the block). So
+    /// `a[i]` is an ordinary typed-pointer index and `a.Count` reads `ptr[-1]`.
     fn alloc_array(&mut self, count: Value, elem: IrType) -> Value {
         let esz = self.size_of_ty(elem);
         let bytes = self.fb.bin(IrBin::Mul, count.clone(), esz, IrType::I64);
         let total = self
             .fb
             .bin(IrBin::Add, bytes, Value::int(8, IrType::I64), IrType::I64);
-        let block = self.fb.call("malloc", vec![total], IrType::Ptr);
+        let block = self.heap_alloc(total, AllocKind::Array { header_bytes: 8 }, IrType::Ptr);
         self.fb.store(block.clone(), count);
         self.fb
             .elem_addr(block, IrType::U8, Value::int(8, IrType::I64))
@@ -8090,7 +8148,7 @@ impl<'a> Lowerer<'a> {
         }
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
-            let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
+            let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
             // Object header (ClassVData*) at offset 0: the class vtable when it
             // has virtual methods, else null.
             let hdr = self.fb.field_addr(p.clone(), id, 0);
@@ -8163,7 +8221,7 @@ impl<'a> Lowerer<'a> {
             return cstr;
         };
         let size = self.fb.size_of(id);
-        let p = self.fb.call("malloc", vec![size], IrType::Ref(id));
+        let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
         let hdr = self.fb.field_addr(p.clone(), id, 0);
         self.fb.store(hdr, Value::Const(Const::Null));
         if let Some(ctor) = self.structs.ctor_for(id, 1) {
@@ -8185,9 +8243,9 @@ impl<'a> Lowerer<'a> {
         let Some(id) = self.structs.by_name.get("String").copied() else {
             return (undef(IrType::Ptr), IrType::Ptr);
         };
-        // new String(): malloc the body, null the header, run the 0-arg ctor.
+        // new String(): newbf_alloc the body, null the header, run the 0-arg ctor.
         let size = self.fb.size_of(id);
-        let s = self.fb.call("malloc", vec![size], IrType::Ref(id));
+        let s = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
         let hdr = self.fb.field_addr(s.clone(), id, 0);
         self.fb.store(hdr, Value::Const(Const::Null));
         if let Some(ctor) = self.structs.ctor_for(id, 0) {
@@ -8241,10 +8299,16 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `delete x` → `free(x)`. The destructor is deferred (a later sprint).
+    /// `delete x` → `newbf_free(base)`. The destructor is deferred (a later
+    /// sprint).
     fn lower_delete(&mut self, operand: &Expr, src: &str) -> (Value, IrType) {
         // A heap array's allocation base is 8 bytes before its elements pointer
-        // (the length header), so free that, not the elements pointer.
+        // (the length header), so free that, not the elements pointer. This
+        // `base = elements − 8` reconstruction is KEPT (memory-safety.md §A2):
+        // `newbf_free` must receive exactly what `newbf_alloc` returned — in
+        // Thunk mode (the run-corpus default) that goes straight to CRT `free`,
+        // and the MS-T1 ledger keys each allocation by the alloc base too. So
+        // only the symbol name changes (`free` → `newbf_free`); the −8 stays.
         if let Expr::Ident(s) = operand
             && self.array_locals.contains(s.text(src))
         {
@@ -8252,23 +8316,25 @@ impl<'a> Lowerer<'a> {
             let base = self
                 .fb
                 .elem_addr(ptr, IrType::U8, Value::int(-8, IrType::I64));
-            self.fb.call("free", vec![base], IrType::Void);
+            self.fb.call("newbf_free", vec![base], IrType::Void);
             return (Value::Const(Const::Undef(IrType::Void)), IrType::Void);
         }
         let (v, t) = self.expr(operand, src);
         if let IrType::Ref(id) = t {
             self.emit_destroy(v, id);
         } else {
-            self.fb.call("free", vec![v], IrType::Void);
+            self.fb.call("newbf_free", vec![v], IrType::Void);
         }
         (Value::Const(Const::Undef(IrType::Void)), IrType::Void)
     }
 
     /// Run a class instance's destructor chain then free it: the derived dtor
     /// first, each base's next, root last (reverse of construction order), then
-    /// `free`. Inheritance composes a base dtor into a derived that declares
-    /// none, so the same symbol can repeat down the chain — dedup to call once.
-    /// Shared by `delete` and `scope`-lifetime cleanup.
+    /// `newbf_free`. Inheritance composes a base dtor into a derived that
+    /// declares none, so the same symbol can repeat down the chain — dedup to
+    /// call once. Shared by `delete` and `scope`-lifetime cleanup. `v` is the
+    /// object base (what `newbf_alloc` returned), so it frees correctly in both
+    /// Thunk (CRT free) and Stomp (ledger keyed by base) modes.
     fn emit_destroy(&mut self, v: Value, id: StructId) {
         let mut seen: Vec<String> = Vec::new();
         let mut cur = Some(id);
@@ -8281,7 +8347,7 @@ impl<'a> Lowerer<'a> {
             }
             cur = self.structs.bases[cid.0 as usize];
         }
-        self.fb.call("free", vec![v], IrType::Void);
+        self.fb.call("newbf_free", vec![v], IrType::Void);
     }
 
     /// Lower a method call `receiver.Method(args)`. Resolves the receiver's

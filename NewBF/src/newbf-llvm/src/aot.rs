@@ -98,6 +98,18 @@ pub fn link_executable(
     cmd.arg("/SUBSYSTEM:CONSOLE");
     cmd.arg("/ENTRY:mainCRTStartup");
     cmd.arg("/MACHINE:X64");
+    // MS-T2 bridge until MS-T3 links the runtime staticlib: the alloc path now
+    // emits `newbf_alloc`/`newbf_free` (memory-safety.md §A1). The real runtime
+    // (with the stomp guard + the `/ENTRY:newbf_entry` bootstrap) joins the link
+    // at MS-T3; until then, resolve these to the CRT thunks the guard's *default
+    // Thunk mode* already defines them as (`newbf_alloc`≡`malloc`,
+    // `newbf_free`≡`free`, mod.rs route_alloc/route_free). `/ALTERNATENAME` is a
+    // *fallback*: when MS-T3 supplies a real `newbf_alloc` definition it wins and
+    // these are ignored. On x64 the extra `type_id`/`site_id` args sit in
+    // RDX/R8, which `malloc` ignores — the size is in RCX, so the thunk is
+    // ABI-safe.
+    cmd.arg("/ALTERNATENAME:newbf_alloc=malloc");
+    cmd.arg("/ALTERNATENAME:newbf_free=free");
     // Modern Windows security defaults (link.exe warns without them).
     cmd.arg("/NXCOMPAT");
     cmd.arg("/DYNAMICBASE");
