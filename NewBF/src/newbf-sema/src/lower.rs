@@ -202,18 +202,31 @@ struct StructTable {
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
 type MonoRecord = (StructId, String, Vec<(String, IrType)>);
 
-/// FV-T4: a static method-ref thunk to emit. `$mref$<full>($self, P…) -> ret`
-/// drops its `$self` and tail-calls `<full>(P…)`, so a bare static method
-/// reference fits the uniform `code(target, args…)` calling convention.
+/// A method-ref thunk to emit, absorbing the uniform `code(target, args…)`
+/// convention's hidden leading `$self` (param 0):
+///   - **static** (FV-T4): `$mref$<full>($self /*ignored*/, P…){ return <full>(P…); }`
+///     — drops `$self` and tail-calls the static `<full>(P…)`. `target = null`.
+///   - **bound** (FV-T5): `$mrefb$<full>($self, P…){ return ((T)$self).M(P…); }`
+///     — forwards `$self` as the receiver `this` (the instance method's leading
+///     parameter) and tail-calls `<full>($self, P…)`. `target = receiver body
+///     pointer`. Class receivers only (a class `this` is a body `Ptr`, ABI-
+///     identical to the `$self` `Ptr` the convention passes — no cast needed in
+///     opaque-pointer IR; Risk 7.9 — value-struct/`mut`/`ref` receivers are
+///     declined at the reference site, never reaching here).
 #[derive(Clone)]
 struct MethodRefThunk {
-    /// The thunk's own symbol (`$mref$<full>`) — the value returned by the ref.
+    /// The thunk's own symbol (`$mref$<full>` static, `$mrefb$<full>` bound) —
+    /// the value (`code`) returned by the ref.
     thunk_sym: String,
     /// The wrapped method's real symbol (the thunk's callee).
     callee: String,
-    /// The wrapped method's return type and explicit parameter types.
+    /// The wrapped method's return type and explicit parameter types (NOT
+    /// including a bound method's leading `this`).
     ret: IrType,
     params: Vec<IrType>,
+    /// `true` for a bound instance method ref: the thunk forwards `$self` as the
+    /// method's leading `this`. `false` for a static ref (drops `$self`).
+    bound: bool,
 }
 
 /// Composite resolution key for a generic-method monomorph:
@@ -3556,6 +3569,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             &[],
             &[],
             None,
+            None,
         ) {
             m.add_function(func);
         }
@@ -3654,6 +3668,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 &mono.env,
                 &[],
                 mono.owner,
+                ret_fn_sig_of_ty(return_ty, mdecl_src, &structs, &mono.env),
             ) {
                 m.add_function(func);
             }
@@ -3674,10 +3689,15 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     m
 }
 
-/// FV-T4: emit a static method-ref thunk `$mref$<full>($self, P…) -> ret` that
-/// ignores `$self` and tail-calls `<full>(P…)`. This absorbs the uniform
-/// convention's hidden `$self` (param 0) so a static method (which has no `$self`)
-/// is callable through the same `code(target, args…)` shape as a lambda/closure.
+/// Emit a method-ref thunk `<sym>($self, P…) -> ret` absorbing the uniform
+/// convention's hidden `$self` (param 0) so a method (which has either no `$self`
+/// or a `this`-typed leading param) is callable through the same `code(target,
+/// args…)` shape as a lambda/closure.
+///   - **static** (FV-T4): ignore `$self` and tail-call `<full>(P…)`.
+///   - **bound** (FV-T5): forward `$self` as the receiver `this` and tail-call
+///     `<full>($self, P…)`. The receiver is a class body `Ptr` (target); in the
+///     opaque-pointer IR it is ABI-identical to the method's `Ref(owner)` `this`
+///     param, so the `((T)$self)` cast is implicit (no IR cast needed).
 fn emit_method_ref_thunk(thunk: &MethodRefThunk) -> Function {
     let mut ir_params: Vec<IrParam> = vec![IrParam {
         name: Some("$self".to_string()),
@@ -3688,11 +3708,14 @@ fn emit_method_ref_thunk(thunk: &MethodRefThunk) -> Function {
         ty: *t,
     }));
     let mut fb = FunctionBuilder::new(thunk.thunk_sym.clone(), ir_params, thunk.ret);
-    // Forward the explicit params (which start at `Param(1)`, after `$self`) to
-    // the real method in order.
-    let args: Vec<Value> = (0..thunk.params.len())
-        .map(|i| Value::Param((i + 1) as u32))
-        .collect();
+    // For a bound ref, `$self` (Param 0) is the receiver and leads the call
+    // (the method's `this`); for a static ref it is dropped. The explicit params
+    // always start at `Param(1)` (after `$self`).
+    let mut args: Vec<Value> = Vec::with_capacity(thunk.params.len() + 1);
+    if thunk.bound {
+        args.push(Value::Param(0));
+    }
+    args.extend((0..thunk.params.len()).map(|i| Value::Param((i + 1) as u32)));
     let r = fb.call(thunk.callee.clone(), args, thunk.ret);
     if thunk.ret == IrType::Void {
         fb.ret(None);
@@ -4157,6 +4180,7 @@ fn lower_type_at(
                     env,
                     &[],
                     owner_id,
+                    ret_fn_sig_of_ty(return_ty, src, structs, env),
                 ) {
                     m.add_function(func);
                 }
@@ -4181,6 +4205,7 @@ fn lower_type_at(
                         env,
                         &[],
                         owner_id,
+                        None,
                     ) {
                         m.add_function(func);
                     }
@@ -4202,6 +4227,7 @@ fn lower_type_at(
                         env,
                         &[],
                         owner_id,
+                        None,
                     ) {
                         m.add_function(func);
                     }
@@ -4260,6 +4286,7 @@ fn lower_type_at(
                             env,
                             &[],
                             owner_id,
+                            None,
                         ) {
                             m.add_function(func);
                         }
@@ -4303,6 +4330,7 @@ fn lower_type_at(
                             env,
                             &[("value", pty)],
                             owner_id,
+                            None,
                         ) {
                             m.add_function(func);
                         }
@@ -4344,6 +4372,7 @@ fn lower_type_at(
 // Threads the per-type method table + program struct table alongside the
 // signature; a context struct is a future cleanup, not worth the churn now.
 #[allow(clippy::too_many_arguments)] // lowering entry: threaded method context
+#[allow(clippy::too_many_arguments)] // the per-method lowering entry point
 fn lower_method(
     full_name: String,
     ret: IrType,
@@ -4356,6 +4385,10 @@ fn lower_method(
     env: TyEnv,
     extra: &[(&str, IrType)],
     cur_type: Option<StructId>,
+    // FV-T7: the inner `(ret, ptys)` of a `function R(P)` return type (`None`
+    // otherwise), so a lambda in a `return` position can be target-typed. Set on
+    // the `Lowerer` below; see `Lowerer.ret_fn_sig`.
+    ret_fn_sig: Option<(IrType, Vec<IrType>)>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -4385,6 +4418,7 @@ fn lower_method(
 
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
     let mut lw = Lowerer::new(fb, ret, methods, structs, env, cur_type);
+    lw.ret_fn_sig = ret_fn_sig;
 
     // Spill `this` into a slot at entry, recorded for `Expr::This`.
     let base = if this_ty.is_some() { 1 } else { 0 };
@@ -4613,6 +4647,13 @@ struct Lowerer<'a> {
     /// recovers it — letting a bare `.Case` pattern in `switch (x)` resolve
     /// against `x`'s enum (the scrutinee determines the enum, as Beef requires).
     enum_locals: HashMap<String, String>,
+    /// FV-T7: the *inner* `(ret, ptys)` of the method's `function R(P)` return
+    /// type, `None` for a non-function return. `ret_ty` only carries the erased
+    /// `$Func` value-struct; this preserves the signature so a lambda written
+    /// directly in a `return` position (`return x => x + n;`) target-types its
+    /// untyped params from the declared return sig (recorded into
+    /// `inline_lambda_sigs` so the emit pass binds the lambda body's params).
+    ret_fn_sig: Option<(IrType, Vec<IrType>)>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -4641,6 +4682,7 @@ impl<'a> Lowerer<'a> {
             local_fns: HashMap::new(),
             scope_allocs: vec![(BlockId(0), Vec::new())],
             enum_locals: HashMap::new(),
+            ret_fn_sig: None,
         }
     }
 
@@ -4842,6 +4884,14 @@ impl<'a> Lowerer<'a> {
                     None
                 } else {
                     value.as_ref().map(|e| {
+                        // FV-T7: a lambda written directly in a `return` position
+                        // (`return x => x + n;`) is collected as an INLINE lambda
+                        // (T6a) but has no call-arg target to type its params from.
+                        // Seed its `(ret, ptys)` from the method's declared return
+                        // function signature (`ret_fn_sig`) so the emit pass binds
+                        // the lambda body's params at the right IR types — the
+                        // return-position analogue of T6b's call-arg target-typing.
+                        self.record_return_lambda_sig(e);
                         // Target-type a `.Some(x)` / `.(args)` / `(a,b)` / `.{ }`
                         // return against the function's return type before falling
                         // back to a plain eval — via the one canonical try-order.
@@ -5853,6 +5903,10 @@ impl<'a> Lowerer<'a> {
                                 r
                             } else if let Some(r) = self.try_method_ref(base, name.text(src), src) {
                                 r
+                            } else if let Some(r) =
+                                self.try_bound_method_ref(base, name.text(src), src)
+                            {
+                                r
                             } else {
                                 (undef(IrType::I64), IrType::I64)
                             }
@@ -6846,11 +6900,72 @@ impl<'a> Lowerer<'a> {
                         callee: sig.full_name.clone(),
                         ret: sig.ret,
                         params: sig.params.clone(),
+                        bound: false,
                     });
                 return Some((self.fb.global_addr(thunk_sym), IrType::Ptr));
             }
         }
         None
+    }
+
+    /// FV-T5: a BOUND instance method ref `obj.M` in a value position (e.g. passed
+    /// to a HOF). The base is an *instance* (a local/field/`this`/rvalue of a class
+    /// type), distinguishing this from the static `Type.M` path (whose base names a
+    /// registered type — handled by [`try_method_ref`]). Builds a `Func$ { code =
+    /// $mrefb$<full>, target = receiver body pointer }`: the de-duplicated thunk
+    /// `$mrefb$<full>($self, P…){ return ((T)$self).M(P…); }` forwards `$self` as
+    /// the receiver `this`, so the bound method runs on the right object.
+    ///
+    /// **Class receivers only** (Risk 7.9): a class `this` is a body `Ptr`, ABI-
+    /// identical to the convention's `$self` `Ptr`, so the cast is implicit. A
+    /// value-struct / `mut` / `ref` receiver needs a different `$self`-forwarding
+    /// mode (pass-by-address with the receiver's mode) — that is declined here
+    /// (returns `None`, no miscompile) and deferred. Virtual dispatch through a
+    /// bound ref is also deferred: this binds the concrete `full_name` (so the
+    /// test uses a non-virtual method).
+    fn try_bound_method_ref(
+        &mut self,
+        base: &Expr,
+        name: &str,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        // A static `Type.M` ref (base names a registered type) is handled by
+        // `try_method_ref` — only take this path when the base is an instance.
+        if let Expr::Ident(s) = base
+            && self.lookup(s.text(src)).is_none()
+            && self.structs.by_name.contains_key(s.text(src))
+        {
+            return None;
+        }
+        let (body_ptr, owner) = self.struct_base(base, src)?;
+        // Risk 7.9: class receivers only in this slice. A value-struct / mut / ref
+        // receiver needs a different `$self` forwarding mode — decline cleanly.
+        if !matches!(self.structs.kinds[owner.0 as usize], StructKind::Ref) {
+            return None;
+        }
+        // Resolve a non-static instance method `M` on the receiver's class.
+        let sig = self.structs.methods[owner.0 as usize]
+            .get(name)
+            .and_then(|c| c.iter().find(|s| s.is_instance))?
+            .clone();
+        // `params[0]` is the leading `this` (a `Ref(owner)`); the thunk's explicit
+        // params are the rest. The thunk forwards `$self` (the receiver) as `this`.
+        let explicit: Vec<IrType> = sig.params.get(1..).unwrap_or(&[]).to_vec();
+        let thunk_sym = format!("$mrefb${}", sig.full_name);
+        self.structs
+            .method_ref_thunks
+            .borrow_mut()
+            .entry(thunk_sym.clone())
+            .or_insert_with(|| MethodRefThunk {
+                thunk_sym: thunk_sym.clone(),
+                callee: sig.full_name.clone(),
+                ret: sig.ret,
+                params: explicit,
+                bound: true,
+            });
+        let code = self.fb.global_addr(thunk_sym);
+        let fv = self.build_func_value(code, body_ptr);
+        Some((fv, IrType::Struct(self.structs.func_struct)))
     }
 
     /// `obj.Name` where `Name` is not a field but the receiver's type defines a
@@ -7805,6 +7920,33 @@ impl<'a> Lowerer<'a> {
                     .borrow_mut()
                     .insert(sym.clone(), (*ret, ptys.clone()));
             }
+        }
+    }
+
+    /// FV-T7: if `e` is a lambda returned directly from the current method
+    /// (`return x => x + n;`), key its recorded `$lambdaN` symbol into
+    /// `inline_lambda_sigs` with the method's declared return signature
+    /// (`ret_fn_sig`), so the emit pass binds the lambda body's params at the
+    /// resolved types. The return-position analogue of [`Self::record_inline_lambda_sigs`]
+    /// (which target-types a call-arg lambda from the callee param sig). A no-op
+    /// when the return type isn't a function type (`ret_fn_sig` is `None`) or `e`
+    /// isn't a collected lambda. Idempotent (same key → same value).
+    fn record_return_lambda_sig(&self, e: &Expr) {
+        let Some((ret, ptys)) = self.ret_fn_sig.clone() else {
+            return;
+        };
+        // Look through a parenthesized lambda (`(x => …)`).
+        let mut e = e;
+        while let Expr::Paren { inner, .. } = e {
+            e = inner;
+        }
+        if let Expr::Lambda { span, .. } = e
+            && let Some(sym) = self.structs.lambda_names.get(span)
+        {
+            self.structs
+                .inline_lambda_sigs
+                .borrow_mut()
+                .insert(sym.clone(), (ret, ptys));
         }
     }
 
@@ -9234,6 +9376,34 @@ fn param_fn_sig(
         return None;
     }
     match &p.ty {
+        AstType::Function {
+            return_ty,
+            params: fps,
+            is_delegate: false,
+            ..
+        } => {
+            let ret = lower_value_ty(return_ty, src, structs, env);
+            let ptys: Vec<IrType> = fps
+                .iter()
+                .map(|t| lower_value_ty(t, src, structs, env))
+                .collect();
+            Some((ret, ptys))
+        }
+        _ => None,
+    }
+}
+
+/// FV-T7: the *inner* Beef function signature `(ret, ptys)` of a `function R(P)`
+/// **return type**, lowered under `env` — `None` for any non-function (or
+/// `delegate`) return type. The return-type companion to [`param_fn_sig`]: where
+/// the method's `ret` IR type erases a `function R(P)` return to the uniform
+/// `$Func` value-struct, this preserves `(ret, ptys)` so a lambda written
+/// directly in a `return` position (`return x => x + n;`) can target-type its
+/// untyped params from the declared return signature — exactly as a call-arg
+/// inline lambda is target-typed from the resolved callee param sig (T6b). Used
+/// to seed `Lowerer.ret_fn_sig`.
+fn ret_fn_sig_of_ty(ty: &AstType, src: &str, structs: &StructTable, env: TyEnv) -> Option<(IrType, Vec<IrType>)> {
+    match ty {
         AstType::Function {
             return_ty,
             params: fps,
