@@ -25,5 +25,5 @@
 mod eval;
 mod fold;
 
-pub use eval::eval_const_i64;
+pub use eval::{eval_const, eval_const_i64, EvalError};
 pub use fold::fold_comptime;
