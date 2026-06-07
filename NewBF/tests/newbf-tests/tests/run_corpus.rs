@@ -44,7 +44,7 @@ fn run(src: &str) -> i32 {
     // the final module JIT-links clean. For the generator-free programs (the
     // entire current corpus) this is the no-op fast path: it lowers once and
     // returns verbatim, so behavior is unchanged.
-    let (module, emit) =
+    let (mut module, emit) =
         newbf_comptime::run_emission(&files).expect("comptime emission succeeds");
     // Positive corpus programs must converge cleanly: any emission diagnostic (a
     // tripped round/byte cap or a generated-code analyze diagnostic) is a failure
@@ -54,6 +54,15 @@ fn run(src: &str) -> i32 {
         "comptime emission produced diagnostics: {:?}",
         emit.diagnostics
     );
+    // Fold comptime call sites into width-correct constants (CB-T6) and drop the
+    // compile-time-only functions. The driver runs `fold_comptime` after
+    // `run_emission` on the final module; the run-corpus harness mirrors that so a
+    // `[Comptime]` call (e.g. `comptime_eval_i32_arg.bf`'s `F(7)`) collapses to a
+    // literal and the comptime function is gone — otherwise it would survive as a
+    // real call (verify-noise) or, for a value-folded program, never reach the
+    // value the `// expect:` header asserts. A no-op when `module.comptime` is
+    // empty (every emission-only and ordinary program), so behavior is unchanged.
+    newbf_comptime::fold_comptime(&mut module).expect("comptime fold succeeds");
     let jit = OrcJit::from_ir(&module).expect("jit builds");
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     // SAFETY: corpus entries are `static int32 Main()` — a nullary `i32` fn.

@@ -152,6 +152,98 @@ fn comptime_call_with_const_arg_folds() {
     assert_eq!(main(), 120);
 }
 
+// ── CB-T6: widened-int folds + fold-width fix + inner-fold-first ──────────────
+
+/// **The CB-T6 fold-width proof, full frontend.** A `[Comptime] int32 F(int32 x)
+/// => x*x` called as `F(7)` folds to the `i32` constant 49 — and the folded
+/// module is **verify-clean** (the literal carries the call's own `i32` width, not
+/// a hardcoded `i64`, so every SSA use stays width-consistent). `F` is dropped
+/// (compile-time only) yet `Main` still returns 49: the proof it was folded, not
+/// run.
+#[test]
+fn comptime_i32_arg_folds_width_correct_and_verify_clean() {
+    let src = r#"
+        class Program {
+            [Comptime]
+            public static int32 F(int32 x) { return x * x; }
+            public static int32 Main() { return F(7); }
+        }
+    "#;
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let program = analyze(&files);
+    let mut module = lower_program(&files, &program);
+    assert!(module.funcs.iter().any(|f| f.name == "Program.F"));
+
+    fold_comptime(&mut module).expect("comptime fold succeeds");
+
+    // The comptime function is dropped (compile-time only).
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "Program.F"),
+        "the i32 comptime function should be removed after folding"
+    );
+    // The folded module is LLVM-verify-clean — the width fix's load-bearing
+    // assertion: a hardcoded-i64 literal in an i32 slot would fail verify here.
+    newbf_llvm::verify_module(&module)
+        .expect("CB-T6: the i32-folded module must verify clean (width-correct literal)");
+
+    // And `Main` still returns 49 (an unfolded call to the dropped `F` would
+    // dangle and fail to JIT-resolve).
+    let jit = OrcJit::from_ir(&module).expect("jit builds");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 49);
+}
+
+/// **Inner-fold-first / fixpoint, full frontend.** `Outer(Inner(3))` where both
+/// are `[Comptime]` folds bottom-up across fixpoint passes: `Inner(3)` → 4, then
+/// `Outer(4)` → 40. Both comptime functions are dropped and `Main` returns the
+/// single collapsed literal (3+1)*10 = 40.
+#[test]
+fn comptime_nested_calls_fold_inner_first() {
+    let src = r#"
+        class Program {
+            [Comptime]
+            public static int32 Inner(int32 x) { return x + 1; }
+            [Comptime]
+            public static int32 Outer(int32 y) { return y * 10; }
+            public static int32 Main() { return Outer(Inner(3)); }
+        }
+    "#;
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let program = analyze(&files);
+    let mut module = lower_program(&files, &program);
+
+    fold_comptime(&mut module).expect("comptime fold succeeds");
+
+    // Both nested comptime functions are dropped (fully collapsed inner-first).
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "Program.Inner"),
+        "Inner should be folded away"
+    );
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "Program.Outer"),
+        "Outer should be folded away (its arg became a constant after Inner folded)"
+    );
+    newbf_llvm::verify_module(&module).expect("CB-T6: the nested-folded module must verify clean");
+
+    let jit = OrcJit::from_ir(&module).expect("jit builds");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 40);
+}
+
 // ── CB-T4: comptime member EMISSION (the fixpoint loop) ───────────────────────
 
 /// The §1 marquee source: a `[Comptime, EmitGenerator]` emits a `Sum()` method
