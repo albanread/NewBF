@@ -42,7 +42,7 @@ pub use crash_dump::{
     update_guard_metrics,
 };
 
-pub use guard::{GuardMode, LeakReport, report_leaks, set_guard_mode};
+pub use guard::{GuardMode, LeakReport, live_count, report_leaks, reset, set_guard_mode};
 
 // ──────────────────────────────────────────────────────────────────── //
 // Alloc-path C-ABI: route through the guard mode                       //

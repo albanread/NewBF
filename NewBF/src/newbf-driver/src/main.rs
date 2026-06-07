@@ -100,6 +100,16 @@ fn main() {
     // instead of dying silently (MANIFESTO core decision 16).
     newbf_runtime::install_crash_handler();
 
+    // MS-T3: enable the debug memory guard for the AOT-less JIT/`run` paths.
+    // The MODE atomic lives in *this* host process's `newbf-runtime`; JIT'd
+    // Beef code's `newbf_alloc`/`newbf_free` (resolved via the MS-T0 absolute-
+    // symbol seam) then route through the quarantining stomp allocator so a
+    // UAF faults and a double-free aborts (memory-safety.md §A5). Stomp on a
+    // debug driver, Thunk passthrough in release (the strip is by the host's
+    // own profile here, distinct from AOT's per-target-program profile — A5).
+    #[cfg(debug_assertions)]
+    newbf_runtime::set_guard_mode(newbf_runtime::GuardMode::Stomp);
+
     let cli = Cli::parse();
     match cli.command {
         None => {

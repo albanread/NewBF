@@ -25,3 +25,16 @@ pub use aot::{emit_object, emit_object_to_memory, link_executable};
 pub use jit::OrcJit;
 pub use lower::{emit_module, lower_to_string, verify_module};
 pub use mapsym::symbolicate;
+
+// Guard lifecycle re-export (memory-safety.md §A5/§A4, MS-T3). The guard's
+// MODE/ledger atomics live in the `newbf-runtime` instance linked into the
+// HOST process (driver, run-corpus harness, comptime). Those hosts already
+// depend on `newbf-llvm`; re-exporting the lifecycle here lets them flip the
+// guard mode, reset the ledger between programs, and read the live-count
+// WITHOUT taking a new direct Cargo dep on `newbf-runtime` (the JIT'd Beef
+// code's `newbf_alloc`/`newbf_free` resolve via the MS-T0 absolute-symbol
+// seam, so the host only needs the *lifecycle* — set the mode, reset, report).
+pub use newbf_runtime::{
+    GuardMode, LeakReport, install_crash_handler, live_count, report_leaks, reset as guard_reset,
+    set_guard_mode,
+};

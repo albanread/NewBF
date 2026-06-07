@@ -6,6 +6,18 @@ license.workspace = true
 description = "NewBF: Rust-side unit and integration tests driving the full pipeline."
 publish = false
 
+# The `guard_runner` child-process binary (MS-T3, the R4 child-process harness)
+# JIT-runs a `.bf` in Stomp mode; the `guard_corpus` test spawns it and inspects
+# the exit code. A binary in `src/bin/` is built with the package's normal
+# `[dependencies]`, so its crates live here (not in dev-dependencies). The
+# integration tests reuse the same crates via dev-dependencies (unchanged).
+[dependencies]
+newbf-lexer.workspace = true
+newbf-parser.workspace = true
+newbf-sema.workspace = true
+newbf-comptime.workspace = true
+newbf-llvm.workspace = true
+
 [dev-dependencies]
 newbf-lexer.workspace = true
 newbf-parser.workspace = true
@@ -14,6 +26,10 @@ newbf-ir.workspace = true
 newbf-llvm.workspace = true
 newbf-comptime.workspace = true
 newbf-winapi.workspace = true
+
+[[bin]]
+name = "guard_runner"
+path = "src/bin/guard_runner.rs"
 
 [lints]
 workspace = true
