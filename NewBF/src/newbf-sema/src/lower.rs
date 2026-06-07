@@ -4091,6 +4091,514 @@ fn body_yields_place(body: &MethodBody) -> bool {
     )
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// MX-T2.5 — the strict expansion gate (mixins.md §3.8). The safety mechanism for
+// R7: when MX-T3 turns expansion ON, it fires on EVERY `Name!(…)` call site,
+// including the dense `Mixins.bf` verify-corpus fixture. Any shape v1 cannot
+// correctly splice MUST fall back to the EXISTING verifiable path (the `_ => {}`
+// statement skip at the `Stmt::MixinDecl` arm / the synthetic-`Call`
+// unresolved-default in the `Expr::MixinCall` arm) — never to novel broken IR.
+// [`mixin_expandable`] is that pure classifier: it returns `Expandable` ONLY for
+// the shapes mixins.md §3.8 lists as v1-supported, and a `MixinDecline::*` reason
+// for everything else. MX-T3's `expand_mixin` calls it first and returns `None`
+// (declines to expand) on any decline, leaving the existing path untouched.
+//
+// ── `Mixins.bf` shape-by-shape disposition (the contract for MX-T3) ──────────
+// Each construct in `beef-tests/feature-suite/src/Mixins.bf`, classified against
+// mixins.md §3.8. "expand" = `mixin_expandable` returns `Expandable`; "DECLINE
+// (reason)" = it returns that `MixinDecline` variant → MX-T3 falls back.
+//
+//  Declaration / call site (Mixins.bf line)        | v1 disposition (§3.8)
+//  ------------------------------------------------|---------------------------------
+//  `MixNums!(3,5)` stmt/expr value (block-yield)   | EXPAND — the model case.
+//  `const int cVal = MixNums!(3,5)` (L13)          | DECLINE(ConstOrComptimeContext)
+//      — a `MixinCall` is not a constant literal, so `const_field_init` never
+//      captures it (it degrades as a non-constant init does TODAY, before any
+//      expansion); MX-T3 also never reaches this site via `expr`. Belt-and-
+//      braces: the const/comptime context flag declines it if it ever does.
+//  `mc.MixA!(10)` (L183) — `var` param, writes `mA` | DECLINE(FreeNameInBody)
+//      — the body assigns the OWNER FIELD (`mA += addTo;`); `mA` is a bare free
+//      name (not the param `addTo`, not a body-local), the §3.4 caller-scope
+//      hazard. (§3.8 gates this var write-back form either way; the precise
+//      signal here is the free name `mA`, not a param assignment.)
+//  `mc.MixB!(10)` (L185) — local fn in body         | DECLINE(LambdaOrLocalFn)
+//      — `has_lambda_or_localfn` (the inner `void AddIt()`).
+//  `MixClass.MixC!(30)` (L186) — `var`-value yield  | DECLINE(FreeNameInBody)
+//      — body is `val + sA`; `val` is the param but `sA` is a bare STATIC-field
+//      free name, and the mixin is `static` (call site `has_this == false`).
+//      v1 free-identifier hygiene (§3.4) resolves bare names in the CALLER scope;
+//      `sA` is not a caller local → unresolved. §3.8 lists MixC as "expand if
+//      simple", but a bare member free name is exactly the §3.4 hazard, so v1
+//      DECLINEs (R7: declining is always safe — the existing path stands).
+//  `GetVal!(int val1)` (L189) — `var` param, `a=123`| DECLINE(VarWriteBackBody)
+//      — write-back through the arg-introduced local; out/write-back deferred.
+//  `GetVal2!(var val2)` (L191) — `out int a`        | DECLINE(UnsupportedParamKind)
+//      — `out` param (`MixinParamKind::Out`); out write-back deferred.
+//  `CircularMixin!(test)` (L206), `CircularMixin!(k)`| DECLINE(Generic)
+//      `CircularMixin!(*v)` (L70-71, recursion)      — `generic_params` non-empty;
+//      recursion is reached only via the generic body, also gated by depth in T3.
+//  `DisposeIt!(dc)` (L210) — `DisposeIt<T>`          | DECLINE(Generic)
+//  `SelfOuter.Test!(val)` (L109) `Test<T>`/`Test`    | DECLINE(Generic) for the
+//      `<T>` overloads; the non-generic `Test(Type value)` is an empty body — but
+//      every call site here is the generic dispatch, so DECLINE(Generic) (and the
+//      call carries no resolvable target → existing path).
+//  `SelfOuter.Test2!(val)` (L123) `Test2<T>`         | DECLINE(Generic)
+//  `Helper<T>.Pop!<int>()` (L131), `Pop!<float>()`   | DECLINE(Generic) — explicit
+//      (L253) — `Pop<TVal>` generic + `!<…>` type-args   `type_args` AND generic def.
+//  `ExtendSpan!(arr,30,4)` (L178) — `ExtendSpan<T>`  | DECLINE(Generic) — and the
+//      body uses `scope:mixin` (a further-gated shape; Generic fires first).
+//  lambda `(sv) => { CheckStr(sv.ToScopeCStr!()); }`  | DECLINE(LambdaOrLocalFn)
+//      (L199-202) — `ToScopeCStr!()` is invoked INSIDE a lambda; the call site
+//      sits in a lambda body. (Also `ToScopeCStr` is a corlib/cross-file mixin in
+//      practice → cross-file gate; either way DECLINE.)
+//  `AppendAndNullify!(str0)` (L236) — local mixin,    | DECLINE(VarWriteBackBody)
+//      writes through `str` (`str.Append; str = null;`)  — write-back through the
+//      by-value param's binding; reassigning the param is the write-back shape.
+//  `GetRef!(b) += 200` (L241) — yields `ref a`        | DECLINE(YieldsPlace)
+//      — `yields_place`; the lvalue-yield shape.
+//  `Unwrap!(svRes)..Trim()` (L249) — `..`-chain on    | DECLINE(YieldsPlace-ish)
+//      the yield — `res.Value` is an lvalue place used  Actually: `Unwrap`'s body
+//      `res.Value` is NOT a `ref`-prefixed yield, so `yields_place` is FALSE for
+//      it; but `Unwrap(var res)` reassigns nothing → it would classify as the
+//      simple var-value yield. The `..`-cascade is a CALL-SITE construct, not a
+//      mixin-body shape, so the predicate cannot see it. v1 declines `Unwrap`
+//      via the `var res` + member-yield + the cascade being an unsupported
+//      call-site context: MX-T3's expression path requires a plain target; the
+//      `..`-cascade target is gated. Documented as UncascadedExprContext (the
+//      call-site predicate MX-T3 supplies) — see `MixinCallSite::cascade`.
+//
+// Net: of the 21 distinct mixin constructs in Mixins.bf, ZERO are v1-expandable
+// in the fixture as written — every one hits a §3.8 gate. So when MX-T3 turns
+// expansion on, `Mixins.bf` is expanded NOWHERE and stays byte-for-byte on the
+// existing verifiable path → the 100%-clean-verify ratchet (R7) holds by
+// construction. (The model `EXPAND` case — a simple non-generic stmt/expr mixin
+// with no var-write-back, no place-yield, no lambda — is exercised by MX-T3's
+// NEW run-corpus programs, not by this fixture.)
+
+/// MX-T2.5: why a mixin call site is NOT expandable in v1 (mixins.md §3.8). Each
+/// variant maps to a row of the disposition table above. `mixin_expandable`
+/// returns `Ok(())`-shaped `Expandable` or one of these; MX-T3 treats any decline
+/// as "return `None`, fall back to the existing verifiable path."
+//
+// MX-T3 is the consumer (it calls `mixin_expandable` from `expand_mixin`). Until
+// then this is classification-only data, unread by lowering — mirrors how MX-T2's
+// `MixinDef` fields are `#[allow(dead_code)]` pending their MX-T3 consumer.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MixinDecline {
+    /// The def is generic (`generic_params` non-empty) or the call supplies
+    /// `type_args` (`Name!<T>(…)`). §3.8: generic mixins deferred to MX-T7.
+    Generic,
+    /// The body contains a lambda or local function (`has_lambda_or_localfn`).
+    /// §3.8/§6: the uncollected-span `undef` miscompile hazard — deferred.
+    LambdaOrLocalFn,
+    /// The body's trailing yield is a place (`ref …`, `yields_place`). §3.8:
+    /// lvalue-yielding mixins deferred to MX-T7.
+    YieldsPlace,
+    /// A param kind v1 cannot bind: `ByRef` or `Out` (write-back). §3.8: out /
+    /// write-back deferred; v1 supports only `ByValue` + limited `VarInfer`.
+    UnsupportedParamKind,
+    /// A `var`/by-value param whose body ASSIGNS BACK through it (its root is the
+    /// assignment target — `GetVal`'s `a = 123;`, `AppendAndNullify`'s
+    /// `str = null;`). §3.8: gated unless the simple var-value form. v1 cannot
+    /// prove single-assignment / write-back safety. (Assigning a caller field via
+    /// a free name — `MixA`'s `mA += addTo` — is `FreeNameInBody` instead.)
+    VarWriteBackBody,
+    /// The body references `this` explicitly while the caller is static
+    /// (`call.has_this == false`). §3.4 static-caller guard: `Expr::This` would
+    /// otherwise yield `undef(Ptr)`. Declined.
+    ReferencesThisStatically,
+    /// The body references a bare identifier that is neither a param nor a
+    /// body-local — a FREE NAME that v1 resolves in the CALLER scope (§3.4). If
+    /// it names an owner field/static (`MixC`'s `sA`) the caller scope has no
+    /// such local → unresolved. Conservatively declined (the simple v1 mixins
+    /// reference only their params).
+    FreeNameInBody,
+    /// The mixin is declared in a different file than the call site (v1 =
+    /// same-file only; §3.8/§10 cross-file deferred to MX-T7).
+    CrossFile,
+    /// The call site is a const initializer or inside a `[Comptime]` body. §3.8:
+    /// comptime/const mixins deferred to MX-T8 (degrade as a non-constant init).
+    ConstOrComptimeContext,
+    /// The call site is an expression-mixin used as the target of a `..`-cascade
+    /// (`Unwrap!(svRes)..Trim()`) — an unsupported expression context in v1
+    /// (the cascade needs a stable place target the v1 result-slot model can't
+    /// provide). §3.8 lvalue/cascade row.
+    CascadeTarget,
+    /// The expanded depth would exceed `MIXIN_MAX_DEPTH` (recursion guard). §3.8
+    /// `CircularMixin!` recursion; also covered by `Generic` here but kept
+    /// distinct so MX-T3's depth check has a reason to report.
+    DepthExceeded,
+}
+
+/// MX-T3 expansion-depth ceiling (mixins.md §3.6/§10): a self/mutually-recursive
+/// mixin chain is bounded; on overflow the gate declines (graceful skip). Defined
+/// here so the predicate and MX-T3's `MixinFrame` share one constant.
+//
+// Consumed by MX-T3's depth guard; unread until then.
+#[allow(dead_code)]
+const MIXIN_MAX_DEPTH: usize = 64;
+
+/// MX-T2.5: the call-site facts the strict gate needs that are NOT on the
+/// `MixinDef` (those come from collection). MX-T3 fills this from the live
+/// `Lowerer` + the `Expr::MixinCall` node when it reaches a call site; the
+/// predicate is pure over `(def, call)`.
+//
+// MX-T3 constructs this at each `Expr::MixinCall`; unused until then.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct MixinCallSite {
+    /// `true` if the `Name!<T>(…)` form supplied explicit type args. Combined
+    /// with `def.generic_params` to detect the generic shape.
+    has_type_args: bool,
+    /// The number of arguments at the call site (v1 resolves overloads by arity;
+    /// a mismatch is not expandable — fall back).
+    arg_count: usize,
+    /// `true` if the caller has a `this` (instance context). `false` in a static
+    /// method — the static-caller `this` guard (§3.4).
+    has_this: bool,
+    /// The `srcs` index of the file the CALL site is in. v1 expands only when it
+    /// equals `def.src_file` (same-file gate, §3.8/§10).
+    caller_src_file: usize,
+    /// `true` if the call is in a const initializer or `[Comptime]` body (§3.8
+    /// comptime/const gate).
+    in_const_or_comptime: bool,
+    /// `true` if the expression-mixin call is the target of a `..`-cascade
+    /// (`Unwrap!(x)..Trim()`) — an unsupported expression context (§3.8).
+    cascade: bool,
+}
+
+/// MX-T2.5: the pure strict-expansion-gate predicate (mixins.md §3.8). Returns
+/// `Ok(())` (encoded as `Result<(), MixinDecline>`) ONLY for the shapes v1
+/// (MX-T3's first slice) can correctly splice; otherwise the `MixinDecline`
+/// reason. **No side effects, no IR** — a classification only. MX-T3 calls this
+/// first in `expand_mixin` and, on any `Err`, returns `None` so the caller falls
+/// through to the EXISTING verifiable path (R7: declining is always safe — the
+/// fixture's untouched lowering is what keeps `Mixins.bf` verify-clean).
+///
+/// `body_src` is the DECLARING file's source (`srcs[def.src_file]`, mixins.md
+/// §3.2) — needed to read the body's identifier spans for the free-name check.
+/// In v1 (same-file gate) it equals the caller's src.
+///
+/// Order of checks is documented (most-specific first) but every check is a pure
+/// AND, so order only affects which reason is reported, not the bool outcome.
+//
+// MX-T3 is the consumer. The arity-mismatch (`def.params.len() != arg_count`)
+// fall-back lives in MX-T3's resolver (it picks the overload by arity before
+// calling this); the predicate still re-checks it defensively.
+#[allow(dead_code)]
+fn mixin_expandable(
+    def: &MixinDef,
+    call: &MixinCallSite,
+    body_src: &str,
+) -> Result<(), MixinDecline> {
+    // 1. Generic — def has type params, or the call supplied `Name!<T>(…)`.
+    if !def.generic_params.is_empty() || call.has_type_args {
+        return Err(MixinDecline::Generic);
+    }
+    // 2. Cross-file (v1 same-file only). Checked early: a cross-file body's spans
+    //    resolve against a different src — unsupported until MX-T7.
+    if def.src_file != call.caller_src_file {
+        return Err(MixinDecline::CrossFile);
+    }
+    // 3. Const/comptime context (degrades as a non-constant init does today).
+    if call.in_const_or_comptime {
+        return Err(MixinDecline::ConstOrComptimeContext);
+    }
+    // 4. Lambda / local-fn in the body (uncollected-span `undef` hazard).
+    if def.has_lambda_or_localfn {
+        return Err(MixinDecline::LambdaOrLocalFn);
+    }
+    // 5. Lvalue-yield (`ref …` trailing) — the place-yield shape.
+    if def.yields_place {
+        return Err(MixinDecline::YieldsPlace);
+    }
+    // 6. A `..`-cascade target expression context (`Unwrap!(x)..Trim()`).
+    if call.cascade {
+        return Err(MixinDecline::CascadeTarget);
+    }
+    // 7. Param-kind / write-back gates.
+    for p in &def.params {
+        match p.kind {
+            // `ref`/`out` params can't be bound by v1 (write-back deferred).
+            MixinParamKind::ByRef | MixinParamKind::Out => {
+                return Err(MixinDecline::UnsupportedParamKind);
+            }
+            // A `var`/by-value param is fine to BIND, but if the body assigns
+            // back through it (`p = …`, `p += …`) v1 can't guarantee
+            // single-assignment / write-back safety → decline. (`MixC`'s
+            // `val + sA` does NOT assign `val` → not caught here; `GetVal`'s
+            // `a = 123` and `AppendAndNullify`'s `str = null` ARE.)
+            MixinParamKind::VarInfer | MixinParamKind::ByValue => {
+                if body_assigns_param(&def.body, &p.name, body_src) {
+                    return Err(MixinDecline::VarWriteBackBody);
+                }
+            }
+        }
+    }
+    // 8. Arity (defensive; MX-T3's resolver matches by arity before this).
+    if def.params.len() != call.arg_count {
+        return Err(MixinDecline::UnsupportedParamKind);
+    }
+    // 9. Static-caller `this` guard: an explicit `this` while the caller is
+    //    static would emit `undef(Ptr)` (§3.4).
+    if !call.has_this && body_references_this(&def.body) {
+        return Err(MixinDecline::ReferencesThisStatically);
+    }
+    // 10. Free-name guard (§3.4): a bare identifier in the body that is neither a
+    //     param nor a body-local resolves in the CALLER scope. A simple v1 mixin
+    //     references only its params; anything else (an owner field/static like
+    //     `MixC`'s `sA`, a sibling method) is a free name v1 can't safely bind.
+    if body_has_free_name(&def.body, &def.params, body_src) {
+        return Err(MixinDecline::FreeNameInBody);
+    }
+    Ok(())
+}
+
+/// MX-T2.5 helper: whether a mixin body ASSIGNS BACK through the named param —
+/// an assignment (`=`/`+=`/…) whose target's root identifier IS `param`. Used by
+/// the `VarWriteBackBody` gate (mixins.md §3.8: `GetVal`'s `a = 123`,
+/// `AppendAndNullify`'s `str = null`). A `var`/by-value mixin that never assigns
+/// its param (only reads it, e.g. `MixC`'s `val + sA`, `Unwrap`'s `res.Value`) is
+/// the "simple var-value form" §3.8 permits → not caught here. Conservative: a
+/// false positive only declines (safe — falls back to the existing path).
+/// (`MixA`'s `mA += addTo` assigns the OWNER FIELD `mA`, not the param `addTo`, so
+/// it is caught by the FREE-NAME gate instead — both are correct DECLINEs.)
+fn body_assigns_param(body: &MethodBody, param: &str, src: &str) -> bool {
+    let mut writes = false;
+    let check = &mut |e: &Expr| {
+        if expr_assigns_name(e, param, src) {
+            writes = true;
+        }
+    };
+    match body {
+        MethodBody::Expr(e) => check(e),
+        MethodBody::Block(s) => for_each_stmt_expr(s, check),
+        MethodBody::None => {}
+    }
+    writes
+}
+
+/// Whether an expression tree contains an assignment whose target's root ident is
+/// `name`. Reaches statement-position assignments via `for_each_stmt_expr`; also
+/// matches an assignment nested in a sub-expression.
+fn expr_assigns_name(e: &Expr, name: &str, src: &str) -> bool {
+    match e {
+        Expr::Assign { target, value, .. } => {
+            assign_target_root_is(target, name, src) || expr_assigns_name(value, name, src)
+        }
+        Expr::Paren { inner, .. } | Expr::Member { base: inner, .. } => {
+            expr_assigns_name(inner, name, src)
+        }
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => expr_assigns_name(operand, name, src),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_assigns_name(lhs, name, src) || expr_assigns_name(rhs, name, src)
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            expr_assigns_name(cond, name, src)
+                || expr_assigns_name(then, name, src)
+                || expr_assigns_name(els, name, src)
+        }
+        Expr::Call { callee, args, .. } | Expr::MixinCall { callee, args, .. } => {
+            expr_assigns_name(callee, name, src) || args.iter().any(|a| expr_assigns_name(a, name, src))
+        }
+        Expr::Generic { base, .. } => expr_assigns_name(base, name, src),
+        Expr::Index { base, args, .. } => {
+            expr_assigns_name(base, name, src) || args.iter().any(|a| expr_assigns_name(a, name, src))
+        }
+        Expr::Initializer { base, entries, .. } => {
+            expr_assigns_name(base, name, src)
+                || entries.iter().any(|a| expr_assigns_name(a, name, src))
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(|a| expr_assigns_name(a, name, src)),
+        Expr::Named { value, .. } => expr_assigns_name(value, name, src),
+        _ => false,
+    }
+}
+
+/// Whether an assignment target's ROOT identifier is `name` — `name`, `name += …`,
+/// `name.field = …` (root `name`), `name[i] = …` (root `name`). A `this.f`/other
+/// rooted target is not `name`.
+fn assign_target_root_is(target: &Expr, name: &str, src: &str) -> bool {
+    match target {
+        Expr::Ident(s) => s.text(src) == name,
+        Expr::Member { base, .. } | Expr::Index { base, .. } | Expr::Paren { inner: base, .. } => {
+            assign_target_root_is(base, name, src)
+        }
+        _ => false,
+    }
+}
+
+/// MX-T2.5 helper: whether a mixin body references `this` explicitly anywhere.
+/// Used by the static-caller `this` guard (§3.4): expanding such a body where the
+/// caller has no `this` (`call.has_this == false`) would emit `undef(Ptr)`.
+fn body_references_this(body: &MethodBody) -> bool {
+    let mut refs = false;
+    let check = &mut |e: &Expr| {
+        if expr_references_this(e) {
+            refs = true;
+        }
+    };
+    match body {
+        MethodBody::Expr(e) => check(e),
+        MethodBody::Block(s) => for_each_stmt_expr(s, check),
+        MethodBody::None => {}
+    }
+    refs
+}
+
+/// MX-T2.5 helper: whether a mixin body references a bare identifier that is
+/// neither one of `params` nor a body-local it declares — a FREE NAME v1 resolves
+/// in the CALLER scope (§3.4). A simple v1 mixin (`Double(int x) => x * 2`,
+/// `MixNums(int a, int b) { (a<<8)|b }`) references ONLY its params → no free
+/// name → expandable. A body touching an owner field/static (`MixC`'s `sA`) or a
+/// sibling symbol is declined. `body_src` reads the ident spans; `params` carry
+/// the bound names. Conservative: a method-CALLEE identifier (`Foo(…)`) is NOT
+/// counted as a free *value* name (calls resolve through the method namespace,
+/// not the caller's locals), so an ordinary helper call doesn't over-decline;
+/// only value-position bare idents and member bases count. Body-locals are
+/// collected from the body's own `Stmt::Local`/`Locals` declarations.
+fn body_has_free_name(body: &MethodBody, params: &[MixinParam], body_src: &str) -> bool {
+    // Names bound INSIDE the body: the params, plus any local declared in a block
+    // body. (An `=> expr` body declares no locals.)
+    let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    if let MethodBody::Block(s) = body {
+        collect_body_local_names(s, body_src, &mut bound);
+    }
+    let mut found = false;
+    let check = &mut |e: &Expr| {
+        if expr_has_free_name(e, &bound, body_src) {
+            found = true;
+        }
+    };
+    match body {
+        MethodBody::Expr(e) => check(e),
+        MethodBody::Block(s) => for_each_stmt_expr(s, check),
+        MethodBody::None => {}
+    }
+    found
+}
+
+/// Collect the names a block body binds (its `Stmt::Local` declarations), so the
+/// free-name check doesn't flag a body-local as free.
+fn collect_body_local_names(stmt: &Stmt, src: &str, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Local { name, .. } => {
+            out.insert(name.text(src).to_string());
+        }
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                collect_body_local_names(d, src, out);
+            }
+        }
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                collect_body_local_names(s, src, out);
+            }
+        }
+        Stmt::If { then, els, .. } => {
+            collect_body_local_names(then, src, out);
+            if let Some(e) = els {
+                collect_body_local_names(e, src, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_body_local_names(body, src, out),
+        _ => {}
+    }
+}
+
+/// Whether an expression references a bare VALUE identifier (or member base) not
+/// in `bound`. A `Call`/`MixinCall` callee identifier is NOT a free value name
+/// (it resolves through the method/mixin namespace), so it is skipped; the call's
+/// args ARE walked. `Expr::DotIdent`/`Expr::This` are not bare value idents here.
+fn expr_has_free_name(e: &Expr, bound: &HashSet<String>, src: &str) -> bool {
+    match e {
+        Expr::Ident(s) => !bound.contains(s.text(src)),
+        // A member access `base.name`: only the BASE is a value position; `name`
+        // is a member, not a caller local. The base's freeness recurses.
+        Expr::Member { base, .. } => expr_has_free_name(base, bound, src),
+        Expr::Paren { inner, .. } => expr_has_free_name(inner, bound, src),
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => expr_has_free_name(operand, bound, src),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_has_free_name(lhs, bound, src) || expr_has_free_name(rhs, bound, src)
+        }
+        Expr::Assign { target, value, .. } => {
+            expr_has_free_name(target, bound, src) || expr_has_free_name(value, bound, src)
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            expr_has_free_name(cond, bound, src)
+                || expr_has_free_name(then, bound, src)
+                || expr_has_free_name(els, bound, src)
+        }
+        // The callee name resolves in the method/mixin namespace, not the
+        // caller's value scope — skip it; walk the args (value positions).
+        Expr::Call { args, .. } | Expr::MixinCall { args, .. } => {
+            args.iter().any(|a| expr_has_free_name(a, bound, src))
+        }
+        Expr::Generic { base, .. } => expr_has_free_name(base, bound, src),
+        Expr::Index { base, args, .. } => {
+            expr_has_free_name(base, bound, src)
+                || args.iter().any(|a| expr_has_free_name(a, bound, src))
+        }
+        Expr::Initializer { base, entries, .. } => {
+            expr_has_free_name(base, bound, src)
+                || entries.iter().any(|a| expr_has_free_name(a, bound, src))
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(|a| expr_has_free_name(a, bound, src)),
+        Expr::Named { value, .. } => expr_has_free_name(value, bound, src),
+        _ => false,
+    }
+}
+
+/// Whether an expression tree contains an explicit `this` reference.
+fn expr_references_this(e: &Expr) -> bool {
+    match e {
+        Expr::This(_) => true,
+        Expr::Paren { inner, .. } | Expr::Member { base: inner, .. } => expr_references_this(inner),
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => expr_references_this(operand),
+        Expr::Binary { lhs, rhs, .. } => expr_references_this(lhs) || expr_references_this(rhs),
+        Expr::Assign { target, value, .. } => {
+            expr_references_this(target) || expr_references_this(value)
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => expr_references_this(cond) || expr_references_this(then) || expr_references_this(els),
+        Expr::Call { callee, args, .. } | Expr::MixinCall { callee, args, .. } => {
+            expr_references_this(callee) || args.iter().any(expr_references_this)
+        }
+        Expr::Generic { base, .. } => expr_references_this(base),
+        Expr::Index { base, args, .. } => {
+            expr_references_this(base) || args.iter().any(expr_references_this)
+        }
+        Expr::Initializer { base, entries, .. } => {
+            expr_references_this(base) || entries.iter().any(expr_references_this)
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(expr_references_this),
+        Expr::Named { value, .. } => expr_references_this(value),
+        _ => false,
+    }
+}
+
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Prepend the corlib prelude as source — parsed, then composed at the AST
     // and lowered once with the user program (STDLIB.md). The prelude units are
@@ -11512,5 +12020,209 @@ mod tests {
             .get("AppendAndNullify")
             .expect("local mixin AppendAndNullify collected")[0];
         assert_eq!(aan.owner, None, "a local mixin has no owner");
+    }
+
+    /// MX-T2.5: the strict-expansion-gate predicate (`mixin_expandable`)
+    /// classifies each representative `Mixins.bf` shape per mixins.md §3.8. Drives
+    /// off the MX-T2 registry (`StructTable.mixins`) built from the REAL fixture,
+    /// plus a synthetic "model EXPAND case" to prove the predicate accepts a
+    /// supported shape. This is the contract MX-T3 enforces (R7): every fixture
+    /// shape DECLINES → expansion fires nowhere on `Mixins.bf` → verify-clean.
+    #[test]
+    fn mx_t2_5_gate_predicate_classifies_mixins_bf_shapes() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../beef-tests/feature-suite/src/Mixins.bf");
+        let src = std::fs::read_to_string(&path).expect("Mixins.bf fixture exists");
+        let unit = parse_file(&src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src: &src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+
+        // Helper: the first overload of a known mixin name.
+        let first = |name: &str| -> &MixinDef {
+            &t.mixins
+                .get(name)
+                .unwrap_or_else(|| panic!("`{name}` collected"))[0]
+        };
+
+        // A neutral call site: same-file (src_file 0), instance context
+        // (has_this true so the static-`this` guard never fires spuriously),
+        // arity matched per-mixin, no type args, not const/comptime, not a
+        // cascade. Each shape's DECLINE comes from the def/param/body, not this.
+        let site = |arity: usize| MixinCallSite {
+            has_type_args: false,
+            arg_count: arity,
+            has_this: true,
+            caller_src_file: 0,
+            in_const_or_comptime: false,
+            cascade: false,
+        };
+        let body_src = |d: &MixinDef| t.srcs[d.src_file].as_str();
+        let classify = |name: &str, arity: usize| -> Result<(), MixinDecline> {
+            let d = first(name);
+            mixin_expandable(d, &site(arity), body_src(d))
+        };
+
+        // --- Generic mixins → DECLINE(Generic). (§3.8)
+        for g in ["CircularMixin", "DisposeIt", "Test", "Test2", "Pop", "ExtendSpan"] {
+            assert_eq!(
+                classify(g, 1),
+                Err(MixinDecline::Generic),
+                "{g} is generic → DECLINE(Generic)"
+            );
+        }
+
+        // --- A generic CALL (`Name!<T>(…)`) on a non-generic-arity site still
+        //     declines via the call's own `type_args` flag.
+        {
+            let d = first("Test"); // Test(Type value) non-generic overload exists,
+            // but [0] is the `<T>` one; the call-side flag declines regardless.
+            let mut s = site(1);
+            s.has_type_args = true;
+            assert_eq!(mixin_expandable(d, &s, body_src(d)), Err(MixinDecline::Generic));
+        }
+
+        // --- Lambda / local-fn body → DECLINE(LambdaOrLocalFn). MixB has an
+        //     inner `void AddIt()`. (§3.8/§6)
+        assert_eq!(
+            classify("MixB", 1),
+            Err(MixinDecline::LambdaOrLocalFn),
+            "MixB's local fn → DECLINE(LambdaOrLocalFn)"
+        );
+
+        // --- Lvalue-yield body → DECLINE(YieldsPlace). GetRef yields `ref a`.
+        //     (GetRef is a `var a` param AND yields a place; the place gate is
+        //     listed before the var-write-back gate, but it ALSO writes back —
+        //     either way DECLINE; assert the documented reason order.) (§3.8)
+        assert!(
+            matches!(
+                classify("GetRef", 1),
+                Err(MixinDecline::YieldsPlace | MixinDecline::VarWriteBackBody)
+            ),
+            "GetRef yields a place / writes back → DECLINE"
+        );
+
+        // --- `out` param → DECLINE(UnsupportedParamKind). GetVal2(out int a).
+        assert_eq!(
+            classify("GetVal2", 1),
+            Err(MixinDecline::UnsupportedParamKind),
+            "GetVal2's out param → DECLINE(UnsupportedParamKind)"
+        );
+
+        // --- param write-back body → DECLINE(VarWriteBackBody). GetVal
+        //     (`a = 123`, param `a`), AppendAndNullify (`str = null`, param `str`).
+        //     (§3.8)
+        for w in ["GetVal", "AppendAndNullify"] {
+            assert_eq!(
+                classify(w, 1),
+                Err(MixinDecline::VarWriteBackBody),
+                "{w} assigns its param → DECLINE(VarWriteBackBody)"
+            );
+        }
+
+        // --- MixA (`mA += addTo`) assigns the OWNER FIELD `mA` (a bare free name,
+        //     not the param `addTo`) → DECLINE(FreeNameInBody). (§3.8)
+        assert_eq!(
+            classify("MixA", 1),
+            Err(MixinDecline::FreeNameInBody),
+            "MixA's bare `mA` is a free name → DECLINE(FreeNameInBody)"
+        );
+
+        // --- MixC: `static mixin MixC(var val) { val + sA }` — no write-back, no
+        //     place-yield, but `sA` is a bare owner-static FREE NAME → DECLINE.
+        assert_eq!(
+            classify("MixC", 1),
+            Err(MixinDecline::FreeNameInBody),
+            "MixC's bare `sA` is a free name → DECLINE(FreeNameInBody)"
+        );
+
+        // --- Unwrap: `static mixin Unwrap(var res) { res.Value }` — the body is a
+        //     simple member-yield on the param (no write-back, no free name: the
+        //     base `res` IS the param, `.Value` is a member). The predicate alone
+        //     would ACCEPT it; the DECLINE for `Unwrap!(svRes)..Trim()` comes from
+        //     the CALL-SITE `cascade` flag (the `..`-cascade is an unsupported
+        //     expression context). Assert BOTH: bare → Ok, cascade → DECLINE.
+        assert_eq!(
+            classify("Unwrap", 1),
+            Ok(()),
+            "Unwrap's body alone is a simple member-yield → predicate accepts"
+        );
+        {
+            let d = first("Unwrap");
+            let mut s = site(1);
+            s.cascade = true;
+            assert_eq!(
+                mixin_expandable(d, &s, body_src(d)),
+                Err(MixinDecline::CascadeTarget),
+                "`Unwrap!(x)..Trim()` cascade target → DECLINE(CascadeTarget)"
+            );
+        }
+
+        // --- Const/comptime context → DECLINE(ConstOrComptimeContext). The
+        //     `const int cVal = MixNums!(3,5)` site. MixNums itself is the model
+        //     EXPAND shape, so the DECLINE here is purely the context flag.
+        {
+            let d = first("MixNums");
+            let mut s = site(2);
+            s.in_const_or_comptime = true;
+            assert_eq!(
+                mixin_expandable(d, &s, body_src(d)),
+                Err(MixinDecline::ConstOrComptimeContext),
+                "const-init context → DECLINE(ConstOrComptimeContext)"
+            );
+        }
+
+        // --- Cross-file → DECLINE(CrossFile). MixNums declared in src_file 0;
+        //     a caller in a different file declines (v1 same-file only).
+        {
+            let d = first("MixNums");
+            let mut s = site(2);
+            s.caller_src_file = 1;
+            assert_eq!(
+                mixin_expandable(d, &s, body_src(d)),
+                Err(MixinDecline::CrossFile),
+                "cross-file call → DECLINE(CrossFile)"
+            );
+        }
+
+        // --- MixNums is the MODEL shape: non-generic, no lambda, no place-yield,
+        //     ByValue params, no write-back, no free name (refs only `a`,`b`). At
+        //     a plain same-file statement/expression site it is EXPANDABLE — this
+        //     proves the predicate ACCEPTS a supported shape (not vacuously all-
+        //     decline). (NOTE: the const-init site above still declines; the bare
+        //     `MixNums!(…)` model case is what MX-T3's run-corpus exercises.)
+        assert_eq!(
+            classify("MixNums", 2),
+            Ok(()),
+            "MixNums at a plain same-file site is the model EXPAND case"
+        );
+
+        // --- A synthetic minimal expression mixin proves the EXPAND path is real
+        //     and self-contained (the model MX-T3 run-corpus shape `Double!(x)`).
+        let dsrc = "class C { static mixin Double(int x) { x * 2 } }";
+        let dunit = parse_file(dsrc, FileId(0)).0;
+        let dfiles = [SourceFile {
+            file: FileId(0),
+            src: dsrc,
+            unit: &dunit,
+        }];
+        let dt = StructTable::build(&dfiles);
+        let dbl = &dt.mixins.get("Double").expect("Double collected")[0];
+        assert_eq!(
+            mixin_expandable(dbl, &site(1), dt.srcs[dbl.src_file].as_str()),
+            Ok(()),
+            "a simple `Double(int x) => x*2` mixin is expandable"
+        );
+
+        // --- Arity mismatch is defensively declined (MX-T3's resolver matches by
+        //     arity first, but the predicate re-checks).
+        assert_eq!(
+            mixin_expandable(dbl, &site(2), dt.srcs[dbl.src_file].as_str()),
+            Err(MixinDecline::UnsupportedParamKind),
+            "arity mismatch → DECLINE"
+        );
     }
 }
