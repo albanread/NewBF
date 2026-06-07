@@ -4327,14 +4327,16 @@ const MIXIN_MAX_DEPTH: usize = 64;
 /// step 3 / §3.6). The stack tracks the live splice chain so the depth guard can
 /// bound recursion (`depth <= MIXIN_MAX_DEPTH`) and so the unconditional
 /// post-splice truncation (R5) can restore the pre-splice stack length even when
-/// the body escaped via `return`/`break`/`continue` (the §3.6 desync fix). The
-/// caller snapshots (`caller_ret_ty`, `caller_loops_len`) are recorded for
-/// MX-T4's escape-hardening; the depth field is what the guard reads.
+/// the body escaped via `return`/`break`/`continue` (the §3.6 desync fix).
 //
-// The fields are snapshots consumed by MX-T4 (escape + empty-loop guards); MX-T3
-// only reads `mixin_stack.len()` for the depth guard, so the per-frame fields are
-// not yet individually read. Allow dead_code (cited to MX-T4) until then.
-#[allow(dead_code)]
+// MX-T4 now CONSUMES the caller snapshots: after the splice `expand_mixin` reads
+// the frame back to (1) assert `ret_ty` is unchanged — proving a body `return`
+// coerced to the CALLER's return type (escape targets caller, not a callee) — and
+// (2) restore `self.loops` to `caller_loops_len` (R5 defensive loop-depth
+// restore). The empty-loop guard reads `self.loops` directly (== the same
+// snapshot). The `depth` field documents the splice nesting; the guard bounds it
+// via `mixin_stack.len()` so the field itself is unread — kept for diagnostics.
+#[allow(dead_code)] // `depth` is documentation-only; the guard reads `.len()`.
 #[derive(Clone, Copy)]
 struct MixinFrame {
     /// The caller's `ret_ty` at the splice point — a `return` inside the body
@@ -4625,6 +4627,53 @@ fn collect_body_local_names(stmt: &Stmt, src: &str, out: &mut HashSet<String>) {
         | Stmt::ForEach { body, .. }
         | Stmt::Defer { body, .. } => collect_body_local_names(body, src, out),
         _ => {}
+    }
+}
+
+/// MX-T4 empty-loop guard (mixins.md §3.6): whether a mixin body contains a
+/// `break`/`continue` that targets an ENCLOSING (caller) loop — i.e. one NOT
+/// nested inside a loop the body itself declares. Such an escape uses
+/// `self.loops.last()` at splice time; if the caller has no enclosing loop
+/// (`caller_loops_len == 0`) the existing `Stmt::Break`/`Continue` arms silently
+/// no-op WITHOUT setting `terminated`, which would let the splice keep lowering
+/// past a statement the program meant as a terminator (a degenerate miscompile,
+/// not a panic). v1 declines such a splice up front (graceful skip → existing
+/// path) so no novel IR is emitted. A `break`/`continue` INSIDE a body-declared
+/// loop targets that loop (always valid) and is NOT counted.
+///
+/// Walks statements only (break/continue are statements `for_each_stmt_expr`
+/// doesn't visit). `in_body_loop` tracks whether we are inside a loop the body
+/// opened: once true, descendant break/continue belong to that loop, not the
+/// caller's.
+fn body_escapes_caller_loop(body: &MethodBody) -> bool {
+    fn walk(s: &Stmt, in_body_loop: bool) -> bool {
+        match s {
+            // A bare break/continue escapes to the CALLER's loop only when not
+            // already inside a loop this body opened.
+            Stmt::Break { .. } | Stmt::Continue { .. } => !in_body_loop,
+            // The body opens its own loop: descendants' break/continue target it.
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::ForEach { body, .. } => walk(body, true),
+            Stmt::Block { stmts, .. } => stmts.iter().any(|s| walk(s, in_body_loop)),
+            Stmt::Locals { decls, .. } => decls.iter().any(|s| walk(s, in_body_loop)),
+            Stmt::If { then, els, .. } => {
+                walk(then, in_body_loop) || els.as_ref().is_some_and(|e| walk(e, in_body_loop))
+            }
+            Stmt::Defer { body, .. } => walk(body, in_body_loop),
+            // A `switch` arm's `break` exits the switch, not a loop — but v1
+            // gates such forms elsewhere; conservatively a top-level break/
+            // continue is detected via the arms walked here. We do NOT descend
+            // into a nested `Stmt::Switch` for loop-escape (its `break` is the
+            // switch's), nor into a nested mixin decl. Conservative = safe.
+            _ => false,
+        }
+    }
+    match body {
+        // An `=> expr` body has no statements, so no break/continue.
+        MethodBody::Expr(_) | MethodBody::None => false,
+        MethodBody::Block(s) => walk(s, false),
     }
 }
 
@@ -8384,6 +8433,21 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
+        // 4b. MX-T4 EMPTY-LOOP GUARD (mixins.md §3.6): a `break`/`continue` in the
+        //     body targets the CALLER's innermost loop (`self.loops.last()`). If the
+        //     body would escape to a caller loop (`body_escapes_caller_loop`) but
+        //     the caller has NO enclosing loop here (`self.loops` is empty — this is
+        //     the `caller_loops_len` the `MixinFrame` snapshots), the existing
+        //     `Stmt::Break`/`Continue` arms would silently no-op WITHOUT setting
+        //     `terminated`, letting the splice keep lowering past the intended
+        //     terminator. v1 declines this degenerate shape up front (graceful skip
+        //     → existing verifiable path) so no novel/wrong IR is emitted and no
+        //     panic occurs. `caller_loops_len == 0` is read here as `self.loops`
+        //     length (the value snapshotted into the frame below).
+        if self.loops.is_empty() && body_escapes_caller_loop(&def.body) {
+            return None;
+        }
+
         // The result slot type for a value-yielding mixin: the call-site target
         // when known (§3.5 common case). When untargeted, we discover it from the
         // trailing yield's lowered type below (so we alloca *after* learning it).
@@ -8393,11 +8457,16 @@ impl<'a> Lowerer<'a> {
 
         // 5. Snapshot the lockstep stack depths BEFORE pushing anything (§3.3
         //    step 4) — the unconditional truncation (step 8 / R5) restores these
-        //    even on an escaping body.
+        //    even on an escaping body. `loops_snap` (== `caller_loops_len`, also
+        //    recorded in the `MixinFrame` below) lets MX-T4 restore `self.loops`
+        //    if a body somehow opened a loop it didn't close (R5: a body splice
+        //    must leave `self.loops` exactly as it found it; a defensive truncate
+        //    keeps a later caller mixin call from desyncing).
         let scopes_snap = self.scopes.len();
         let defers_snap = self.defers.len();
         let scope_allocs_snap = self.scope_allocs.len();
         let mixin_snap = self.mixin_stack.len();
+        let loops_snap = self.loops.len();
 
         // 6. Push the lockstep frame (mirrors `Stmt::Block`, 6200-6202) so params
         //    + body-locals live in a fresh scope and don't leak into the caller.
@@ -8406,8 +8475,16 @@ impl<'a> Lowerer<'a> {
         self.scope_allocs
             .push((self.fb.current_block(), Vec::new()));
         self.mixin_stack.push(MixinFrame {
+            // The caller's `ret_ty` at the splice point. A `return expr` in the
+            // body lowers through `Stmt::Return` which coerces to `self.ret_ty`
+            // (the live caller's, never mutated during a splice) — so this
+            // snapshot EQUALS the type the escape actually coerces to. MX-T4
+            // reads it back below to assert the escape targeted the caller.
             caller_ret_ty: self.ret_ty,
-            caller_loops_len: self.loops.len(),
+            // The caller's loop depth — a `break`/`continue` in the body targets
+            // `self.loops.last()` (the caller's innermost). Snapshotted for the
+            // empty-loop guard (checked above) and the post-splice restore.
+            caller_loops_len: loops_snap,
             depth,
         });
 
@@ -8448,12 +8525,35 @@ impl<'a> Lowerer<'a> {
         let yielded = self.splice_body(&def.body, want_value, target, body_src);
 
         // 9. UNCONDITIONAL stack truncation back to the snapshot (§3.3 step 8 /
-        //    R5) — even when the body escaped via `return`/`break` and
-        //    `self.terminated` is set. A paired pop would be skipped on the
-        //    escape path; truncation is not, so the stack never desyncs.
+        //    R5) — even when the body escaped via `return`/`break`/`continue` and
+        //    `self.terminated` is set. A paired pop would be skipped on the escape
+        //    path; truncation is not, so the stack never desyncs and a LATER mixin
+        //    call in the same caller (after the escaping one terminated the block)
+        //    starts from the correct depths (`mixin_stmts_after_escape` pins this).
+        //
+        // MX-T4 escape-targets-caller assertion: the splice reuses the live
+        // Lowerer, so a body's `return`/`break`/`continue` lowered against the
+        // CALLER's `ret_ty`/`loops` — not any synthetic callee. The splice must
+        // therefore leave `ret_ty` and the `loops` DEPTH exactly as it found them
+        // (it only ever reads `self.loops.last()` for an escape, never pushes a
+        // caller loop). Read the frame's snapshots back (the `MixinFrame` fields
+        // MX-T3 recorded for exactly this): assert `ret_ty` is unchanged and
+        // DEFENSIVELY restore `self.loops` to the snapshotted caller depth (R5: a
+        // body that opened a loop it failed to close — shouldn't happen — must not
+        // desync a later caller mixin call).
+        let frame = self.mixin_stack[mixin_snap];
+        debug_assert_eq!(
+            self.ret_ty, frame.caller_ret_ty,
+            "mixin splice must not mutate the caller's ret_ty (escape targets caller)"
+        );
+        debug_assert_eq!(
+            loops_snap, frame.caller_loops_len,
+            "MixinFrame.caller_loops_len must equal the pre-splice loop depth"
+        );
         self.scopes.truncate(scopes_snap);
         self.defers.truncate(defers_snap);
         self.scope_allocs.truncate(scope_allocs_snap);
+        self.loops.truncate(frame.caller_loops_len);
         self.mixin_stack.truncate(mixin_snap);
 
         // 10. Result. A value-yielding call returns the captured yield (or, after
