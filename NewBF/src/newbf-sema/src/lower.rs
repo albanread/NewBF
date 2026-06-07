@@ -10787,10 +10787,8 @@ impl<'a> Lowerer<'a> {
     /// RF-T2: the runtime type-id from an object's `$header` — `%ClassVData`
     /// field 0 (`i32 mType`). The companion of [`Self::load_vtable_base`]; reads
     /// the header via the same raw offset-0 GEP, then `load_type_id` (a struct-
-    /// GEP into `%ClassVData` field 0, loaded as i32). Sema does not yet emit
-    /// this for any program — `GetType()` wiring is RF-T5 — so it is allowed to
-    /// be unused until then.
-    #[allow(dead_code)]
+    /// GEP into `%ClassVData` field 0, loaded as i32). RF-T5 wires this into
+    /// `recv.GetType()` (a heap-`Ref` receiver) — the dynamic type-id read.
     fn load_type_id(&mut self, obj: Value) -> Value {
         self.fb.load_type_id(obj)
     }
@@ -10927,6 +10925,53 @@ impl<'a> Lowerer<'a> {
                 };
                 let r = self.fb.call(sig.full_name, call_args, sig.ret);
                 return (r, sig.ret);
+            }
+        }
+        // `recv.GetType()` (RF-T5) — the receiver's RUNTIME `Type` (reflection.md
+        // §5.2 / §9 RF-T5). Beef makes `GetType` intrinsic/non-overridable, so
+        // this special-case precedes generic instance overload resolution — UNLESS
+        // the receiver's type declares its own `GetType` (the user-override gate:
+        // then fall through to the normal instance path so the user method runs).
+        // Nullary only (`GetType()` takes no args).
+        if mname == "GetType"
+            && args.is_empty()
+            && let Some((recv, owner_id)) = self.struct_base(base, src)
+            && !self.structs.methods[owner_id.0 as usize].contains_key("GetType")
+        {
+            // The corlib `Type` struct id → the result type (`Ref(Type)`), the
+            // SAME typing `typeof` yields, so `.GetTypeId()`/`.GetName()` resolve
+            // on the metatype. Absent only without corlib (typeof unreachable
+            // there) → a null `Ptr` is harmless.
+            let result_ty = self
+                .structs
+                .by_name
+                .get("Type")
+                .copied()
+                .map_or(IrType::Ptr, IrType::Ref);
+            match self.structs.kinds[owner_id.0 as usize] {
+                // Heap class instance (`StructKind::Ref`): DYNAMIC lookup. Read the
+                // runtime type-id from the object's `$header` (`%ClassVData.mType`,
+                // RF-T2's `LoadTypeId`) — the ACTUAL object's type, not the static
+                // receiver type — then index the in-module registry accessor
+                // `__newbf_type_by_id` (RF-T4) for the matching `Type*`. `recv` is
+                // the heap body pointer (already loaded by `struct_base`); it
+                // dominates this use site (R9-safe — emitted inline here).
+                StructKind::Ref => {
+                    let id = self.load_type_id(recv);
+                    let t = self.fb.call("__newbf_type_by_id", vec![id], result_ty);
+                    return (t, result_ty);
+                }
+                // Value struct (no `$header` to read): the runtime type IS the
+                // static type, known at compile time — `typeof(static type)` =
+                // `GlobalAddr` of its Type global (a v1 simplification vs Beef's
+                // runtime null; reflection.md §10). No `LoadTypeId`.
+                StructKind::Value => {
+                    let g = type_global_name(&self.structs.prefixes[owner_id.0 as usize]);
+                    return (self.fb.global_addr(g), result_ty);
+                }
+                // An interface-typed receiver falls through to normal dispatch
+                // (an interface that declares `GetType` resolves as a slot).
+                StructKind::Interface => {}
             }
         }
         // Interface dispatch (IT-T5, itables.md §5/§5.6). A SEPARATE branch that
