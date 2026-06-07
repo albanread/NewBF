@@ -415,6 +415,50 @@ impl StructTable {
             .cloned()
     }
 
+    /// The ctor analogue of [`pick_overload_partial`] (§3.2), used ONLY under the
+    /// `has_pending` fork — the non-pending path keeps the arity-only
+    /// [`ctor_for`] fast path verbatim. Selects a ctor of `id` by arity plus the
+    /// shape gate on pending slots: among ctors whose explicit-arity matches
+    /// `arg_shapes.len()`, a concrete slot scores by [`type_affinity`] against the
+    /// formal param (past the leading `this`), a *compatible* pending slot adds
+    /// +1, and an *incompatible* pending slot DISQUALIFIES the ctor. Ties keep the
+    /// first-registered ctor (`>` is strict). `None` if no ctor survives — the
+    /// caller then diagnoses/recovers rather than constructing against a wrong
+    /// param type. (Ctors are not variadic, so arity is an exact match.)
+    // Used only under the `has_pending` fork wired in TA-5/TA-6; until then
+    // exercised only by the TA-2 unit tests, so `allow(dead_code)` keeps the
+    // build warning-clean.
+    #[allow(dead_code)]
+    fn ctor_for_partial(&self, id: StructId, arg_shapes: &[ArgShape]) -> Option<MethodSig> {
+        let mut best: Option<(&MethodSig, u32)> = None;
+        'ctor: for c in &self.ctors[id.0 as usize] {
+            // Explicit params past the leading `this`; arity must match exactly.
+            let Some(formal) = c.params.get(1..) else {
+                continue;
+            };
+            if formal.len() != arg_shapes.len() {
+                continue;
+            }
+            let mut raw: u32 = 0;
+            for (f, s) in formal.iter().zip(arg_shapes) {
+                raw += match s {
+                    ArgShape::Concrete(a) => type_affinity(*f, *a),
+                    ArgShape::Pending(kind) => {
+                        if pending_shape_compatible(*kind, *f, self) {
+                            1
+                        } else {
+                            continue 'ctor; // incompatible pending slot → disqualify
+                        }
+                    }
+                };
+            }
+            if best.is_none_or(|(_, bs)| raw > bs) {
+                best = Some((c, raw));
+            }
+        }
+        best.map(|(c, _)| c.clone())
+    }
+
     fn dtor_of(&self, id: StructId) -> Option<String> {
         self.dtors[id.0 as usize].clone()
     }
@@ -3423,6 +3467,100 @@ fn arg_is_pending(e: &Expr, _src: &str) -> bool {
     }
 }
 
+/// The *syntactic kind* of a pending (target-typed dot-form) argument, carrying
+/// only what the shape gate (§3.2) needs to decide compatibility with a formal
+/// param type — never an `IrType` (pending-ness is syntactic; the type is the
+/// formal's, decided at resolution). Sema-local; never leaks into IR.
+///
+///  - `Ctor` — `.(args)`: compatible only with a value-struct `Struct(id)`.
+///  - `Initializer` — `.{ … }`: compatible only with `Struct(id)` for the first
+///    slice (a `Ref(id)` class-init is the §10 follow-up).
+///  - `EnumCase(case)` — bare `.Case` / `.Case(payload)`: compatible only with a
+///    payload-enum `Struct(id)` whose case set contains `case`. The borrowed name
+///    is read from `src` at classification time and lives as long as the AST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKind<'a> {
+    Ctor,
+    Initializer,
+    EnumCase(&'a str),
+}
+
+/// A classified argument slot for shape-gated resolution (§3.1): a `Concrete`
+/// slot already lowered to a known `IrType` (scored by [`type_affinity`]), or a
+/// `Pending` dot-form whose type is the formal's, gated by [`PendingKind`].
+/// Sema-local and stack-lived during one call's resolution; never stored in
+/// `StructTable` and never an IR type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgShape<'a> {
+    Concrete(IrType),
+    Pending(PendingKind<'a>),
+}
+
+/// Classify a *pending* argument expression into its [`PendingKind`] (the
+/// companion to [`arg_is_pending`] for the shape gate). Returns `None` for a
+/// concrete expression — exactly the cases [`arg_is_pending`] returns `false`
+/// for, so the two stay in lockstep. Pure, syntactic, O(1): the `.(args)` ctor
+/// shorthand is the `Call(DotIdent ".")` form; any other `Call(DotIdent name)`
+/// or a bare `DotIdent` is a case form (named `name`); a `DotIdent`-based
+/// `Initializer` is `.{ … }`.
+// Wired into the call sites' `has_pending` fork in TA-3 (via `lower_args_phase1`);
+// until then exercised only by the TA-2 unit tests, so `allow(dead_code)` keeps
+// the build warning-clean (the standing gate).
+#[allow(dead_code)]
+fn pending_kind<'a>(e: &'a Expr, src: &'a str) -> Option<PendingKind<'a>> {
+    match e {
+        // bare `.Case`
+        Expr::DotIdent { name, .. } => Some(PendingKind::EnumCase(name.text(src))),
+        // `.{ … }` (DotIdent base only)
+        Expr::Initializer { base, .. } if matches!(&**base, Expr::DotIdent { .. }) => {
+            Some(PendingKind::Initializer)
+        }
+        // `.(args)` (callee `"."`) vs `.Case(args)` (callee a case name)
+        Expr::Call { callee, .. } => match &**callee {
+            Expr::DotIdent { name, .. } => {
+                let n = name.text(src);
+                if n == "." {
+                    Some(PendingKind::Ctor)
+                } else {
+                    Some(PendingKind::EnumCase(n))
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The shape gate (§3.2): can a pending arg of `kind` target-type to formal
+/// param `f`? `Compatible` contributes a small +1 bonus (below an exact concrete
+/// match of +2); `Incompatible` DISQUALIFIES the whole candidate. This is
+/// correctness blocker #2: an incompatible pending slot must remove the
+/// candidate, not score 0 and silently pick a wrong overload that back-fills
+/// against the wrong param type.
+///
+/// `structs` is needed only for the enum-case set membership check; the ctor /
+/// initializer kinds gate purely on the formal being a value `Struct(_)`.
+fn pending_shape_compatible(kind: PendingKind, f: IrType, structs: &StructTable) -> bool {
+    match kind {
+        // `.(args)`: a value-struct ctor shorthand — only a value `Struct(id)`.
+        // A `Ref` (class), int/float/ptr/void all disqualify.
+        PendingKind::Ctor => matches!(f, IrType::Struct(_)),
+        // `.{ … }`: first slice only constructs against a value `Struct(id)`
+        // (the `Ref(id)` class-init is the §10 follow-up; keep `Struct` only).
+        PendingKind::Initializer => matches!(f, IrType::Struct(_)),
+        // `.Case` / `.Case(payload)`: only a payload-enum `Struct(id)` whose case
+        // set actually contains `case`. A non-enum struct, a class, or a primitive
+        // disqualifies; so does an enum that lacks this case.
+        PendingKind::EnumCase(case) => match f {
+            IrType::Struct(id) => structs
+                .enum_cases
+                .get(&id)
+                .is_some_and(|cases| cases.iter().any(|(n, _, _)| n == case)),
+            _ => false,
+        },
+    }
+}
+
 /// Pick the best-matching overload from `cands` (all sharing a name) for the
 /// given argument types — the receiver is *not* among `arg_tys`. An instance
 /// candidate matches against its params past the leading `this`; it's eligible
@@ -3435,8 +3573,40 @@ fn pick_overload<'s>(
     arg_tys: &[IrType],
     members: bool,
 ) -> Option<&'s MethodSig> {
+    // The all-concrete case of the shape-gated resolver. With every slot
+    // `Concrete`, `pick_overload_partial` scores by `type_affinity`, applies the
+    // identical variadic penalty + tie-break, and never disqualifies (the shape
+    // gate only fires on `Pending` slots), so it is byte-for-byte the old
+    // behavior. `structs` is unused on the all-concrete path (the enum-case gate
+    // only reads it for `Pending(EnumCase)` slots), so a default table is sound.
+    let shapes: Vec<ArgShape> = arg_tys.iter().map(|t| ArgShape::Concrete(*t)).collect();
+    pick_overload_partial(cands, &shapes, members, &StructTable::default())
+}
+
+/// Shape-gated generalization of [`pick_overload`] over a *sparse* shape vector
+/// (§3.1/§3.2): each slot is either `Concrete(IrType)` (scored by
+/// [`type_affinity`], exactly as `pick_overload`) or `Pending(kind)` (a
+/// target-typed dot-form whose type isn't known yet). A pending slot is run
+/// through the SHAPE GATE against its formal param type
+/// ([`pending_shape_compatible`]): **compatible → +1 bonus** (below an exact
+/// concrete match of +2, so it breaks ties toward the candidate it can target
+/// without outranking a better concrete match elsewhere); **incompatible →
+/// DISQUALIFY the candidate entirely** (correctness blocker #2 — never score 0
+/// and silently pick a wrong overload).
+///
+/// Arity rules are unchanged from `pick_overload`: a `params T[]` matches any
+/// count at/above its fixed params (flat penalty 1); a normal method needs an
+/// exact count. Only the fixed leading params are scored/gated (the variadic
+/// tail is back-filled against `elem` in `finish_args`). Ties keep the first
+/// registered. `pick_overload` delegates here with all-`Concrete` shapes.
+fn pick_overload_partial<'s>(
+    cands: &'s [MethodSig],
+    arg_shapes: &[ArgShape],
+    members: bool,
+    structs: &StructTable,
+) -> Option<&'s MethodSig> {
     let mut best: Option<(&MethodSig, u32)> = None;
-    for c in cands {
+    'cand: for c in cands {
         if c.is_instance && !members {
             continue;
         }
@@ -3450,16 +3620,28 @@ fn pick_overload<'s>(
         // count. Only the fixed leading params are scored, and a variadic match
         // takes a flat penalty so an exact non-variadic overload wins a tie.
         let (fixed, penalty) = match c.variadic {
-            Some(_) if arg_tys.len() + 1 >= formal.len() => (formal.len() - 1, 1),
+            Some(_) if arg_shapes.len() + 1 >= formal.len() => (formal.len() - 1, 1),
             Some(_) => continue,
-            None if formal.len() == arg_tys.len() => (formal.len(), 0),
+            None if formal.len() == arg_shapes.len() => (formal.len(), 0),
             None => continue,
         };
-        let raw: u32 = formal[..fixed]
-            .iter()
-            .zip(arg_tys)
-            .map(|(f, a)| type_affinity(*f, *a))
-            .sum();
+        // Score the fixed leading params zipped with the slots (truncating to the
+        // shorter, exactly as the old `formal[..fixed].zip(arg_tys)`): a concrete
+        // slot scores by `type_affinity`; a pending slot applies the shape gate —
+        // +1 if it can target-type to `f`, otherwise the candidate is disqualified.
+        let mut raw: u32 = 0;
+        for (f, s) in formal[..fixed].iter().zip(arg_shapes) {
+            raw += match s {
+                ArgShape::Concrete(a) => type_affinity(*f, *a),
+                ArgShape::Pending(kind) => {
+                    if pending_shape_compatible(*kind, *f, structs) {
+                        1
+                    } else {
+                        continue 'cand; // incompatible pending slot → disqualify
+                    }
+                }
+            };
+        }
         let score = raw.saturating_sub(penalty);
         if best.is_none_or(|(_, bs)| score > bs) {
             best = Some((c, score));
@@ -5936,6 +6118,132 @@ impl<'a> Lowerer<'a> {
             .or_else(|| self.try_target_typed_tuple(target, e, src))
             .or_else(|| self.try_target_typed_ctor(target, e, src))
             .or_else(|| self.try_target_typed_initializer(target, e, src))
+    }
+
+    /// Phase 1 of two-phase target-typed arg resolution (§3.1): walk `args`
+    /// left-to-right; lower each **concrete** arg eagerly via [`Self::arg_value`]
+    /// (same side-effect order as the eager path), caching `Some((Value, IrType))`
+    /// at its index; leave each **pending** dot-form a `None` hole (it is lowered
+    /// in [`Self::finish_args`] against its resolved param type). Returns the
+    /// cached partial values (parallel to `args`, `None` at pending slots) and the
+    /// sparse `ArgShape` vector resolution scores against
+    /// ([`pick_overload_partial`] / [`StructTable::ctor_for_partial`]): a concrete
+    /// slot is `Concrete(ty)`, a pending slot is `Pending(kind)`.
+    ///
+    /// Runs **exactly once** per call site (the resolved sub-path then calls
+    /// `finish_args` once), so a pending arg is never lowered during a non-taken
+    /// resolution probe. Wired into the call sites in TA-3+.
+    // Unused until the call sites are forked in TA-3+; `allow(dead_code)` keeps the
+    // build warning-clean (exercised by the TA-2 unit tests only).
+    #[allow(dead_code)]
+    fn lower_args_phase1<'e>(
+        &mut self,
+        args: &'e [Expr],
+        src: &'e str,
+    ) -> (Vec<Option<(Value, IrType)>>, Vec<ArgShape<'e>>) {
+        let mut partial: Vec<Option<(Value, IrType)>> = Vec::with_capacity(args.len());
+        let mut shapes: Vec<ArgShape<'e>> = Vec::with_capacity(args.len());
+        for a in args {
+            if let Some(kind) = pending_kind(a, src) {
+                // Pending: do NOT lower now; record its shape for resolution.
+                partial.push(None);
+                shapes.push(ArgShape::Pending(kind));
+            } else {
+                // Concrete: lower eagerly in source order (incl. ref/out via
+                // `arg_value`), caching the value and its type.
+                let (v, t) = self.arg_value(a, src);
+                partial.push(Some((v, t)));
+                shapes.push(ArgShape::Concrete(t));
+            }
+        }
+        (partial, shapes)
+    }
+
+    /// Phase 2 of two-phase resolution (§3.1/§3.8): the single in-source-order
+    /// emission pass. Walks arg indices `0..n` once; a **concrete** slot takes its
+    /// cached `partial` value and coerces it to its resolved param type; a
+    /// **pending** slot lowers NOW via [`Self::lower_arg_targeted`] against that
+    /// param type, then coerces. `formal` is the param list **already sliced to
+    /// exclude `this`** (the caller passes `&sig.params[1..]` for an instance call,
+    /// `&sig.params[..]` for static/generic/ctor-after-`this`), matching the
+    /// [`Self::pack_variadic_args`] contract. `variadic` is `Some(elem)` for a
+    /// `params T[]` tail (pending tail slots target `elem`).
+    ///
+    /// **Arity-bounds safety:** asserts `args.len()` (== `partial.len()`) lies in
+    /// `[fixed, fixed + variadic_slack]` of `formal` and recovers gracefully — a
+    /// param index past `formal` falls back to the cached/I64 type rather than an
+    /// unguarded `formal[i]` OOB. **Diagnostic recovery (§3.4):** a pending slot
+    /// whose resolved param can't be target-typed recovers with `undef(param_ty)`
+    /// (the *param* type, never a silent `undef(I64)` that would mis-coerce into a
+    /// struct slot). Runs **exactly once** per call. Wired into call sites in TA-3+.
+    // Unused until the call sites are forked in TA-3+; `allow(dead_code)` keeps the
+    // build warning-clean (exercised by the TA-2 unit tests only).
+    #[allow(dead_code)]
+    fn finish_args(
+        &mut self,
+        formal: &[IrType],
+        variadic: Option<IrType>,
+        partial: Vec<Option<(Value, IrType)>>,
+        args: &[Expr],
+        src: &str,
+    ) -> Vec<Value> {
+        debug_assert_eq!(
+            partial.len(),
+            args.len(),
+            "finish_args: partial cache must be parallel to args"
+        );
+        // The number of fixed (non-variadic-tail) params. For a variadic method
+        // the last `formal` entry is the `T[]` slot, so `fixed = formal.len() - 1`
+        // and every arg past it targets `elem`. For a normal method every arg
+        // targets `formal[i]`. Arity should already have been checked by
+        // resolution; assert the lower bound and recover above it.
+        let fixed = match variadic {
+            Some(_) => formal.len().saturating_sub(1),
+            None => formal.len(),
+        };
+        debug_assert!(
+            args.len() >= fixed,
+            "finish_args: fewer args ({}) than fixed params ({fixed})",
+            args.len()
+        );
+        // Lower/coerce every slot to a fully-concrete (Value, IrType) in source
+        // order, then hand to `pack_variadic_args` (variadic) or emit directly.
+        let mut lowered: Vec<(Value, IrType)> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            // The param type this slot targets: a fixed param's declared type, or
+            // the variadic element for a tail slot. If `i` somehow exceeds the
+            // formal arity (arity-recovery), fall back to the cached/I64 type so we
+            // never index `formal` out of bounds.
+            let param_ty: IrType = if i < fixed {
+                formal[i]
+            } else if let Some(elem) = variadic {
+                elem
+            } else {
+                // Past the formal arity with no variadic: recover with the cached
+                // concrete type (or I64 for a pending hole) — no OOB.
+                partial[i].as_ref().map(|(_, t)| *t).unwrap_or(IrType::I64)
+            };
+            let (v, t) = match &partial[i] {
+                // Concrete: take the Phase-1 value, coerce to the resolved param.
+                Some((v, t)) => (v.clone(), *t),
+                // Pending: lower NOW against the resolved param type, with the
+                // §3.4 diagnostic recovery (recover carrying the *param* type).
+                None => self.lower_arg_targeted(param_ty, a, src).unwrap_or_else(|| {
+                    // No diagnostic sink in this lowerer; recover with the param
+                    // type (not a silent undef(I64)) so coercion below is a no-op
+                    // and downstream IR stays type-correct.
+                    (undef(param_ty), param_ty)
+                }),
+            };
+            lowered.push((self.coerce(v, t, param_ty), param_ty));
+        }
+        match variadic {
+            // Pack the fixed leading args + the tail into a fresh `T[]`. The
+            // values are already coerced to their param types; `pack_variadic_args`
+            // re-coerces (a no-op) and builds the array.
+            Some(elem) => self.pack_variadic_args(formal, elem, lowered),
+            None => lowered.into_iter().map(|(v, _)| v).collect(),
+        }
     }
 
     /// Construct a `.Case(args)` / bare `.Case` initializer against a *known
@@ -8961,5 +9269,253 @@ mod tests {
             !arg_is_pending(&qualified_enum, ""),
             "a qualified Enum.Case(args) is concrete"
         );
+    }
+
+    // ---- TA-2: shape-gated partial resolution (`pick_overload_partial`) --------
+
+    /// A static `MethodSig` with explicit param types `params` (no `this`),
+    /// returning `void`. The symbol doubles as the candidate's identity in the
+    /// assertions below.
+    fn sig(name: &str, params: &[IrType]) -> MethodSig {
+        MethodSig {
+            full_name: name.to_string(),
+            ret: IrType::Void,
+            params: params.to_vec(),
+            is_instance: false,
+            variadic: None,
+        }
+    }
+
+    /// (a) `pick_overload` (now a thin wrapper over `pick_overload_partial` with
+    /// all-`Concrete` shapes) preserves the old behavior on a representative
+    /// spread: exact-type preference, same-category vs unrelated, arity gating,
+    /// and the variadic penalty/tie-break. For each case the wrapper's pick must
+    /// equal a direct `pick_overload_partial` call with the same shapes, proving
+    /// the delegation is identity on concrete args.
+    #[test]
+    fn pick_overload_wrapper_matches_partial_on_concrete() {
+        let st = StructTable::default();
+        let concrete = |tys: &[IrType]| -> Vec<ArgShape> {
+            tys.iter().map(|t| ArgShape::Concrete(*t)).collect()
+        };
+        // Exact width beats same-category: an i32 arg prefers the i32 overload.
+        let cands = vec![sig("M_i64", &[IrType::I64]), sig("M_i32", &[IrType::I32])];
+        let tys = [IrType::I32];
+        let picked = pick_overload(&cands, &tys, false).map(|s| s.full_name.as_str());
+        assert_eq!(picked, Some("M_i32"), "exact-width overload wins");
+        assert_eq!(
+            picked,
+            pick_overload_partial(&cands, &concrete(&tys), false, &st)
+                .map(|s| s.full_name.as_str()),
+            "wrapper == partial (exact width)",
+        );
+
+        // Same-category (int↔int) beats unrelated (a pointer-ish Ref): an int arg
+        // routes to the int overload, not the reference one.
+        let cands = vec![sig("M_ref", &[IrType::Ref(StructId(9))]), sig("M_int", &[IrType::I64])];
+        let tys = [IrType::I32];
+        let picked = pick_overload(&cands, &tys, false).map(|s| s.full_name.as_str());
+        assert_eq!(picked, Some("M_int"), "same-category int overload wins");
+        assert_eq!(
+            picked,
+            pick_overload_partial(&cands, &concrete(&tys), false, &st)
+                .map(|s| s.full_name.as_str()),
+            "wrapper == partial (category)",
+        );
+
+        // Arity: a 2-param candidate is ineligible for a 1-arg call.
+        let cands = vec![sig("M2", &[IrType::I64, IrType::I64]), sig("M1", &[IrType::I64])];
+        let tys = [IrType::I64];
+        assert_eq!(
+            pick_overload(&cands, &tys, false).map(|s| s.full_name.as_str()),
+            Some("M1"),
+            "arity selects the 1-param overload",
+        );
+
+        // Variadic penalty: an exact non-variadic overload beats a variadic one
+        // for the same arg count (tie broken by the variadic's flat penalty).
+        let mut variadic = sig("M_var", &[IrType::I64]);
+        variadic.variadic = Some(IrType::I64);
+        let cands = vec![variadic, sig("M_exact", &[IrType::I64])];
+        let tys = [IrType::I64];
+        let picked = pick_overload(&cands, &tys, false).map(|s| s.full_name.as_str());
+        assert_eq!(picked, Some("M_exact"), "exact overload beats variadic on a tie");
+        assert_eq!(
+            picked,
+            pick_overload_partial(&cands, &concrete(&tys), false, &st)
+                .map(|s| s.full_name.as_str()),
+            "wrapper == partial (variadic penalty)",
+        );
+
+        // Instance candidates are ineligible at a non-member site (`members=false`).
+        let mut inst = sig("M_inst", &[IrType::Ref(StructId(1)), IrType::I64]);
+        inst.is_instance = true;
+        let cands = vec![inst, sig("M_static", &[IrType::I64])];
+        let tys = [IrType::I64];
+        assert_eq!(
+            pick_overload(&cands, &tys, false).map(|s| s.full_name.as_str()),
+            Some("M_static"),
+            "instance candidate skipped at a this-less site",
+        );
+    }
+
+    /// (b) A pending `.(args)` (ctor) slot picks the struct-typed overload and
+    /// DISQUALIFIES a primitive-typed candidate. `.(…)` is compatible only with a
+    /// value `Struct(_)` param; an `int` param incompatible → that candidate is
+    /// removed, so the only survivor is the struct overload.
+    #[test]
+    fn pending_ctor_picks_struct_disqualifies_primitive() {
+        let st = StructTable::default();
+        let vec2 = IrType::Struct(StructId(7));
+        // Registered primitive-first, so a *non*-disqualifying resolver would wrongly
+        // keep it; the shape gate must drop it and choose the struct overload.
+        let cands = vec![sig("M_int", &[IrType::I64]), sig("M_vec2", &[vec2])];
+        let shapes = [ArgShape::Pending(PendingKind::Ctor)];
+        assert_eq!(
+            pick_overload_partial(&cands, &shapes, false, &st).map(|s| s.full_name.as_str()),
+            Some("M_vec2"),
+            ".(args) routes to the struct param, never the primitive",
+        );
+
+        // With *only* a primitive candidate, the pending `.(…)` disqualifies it and
+        // resolution fails (None) — better than silently picking a primitive slot.
+        let only_int = vec![sig("M_int", &[IrType::I64])];
+        assert_eq!(
+            pick_overload_partial(&only_int, &shapes, false, &st).map(|s| s.full_name.as_str()),
+            None,
+            "a lone primitive candidate is disqualified by a .(…) pending slot",
+        );
+    }
+
+    /// (c) The wrong-pick guard (correctness blocker #2): `M(Vec2,int)` vs
+    /// `M(Vec3,int)` called as `M(.(…), 5)`, plus a decoy `M(int,int)`. The pending
+    /// `.(…)` in slot 0 disqualifies `M(int,int)` (primitive first param), so
+    /// resolution can NEVER back-fill the construction against a primitive. Between
+    /// the two struct candidates the shape gate ties (both `Struct`), so the
+    /// first-registered wins — but either way the slot-0 param is a `Struct`, so a
+    /// `.(…)` arg is never miscompiled into a primitive slot.
+    #[test]
+    fn pending_ctor_wrong_pick_guard_backfills_a_struct() {
+        let st = StructTable::default();
+        let vec2 = IrType::Struct(StructId(3));
+        let vec3 = IrType::Struct(StructId(4));
+        // Decoy primitive-first candidate registered FIRST (the dangerous case: a
+        // loose gate would keep it and miscompile the `.(…)` into an int slot).
+        let cands = vec![
+            sig("M_int_int", &[IrType::I64, IrType::I64]),
+            sig("M_vec2_int", &[vec2, IrType::I64]),
+            sig("M_vec3_int", &[vec3, IrType::I64]),
+        ];
+        let shapes = [
+            ArgShape::Pending(PendingKind::Ctor),
+            ArgShape::Concrete(IrType::I64),
+        ];
+        let picked = pick_overload_partial(&cands, &shapes, false, &st)
+            .expect("a struct candidate must resolve");
+        assert_ne!(
+            picked.full_name, "M_int_int",
+            "the .(…) slot must NOT resolve to the primitive-first candidate",
+        );
+        // The slot-0 param of the pick is a struct (never a primitive) — the
+        // anti-miscompile invariant.
+        assert!(
+            matches!(picked.params[0], IrType::Struct(_)),
+            "the pending .(…) back-fills against a Struct param, not a primitive",
+        );
+        // First-registered struct candidate wins the all-struct tie.
+        assert_eq!(picked.full_name, "M_vec2_int", "first-registered struct tie");
+    }
+
+    /// (d) A pending `.Case` slot is compatible only with the payload enum whose
+    /// case set contains the named case. `OptA` owns `Some`; `EitherB` owns `Left`
+    /// (not `Some`). `.Some` resolves to the `OptA` param, disqualifying the
+    /// `EitherB` overload (case absent) and the `int` overload (not an enum struct).
+    #[test]
+    fn pending_enum_case_gates_on_case_set() {
+        let mut st = StructTable::default();
+        let opt_a = StructId(11);
+        let either_b = StructId(12);
+        // Minimal payload-enum case tables: only the case *names* matter to the gate.
+        st.enum_cases.insert(
+            opt_a,
+            vec![
+                ("Some".to_string(), 0, vec![IrType::I32]),
+                ("None".to_string(), 1, vec![]),
+            ],
+        );
+        st.enum_cases.insert(
+            either_b,
+            vec![
+                ("Left".to_string(), 0, vec![IrType::I32]),
+                ("Right".to_string(), 1, vec![IrType::I32]),
+            ],
+        );
+        let cands = vec![
+            sig("M_int", &[IrType::I64]),
+            sig("M_either", &[IrType::Struct(either_b)]),
+            sig("M_opt", &[IrType::Struct(opt_a)]),
+        ];
+        let some = [ArgShape::Pending(PendingKind::EnumCase("Some"))];
+        assert_eq!(
+            pick_overload_partial(&cands, &some, false, &st).map(|s| s.full_name.as_str()),
+            Some("M_opt"),
+            ".Some routes to the enum whose case set contains Some",
+        );
+        // A case owned by NEITHER enum disqualifies both enum candidates and the
+        // int one → no resolution (never a silent wrong pick).
+        let missing = [ArgShape::Pending(PendingKind::EnumCase("Nope"))];
+        assert_eq!(
+            pick_overload_partial(&cands, &missing, false, &st).map(|s| s.full_name.as_str()),
+            None,
+            "a case owned by no candidate enum disqualifies every candidate",
+        );
+    }
+
+    /// `pending_kind` classifies the three pending shapes (the companion to
+    /// `arg_is_pending`): `.(args)` → `Ctor`, `.{ … }` → `Initializer`, bare
+    /// `.Case` and `.Case(payload)` → `EnumCase(name)`; a concrete expr → `None`.
+    /// Pinned because the shape gate keys off these kinds.
+    #[test]
+    fn pending_kind_classifies_each_shape() {
+        let src = ". Vec2 Some";
+        let f = FileId(0);
+        // Spans into `src`: "." at 0..1, "Vec2" at 2..6 (unused), "Some" at 7..11.
+        let dot_name = Span::new(f, 0, 1);
+        let some_name = Span::new(f, 7, 11);
+        let sp = Span::new(f, 0, 0);
+
+        // `.(args)` — callee DotIdent named "."
+        let dot_ctor = Expr::Call {
+            span: sp,
+            callee: Box::new(Expr::DotIdent { span: sp, name: dot_name }),
+            args: vec![],
+        };
+        assert_eq!(pending_kind(&dot_ctor, src), Some(PendingKind::Ctor));
+
+        // `.{ … }` — DotIdent-based initializer
+        let dot_init = Expr::Initializer {
+            span: sp,
+            base: Box::new(Expr::DotIdent { span: sp, name: dot_name }),
+            entries: vec![],
+        };
+        assert_eq!(pending_kind(&dot_init, src), Some(PendingKind::Initializer));
+
+        // `.Some(payload)` — callee DotIdent named a case
+        let dot_case_call = Expr::Call {
+            span: sp,
+            callee: Box::new(Expr::DotIdent { span: sp, name: some_name }),
+            args: vec![Expr::Int(sp)],
+        };
+        assert_eq!(
+            pending_kind(&dot_case_call, src),
+            Some(PendingKind::EnumCase("Some")),
+        );
+
+        // bare `.Some`
+        let bare = Expr::DotIdent { span: sp, name: some_name };
+        assert_eq!(pending_kind(&bare, src), Some(PendingKind::EnumCase("Some")));
+
+        // A concrete expression → None (stays in lockstep with arg_is_pending).
+        assert_eq!(pending_kind(&Expr::Ident(sp), src), None);
     }
 }
