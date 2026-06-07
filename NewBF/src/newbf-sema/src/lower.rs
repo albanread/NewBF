@@ -13753,6 +13753,60 @@ mod tests {
         );
     }
 
+    /// RF-T6: the corlib `FieldInfo` value-`struct`'s lowered layout MUST be
+    /// ABI-identical to the `%struct.FieldInfo` aggregate `emit_metadata` writes:
+    ///   { ptr, i32, i32 } = { mName(char8*), mOffset, mTypeId }
+    /// As a `struct` (not a class) `FieldInfo` carries NO `$header`, so field 0
+    /// is `mName` and the struct's ABI size (16 bytes) matches the array element
+    /// the backend packs — so `Type.mFields[i]` (a `FieldInfo*` index) strides
+    /// correctly over the emitted `[k x %FieldInfo]` array. If this drifts,
+    /// `typeof(T).GetField(i)` reads the wrong entry.
+    #[test]
+    fn corlib_fieldinfo_layout_matches_struct_fieldinfo_aggregate() {
+        let src = "class Program { public static int32 Main() { return 0; } }";
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // The corlib `FieldInfo` struct (registered by the prelude).
+        let fi = module
+            .structs
+            .iter()
+            .find(|s| s.name == "FieldInfo" || s.name.ends_with(".FieldInfo"))
+            .unwrap_or_else(|| panic!(
+                "corlib `FieldInfo` struct present (have: {:?})",
+                module.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+            ));
+
+        // The exact field IR types `emit_metadata`'s `%struct.FieldInfo` uses, in
+        // order. A value struct has NO `$header`, so field 0 is `mName`.
+        let expected: [IrType; 3] = [
+            IrType::Ptr, // mName : char8*
+            IrType::I32, // mOffset
+            IrType::I32, // mTypeId
+        ];
+        assert_eq!(
+            fi.fields.len(),
+            expected.len(),
+            "corlib `FieldInfo` field count must match %struct.FieldInfo (no $header): got {:?}",
+            fi.fields.iter().map(|f| (&f.name, f.ty)).collect::<Vec<_>>()
+        );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                fi.fields[i].ty, *want,
+                "corlib `FieldInfo` field {} ({}) IR type must match %struct.FieldInfo",
+                i, fi.fields[i].name
+            );
+        }
+        // The first field must NOT be a `$header` (the value-struct guarantee).
+        assert_ne!(
+            fi.fields[0].name, "$header",
+            "corlib `FieldInfo` must be a value struct (no $header), else field indices shift"
+        );
+    }
+
     /// CB-T3: a `[Comptime, EmitGenerator]` method must (a) record an `EmitJob`
     /// keyed by its owner's qualified name + its mangled symbol, (b) STILL appear
     /// in `module.comptime` (the generator is also a comptime fn — the strip/fold

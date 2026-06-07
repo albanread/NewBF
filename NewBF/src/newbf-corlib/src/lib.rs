@@ -18,9 +18,13 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
     &[
         ("Internal.bf", include_str!("../bf/Internal.bf")),
         ("String.bf", include_str!("../bf/String.bf")),
+        // System.Reflection.FieldInfo — a reflected field's metadata (RF-T6). A
+        // value `struct` whose layout mirrors the emitted `%struct.FieldInfo`.
+        // `Type.mFields` is `FieldInfo*`, so it must register BEFORE `Type.bf`.
+        ("FieldInfo.bf", include_str!("../bf/FieldInfo.bf")),
         // System.Type — the reflection metatype (RF-T4). A value `struct` whose
-        // layout mirrors the emitted `%struct.Type`; uses `char8*`, so it lands
-        // after Internal/String and before any consumer.
+        // layout mirrors the emitted `%struct.Type`; uses `char8*` + `FieldInfo`,
+        // so it lands after Internal/String/FieldInfo and before any consumer.
         ("Type.bf", include_str!("../bf/Type.bf")),
         // System.Compiler — the comptime emission surface (comptime-breadth
         // §3.2, CB-T3). A `static class` whose `EmitTypeBody(text)` call sema

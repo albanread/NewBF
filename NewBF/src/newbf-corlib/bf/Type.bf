@@ -14,9 +14,16 @@
 // corlib-`Type`-layout-vs-`%struct.Type` unit test pins this ABI contract.
 //
 // v1 surface: name + id + size always resolve (the always-on TYPE policy);
-// field/method tables (mFields/mMethods, gated by [Reflect(.Fields/.Methods)])
-// are wired by RF-T6/T7. `mFieldCount`/`mMethodCount` are 0 when stripped, so
-// `GetFieldCount()` already observes the strip differential at RF-T4.
+// the field table (mFields, gated by [Reflect(.Fields)]) is queryable at RF-T6
+// via GetFieldCount/GetField; the method table (mMethods, [Reflect(.Methods)])
+// is wired by RF-T7. `mFieldCount`/`mMethodCount` are 0 when stripped, so
+// `GetFieldCount()` observes the strip differential.
+//
+// `mFields` is typed `FieldInfo*` (not `void*`): it points at the policy-gated
+// `[k x %FieldInfo]` array the backend emits, so `this.mFields[i]` strides by
+// `FieldInfo`'s ABI size (16 bytes — identical to `%struct.FieldInfo`) and
+// reads the i-th entry by copy. The ABI is unchanged — both `void*` and
+// `FieldInfo*` lower to a bare `ptr`; the typed form just lets us index it.
 struct Type {
 	int32 mSize;
 	int32 mTypeId;
@@ -24,7 +31,7 @@ struct Type {
 	int32 mFieldCount;
 	int32 mMethodCount;
 	char8* mName;
-	void* mFields;
+	FieldInfo* mFields;
 	void* mMethods;
 
 	// The type's simple name (a NUL-terminated `char8*` into .rodata). Compare
@@ -38,4 +45,21 @@ struct Type {
 	public int32 GetFieldCount() { return this.mFieldCount; }
 	// The number of reflected methods (0 unless [Reflect(.Methods)]).
 	public int32 GetMethodCount() { return this.mMethodCount; }
+
+	// The i-th reflected field's metadata (RF-T6). Indexes the policy-gated
+	// `[k x %FieldInfo]` array `mFields` points at; `mFields[i]` strides by
+	// FieldInfo's ABI size. For an out-of-range `i` (i < 0 or i >= count) or a
+	// stripped/unmarked type (`mFields == null`), returns a sentinel/empty
+	// FieldInfo (NUL name, offset 0, typeId -1) rather than dereferencing out of
+	// bounds — never faults (reflection.md §9 RF-T6).
+	public FieldInfo GetField(int32 i) {
+		FieldInfo empty;
+		empty.mName = null;
+		empty.mOffset = 0;
+		empty.mTypeId = -1;
+		if (this.mFields == null) { return empty; }
+		if (i < 0) { return empty; }
+		if (i >= this.mFieldCount) { return empty; }
+		return this.mFields[i];
+	}
 }
