@@ -27,6 +27,8 @@ class Program {
 		function int32(int32) f = m.Times;               // BOUND instance method ref
 		List<int32> ys = Map<int32, int32>(xs, f);       // [5, 10, 15, 20]
 		function int32(int32, int32) plus = (acc, x) => acc + x;
-		return Fold<int32, int32>(ys, 0, plus);          // 5 + 10 + 15 + 20 = 50
+		int32 r = Fold<int32, int32>(ys, 0, plus);       // 5 + 10 + 15 + 20 = 50
+		delete m;   // MS-T5.5: balance `new Scaler(5)` after its bound ref is done
+		return r;
 	}
 }

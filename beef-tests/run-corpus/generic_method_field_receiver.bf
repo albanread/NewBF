@@ -15,6 +15,8 @@ class Holder {
 class Program {
 	public static int32 Main() {
 		Holder h = new Holder();
-		return h.Use();   // 30
+		int32 r = h.Use();   // 30
+		delete h;            // MS-T5.5: balance the `new Holder()` (behavior-neutral)
+		return r;
 	}
 }

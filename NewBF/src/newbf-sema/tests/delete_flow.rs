@@ -44,6 +44,23 @@ fn double_free_diags(name: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Analyze a fixture and return only the leak ("provable leak") diagnostics.
+fn leak_diags(name: &str) -> Vec<Diagnostic> {
+    let src = fixture(name);
+    let (unit, pdiags) = parse_file(&src, FileId(0));
+    assert!(pdiags.is_empty(), "{name} must parse clean: {pdiags:?}");
+    let program = analyze(&[SourceFile {
+        file: FileId(0),
+        src: &src,
+        unit: &unit,
+    }]);
+    program
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.message.contains("provable leak"))
+        .collect()
+}
+
 // ── positives ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -73,6 +90,35 @@ fn scope_bound_delete_is_diagnosed_exactly_once() {
         diags[0].message.contains("scope-allocated"),
         "message should describe the scope double-free: {:?}",
         diags[0].message
+    );
+}
+
+// ── MS-T6: provable leak (positive) ──────────────────────────────────────────
+
+#[test]
+fn provable_leak_is_diagnosed_exactly_once() {
+    let diags = leak_diags("provable_leak.bf");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected exactly one provable-leak diagnostic, got: {diags:?}"
+    );
+    assert!(
+        diags[0].message.contains("'p'"),
+        "message should name the leaked binding: {:?}",
+        diags[0].message
+    );
+}
+
+// ── MS-T6: leak negatives (every resolved disposition must stay silent) ───────
+
+#[test]
+fn leak_negatives_are_all_silent() {
+    let diags = leak_diags("leak_negatives.bf");
+    assert!(
+        diags.is_empty(),
+        "deleted / scoped / returned / aliased / field-stored / address-taken / \
+         captured `new`s must NOT be flagged as leaks, got: {diags:?}"
     );
 }
 

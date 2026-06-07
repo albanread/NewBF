@@ -35,6 +35,11 @@ class Program {
 		function int64(int64, int64) plus64 = (acc, x) => acc + x;
 		int64 wsum = wide.Fold<int64>(0, plus64);   // 90L
 
+		// MS-T5.5: balance the four `new List<…>()` allocations (behavior-neutral).
+		delete xs;
+		delete scaled;
+		delete kept;
+		delete wide;
 		return sum + (int32)wsum;                   // 90 + 90 = 180
 	}
 }

@@ -5,6 +5,8 @@
 class Program {
 	public static int32 Main() {
 		Probe p = new Probe();
-		return p.Answer();
+		int32 r = p.Answer();
+		delete p;   // MS-T5.5: balance the `new Probe()` (behavior-neutral)
+		return r;
 	}
 }

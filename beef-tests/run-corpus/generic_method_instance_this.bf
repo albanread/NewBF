@@ -13,6 +13,8 @@ class Cell {
 class Program {
 	public static int32 Main() {
 		Cell c = new Cell();
-		return c.Run();   // 7
+		int32 r = c.Run();   // 7
+		delete c;            // MS-T5.5: balance the `new Cell()` (behavior-neutral)
+		return r;
 	}
 }

@@ -9,7 +9,9 @@ class Program {
 	public static int32 Main() {
 		Animal a = new Dog();
 		// a.GetType() must be Dog (the runtime object), not Animal (the static ref).
-		return (a.GetType().GetTypeId() == typeof(Dog).GetTypeId()
+		int32 r = (a.GetType().GetTypeId() == typeof(Dog).GetTypeId()
 		     && a.GetType().GetTypeId() != typeof(Animal).GetTypeId()) ? 1 : 0;
+		delete a;   // MS-T5.5: balance the `new Dog()` (behavior-neutral)
+		return r;
 	}
 }

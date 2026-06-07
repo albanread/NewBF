@@ -70,15 +70,18 @@ pub fn analyze(files: &[SourceFile<'_>]) -> Program {
         usings: builder.usings,
         global,
     };
-    // MS-T5 (memory-safety.md §B0): the compile-time delete-flow pass runs here,
-    // AFTER `resolve_and_check`, appending provable double-free / scope-delete
-    // diagnostics. It is pure sema (no IR, no LLVM) and re-walks the raw
-    // `CompUnit` ASTs in `files` (the DefGraph carries no method bodies). It
-    // sees only the **user sources** — the corlib prelude is injected later
-    // inside lowering, so library code is never analysed here. The pass is
-    // strictly conservative (zero false positives): it untracks any binding the
-    // moment it is moved/aliased and diagnoses only a provably-deleted-then-
-    // deleted (or scope-then-deleted) binding.
+    // MS-T5/MS-T6 (memory-safety.md §B0): the compile-time delete-flow pass runs
+    // here, AFTER `resolve_and_check`, appending provable double-free /
+    // scope-delete (MS-T5) and provable-leak (MS-T6) diagnostics. It is pure sema
+    // (no IR, no LLVM) and re-walks the raw `CompUnit` ASTs in `files` (the
+    // DefGraph carries no method bodies). It sees only the **user sources** — the
+    // corlib prelude is injected later inside lowering, so library code is never
+    // analysed here. The pass is strictly conservative (zero false positives): it
+    // keeps an owning `new` binding `Owned` only through by-reference uses
+    // (arg-pass/method-call/member-read), moves it on `return`/tracked-reassign,
+    // drops it on capture/field-store/address-of, and diagnoses only a
+    // provably-deleted-then-deleted (or scope-then-deleted) binding, or a binding
+    // still `Owned` at a function-body exit edge (a provable leak).
     diagnostics.extend(ownership::check_delete_flow(files, &graph, &builder.interner));
     Program {
         graph,

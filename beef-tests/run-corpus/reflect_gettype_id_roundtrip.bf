@@ -7,6 +7,8 @@
 class Program {
 	public static int32 Main() {
 		Dog p = new Dog();
-		return (p.GetType().GetTypeId() == typeof(Dog).GetTypeId()) ? 1 : 0;
+		int32 r = (p.GetType().GetTypeId() == typeof(Dog).GetTypeId()) ? 1 : 0;
+		delete p;   // MS-T5.5: balance the `new Dog()` (behavior-neutral)
+		return r;
 	}
 }

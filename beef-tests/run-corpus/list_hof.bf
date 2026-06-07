@@ -21,6 +21,10 @@ class Program {
 		List<int32> doubled = Map<int32, int32>(xs, dbl);
 		List<int32> kept = Filter<int32>(doubled, big);
 		int32 sum = Fold<int32, int32>(kept, 0, plus);
+		// MS-T5.5: balance the three `new List<int32>()` allocations (behavior-neutral).
+		delete xs;
+		delete doubled;
+		delete kept;
 		return sum; // 4 + 6 + 8 = 18
 	}
 }

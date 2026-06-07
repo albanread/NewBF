@@ -16,6 +16,8 @@ class Program {
 		Neg n = new Neg();
 		int32 a = p.Id<int32>(4);   // 4
 		int32 b = n.Id<int32>(2);   // 2
+		delete p;                   // MS-T5.5: balance the `new Pos()` (behavior-neutral)
+		delete n;                   // MS-T5.5: balance the `new Neg()` (behavior-neutral)
 		return a + b;               // 6
 	}
 }

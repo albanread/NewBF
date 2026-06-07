@@ -12,6 +12,7 @@ class Program {
 		Box b = new Box();
 		int32 a = b.Id<int32>(40);   // 40
 		int32 c = b.Id<int32>(2);    // 2
+		delete b;                    // MS-T5.5: balance the `new Box()` (behavior-neutral)
 		return a + c;                // 42
 	}
 }

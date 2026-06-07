@@ -36,7 +36,9 @@ namespace Tests
 			Box b = new Box();
 			int32 a = b.Id<int32>(40);
 			int32 c = new Box().Id<int32>(2);
-			return a + c + b.Run();
+			int32 r = a + c + b.Run();
+			delete b;   // MS-T5.5: balance the `new Box()` (behavior-neutral)
+			return r;
 		}
 	}
 }
