@@ -22,6 +22,7 @@ mod build;
 mod intern;
 mod lower;
 mod model;
+mod ownership;
 mod report;
 mod resolve;
 
@@ -60,16 +61,27 @@ pub fn analyze(files: &[SourceFile<'_>]) -> Program {
     for f in files {
         builder.build_file(f);
     }
-    let diagnostics = builder.resolve_and_check();
+    let mut diagnostics = builder.resolve_and_check();
     let global = builder.global();
+    let graph = DefGraph {
+        namespaces: builder.namespaces,
+        types: builder.types,
+        members: builder.members,
+        usings: builder.usings,
+        global,
+    };
+    // MS-T5 (memory-safety.md §B0): the compile-time delete-flow pass runs here,
+    // AFTER `resolve_and_check`, appending provable double-free / scope-delete
+    // diagnostics. It is pure sema (no IR, no LLVM) and re-walks the raw
+    // `CompUnit` ASTs in `files` (the DefGraph carries no method bodies). It
+    // sees only the **user sources** — the corlib prelude is injected later
+    // inside lowering, so library code is never analysed here. The pass is
+    // strictly conservative (zero false positives): it untracks any binding the
+    // moment it is moved/aliased and diagnoses only a provably-deleted-then-
+    // deleted (or scope-then-deleted) binding.
+    diagnostics.extend(ownership::check_delete_flow(files, &graph, &builder.interner));
     Program {
-        graph: DefGraph {
-            namespaces: builder.namespaces,
-            types: builder.types,
-            members: builder.members,
-            usings: builder.usings,
-            global,
-        },
+        graph,
         interner: builder.interner,
         diagnostics,
     }
