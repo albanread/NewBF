@@ -1011,6 +1011,25 @@ fn classvdata_name(prefix: &str) -> String {
     format!("{prefix}$cvdata")
 }
 
+/// RF-T4: the per-type `%struct.Type` constant global's symbol for a type prefix
+/// (`"Dog."` → `"Dog.$type"`). This is the metatype `typeof(T)` points at — a
+/// SEPARATE constant from the ClassVData header. The same prefix convention as
+/// `classvdata_name`, so monomorphs (`Box$int.` → `Box$int.$type`) get distinct
+/// Type globals automatically (reflection.md §4.6). Sema emits a `GlobalAddr`
+/// of this name from `Expr::TypeOf`; the backend (`emit_metadata`) DEFINES it —
+/// the sema↔llvm contract is exactly this symbol name (newbf-sema ⊥ newbf-llvm,
+/// like ClassVData).
+fn type_global_name(prefix: &str) -> String {
+    format!("{prefix}$type")
+}
+
+/// RF-T4: the registry's out-of-range sentinel `%struct.Type` global — a never-
+/// null "unknown" Type. `typeof` of a non-class / unresolved operand lowers to a
+/// `GlobalAddr` of this name (so `.GetName()`/`.GetTypeId()` can't deref null);
+/// the backend defines it in `emit_metadata`. Always emitted (even by programs
+/// with no reflectable types) so the symbol always resolves.
+const TYPE_UNKNOWN_GLOBAL: &str = "__newbf_type_unknown";
+
 /// Compose vtables across the table (recursive, memoized, base-first): inherit
 /// the base's slots, let an `override` replace a slot's implementation, and
 /// append a new slot for each newly-introduced `virtual` method. Slot indices
@@ -6926,6 +6945,17 @@ impl<'a> Lowerer<'a> {
                 let it = lower_ty_env(ty, src, self.structs, self.env);
                 (self.size_of_ty(it), IrType::I64)
             }
+            // `typeof(T)` (RF-T4) → the address of T's per-type `%struct.Type`
+            // constant (`type_global_name(prefix)`), typed `Ref(Type)` so the
+            // metatype's instance methods (`.GetName()` / `.GetTypeId()` / …)
+            // resolve on the corlib `Type` struct. Resolution mirrors
+            // `new_class_id`: `lower_ty_env` handles bare class names AND generic
+            // applications (`Box<int32>` → its monomorph). Only a user-declared
+            // class (`StructKind::Ref`) gets a Type global — a primitive operand,
+            // an unresolved generic param, or (degenerate) a missing corlib `Type`
+            // lower to the never-null `__newbf_type_unknown` sentinel (no
+            // diagnostic sink at lowering — reflection.md §5.2 / §6).
+            Expr::TypeOf { ty, .. } => self.lower_typeof(ty, src),
             // An anonymous lambda lowers to the address of the free function it
             // was emitted as. If it captures outer locals it becomes a *closure*:
             // allocate a heap env `[code_ptr | cap0 | cap1 …]` (8-byte slots),
@@ -8601,6 +8631,34 @@ impl<'a> Lowerer<'a> {
             Some(IrType::Ref(id)) => Some(id),
             _ => None,
         }
+    }
+
+    /// RF-T4: lower `typeof(T)` to the address of T's `%struct.Type` constant.
+    ///
+    /// Resolve `T` via `lower_ty_env` (the same path `new`/`sizeof` use, so bare
+    /// class names and generic applications both resolve). If it names a
+    /// user-declared class (`Ref(id)` with `kind == Ref`), emit a `GlobalAddr` of
+    /// `type_global_name(prefix(id))` — the per-type Type global the backend
+    /// defines — typed `Ref(Type)` (the corlib `Type` struct id) so the metatype
+    /// methods resolve. Otherwise (primitive / unresolved generic param /
+    /// value-struct in v1) fall back to the never-null `__newbf_type_unknown`
+    /// sentinel global. The result is a constant `GlobalAddr` (no operands), so
+    /// it trivially dominates every use (SSA-safe — reflection.md §5.2).
+    fn lower_typeof(&mut self, ty: &AstType, src: &str) -> (Value, IrType) {
+        // The corlib `Type` struct id (looked up once). Absent only when lowering
+        // WITHOUT corlib (the verify corpus runs some files standalone); there
+        // typeof is unreachable, so a null `Ptr` is harmless.
+        let type_id = self.structs.by_name.get("Type").copied();
+        let result_ty = type_id.map_or(IrType::Ptr, IrType::Ref);
+        let resolved = lower_ty_env(ty, src, self.structs, self.env);
+        if let IrType::Ref(id) = resolved
+            && matches!(self.structs.kinds[id.0 as usize], StructKind::Ref)
+        {
+            let g = type_global_name(&self.structs.prefixes[id.0 as usize]);
+            return (self.fb.global_addr(g), result_ty);
+        }
+        // Non-class / unresolved → the registry sentinel (never null).
+        (self.fb.global_addr(TYPE_UNKNOWN_GLOBAL.to_string()), result_ty)
     }
 
     /// The byte size of an IR type as an `i64` — a value struct defers to the IR
@@ -10484,6 +10542,17 @@ impl<'a> Lowerer<'a> {
         // There is deliberately NO `Func$ → Ptr` path (it would drop `target`).
         if from == IrType::Ptr && to == IrType::Struct(self.structs.func_struct) {
             return self.build_func_value(v, Value::Const(Const::Null));
+        }
+        // RF-T4: a `Ref(id)` (pointer to a struct body) assigned into a by-value
+        // `Struct(id)` slot loads the aggregate by value (a copy). This is how
+        // `Type d = typeof(Dog);` works — `typeof` yields a `Ref(Type)` (pointer
+        // to the per-type `%struct.Type` constant) and a `Type` LOCAL is a
+        // by-value `Struct(Type)`. The copy is the metatype value; direct
+        // `typeof(T).GetName()` (no local) keeps the `Ref` and never hits this.
+        if let (IrType::Ref(rid), IrType::Struct(sid)) = (from, to)
+            && rid == sid
+        {
+            return self.fb.load(v, to);
         }
         match (from, to) {
             // Same-width integers share one LLVM type (signedness isn't in the
@@ -12622,6 +12691,65 @@ mod tests {
             "name-sort: Marked ({}) must get a smaller id than Unmarked ({})",
             marked.type_id,
             unmarked.type_id
+        );
+    }
+
+    /// RF-T4: the corlib `Type` value-`struct`'s lowered layout MUST be
+    /// ABI-identical to the `%struct.Type` aggregate `emit_metadata` writes:
+    ///   { i32, i32, i32, i32, i32, ptr, ptr, ptr }
+    ///   = { mSize, mTypeId, mFlags, mFieldCount, mMethodCount, mName, mFields, mMethods }
+    /// As a `struct` (not a class) `Type` carries NO `$header`, so its field
+    /// order starts at index 0 and matches the headerless emitted constant — the
+    /// §4.5 off-by-one hazard is eliminated. If this drifts, `typeof(T).Field`
+    /// reads the wrong offset.
+    #[test]
+    fn corlib_type_layout_matches_struct_type_aggregate() {
+        let src = "class Program { public static int32 Main() { return 0; } }";
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // The corlib `Type` struct (registered by the prelude).
+        let ty = module
+            .structs
+            .iter()
+            .find(|s| s.name == "Type" || s.name.ends_with(".Type"))
+            .unwrap_or_else(|| panic!(
+                "corlib `Type` struct present (have: {:?})",
+                module.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+            ));
+
+        // The exact field IR types `emit_metadata`'s `%struct.Type` uses, in
+        // order. A value struct has NO `$header`, so field 0 is `mSize`.
+        let expected: [IrType; 8] = [
+            IrType::I32, // mSize
+            IrType::I32, // mTypeId
+            IrType::I32, // mFlags
+            IrType::I32, // mFieldCount
+            IrType::I32, // mMethodCount
+            IrType::Ptr, // mName : char8*
+            IrType::Ptr, // mFields : %FieldInfo*
+            IrType::Ptr, // mMethods : %MethodInfo*
+        ];
+        assert_eq!(
+            ty.fields.len(),
+            expected.len(),
+            "corlib `Type` field count must match %struct.Type (no $header): got {:?}",
+            ty.fields.iter().map(|f| (&f.name, f.ty)).collect::<Vec<_>>()
+        );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                ty.fields[i].ty, *want,
+                "corlib `Type` field {} ({}) IR type must match %struct.Type",
+                i, ty.fields[i].name
+            );
+        }
+        // The first field must NOT be a `$header` (the value-struct guarantee).
+        assert_ne!(
+            ty.fields[0].name, "$header",
+            "corlib `Type` must be a value struct (no $header), else field indices shift"
         );
     }
 }

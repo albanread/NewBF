@@ -18,6 +18,10 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
     &[
         ("Internal.bf", include_str!("../bf/Internal.bf")),
         ("String.bf", include_str!("../bf/String.bf")),
+        // System.Type — the reflection metatype (RF-T4). A value `struct` whose
+        // layout mirrors the emitted `%struct.Type`; uses `char8*`, so it lands
+        // after Internal/String and before any consumer.
+        ("Type.bf", include_str!("../bf/Type.bf")),
         ("Console.bf", include_str!("../bf/Console.bf")),
         ("Pool.bf", include_str!("../bf/Pool.bf")),
         ("Handle.bf", include_str!("../bf/Handle.bf")),

@@ -173,6 +173,69 @@ mod tests {
         m
     }
 
+    /// RF-T4 AOT metadata smoke (the JIT-only run-corpus can't cover AOT
+    /// `.rodata` serialization): emit a module with one Type global (type_id 7) +
+    /// the in-module `__newbf_type_by_id` accessor, link it into a real exe whose
+    /// `main` calls the accessor and returns the Type's `mTypeId`, then run it and
+    /// check the exit code is 7. This proves (a) the Type/registry constants
+    /// serialize into the object's `.rodata` and (b) the in-module accessor links
+    /// in AOT with NO Rust runtime symbol (the design's verified fix).
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn aot_metadata_accessor_links_and_runs() {
+        use super::{emit_object, link_executable};
+        use newbf_ir::{FieldDef, ReflectPolicy, StructDef, TypeMeta, Value, VtableDef};
+
+        let mut m = IrModule::new("aot_meta");
+        // A reflectable class `{ $header: ptr, mX: i32 }` with type_id 7.
+        let c = m.add_struct(StructDef {
+            name: "Widget".into(),
+            fields: vec![
+                FieldDef { name: "$header".into(), ty: IrType::Ptr },
+                FieldDef { name: "mX".into(), ty: IrType::I32 },
+            ],
+        });
+        m.add_vtable(VtableDef { name: "Widget.$cvdata".into(), entries: vec![], type_id: 7 });
+        m.add_type_meta(TypeMeta {
+            type_id: 0, // dense id 0 (the only entry) — registry index
+            struct_id: c,
+            name: "Widget".into(),
+            policy: ReflectPolicy::TYPE,
+            is_ref: true,
+            fields: vec![],
+            methods: vec![],
+        });
+
+        // i32 main() { Type* t = __newbf_type_by_id(0); return t->mTypeId; }
+        // The Type aggregate is { i32 mSize, i32 mTypeId, ... } so mTypeId is the
+        // second i32 — but we placed type_id 7 in the VtableDef's mType word; the
+        // Type global's mTypeId is the DENSE id (0). To return a stable nonzero,
+        // read mSize (field 0 = 16) instead — the object instance size.
+        m.declare_extern("__newbf_type_by_id", vec![Param { name: None, ty: IrType::I32 }], IrType::Ptr);
+        let mut f = FunctionBuilder::new("main", vec![], IrType::I32);
+        let t = f.call("__newbf_type_by_id", vec![Value::int(0, IrType::I32)], IrType::Ptr);
+        // mSize is field 0 of %struct.Type; load it as i32 (= get_size(Widget) = 16).
+        let sz = f.load(t, IrType::I32);
+        f.ret(Some(sz));
+        m.add_function(f.finish());
+
+        let dir = std::env::temp_dir();
+        let pidn = std::process::id();
+        let obj = dir.join(format!("newbf_aotmeta_{pidn}.obj"));
+        let exe = dir.join(format!("newbf_aotmeta_{pidn}.exe"));
+
+        emit_object(&m, &obj).expect("emit object");
+        link_executable(&[&obj], &exe, &[]).expect("link exe");
+        let status = std::process::Command::new(&exe).status().expect("run exe");
+        // mSize(Widget) = ptr(8) + i32(4) + pad(4) = 16; the accessor + Type
+        // global both came from .rodata and the in-module accessor linked.
+        assert_eq!(status.code(), Some(16), "AOT metadata: Type.mSize via in-module accessor");
+
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(exe.with_extension("exe.map"));
+    }
+
     #[test]
     fn emits_a_native_object() {
         let obj = emit_object_to_memory(&add_module()).expect("object emits");

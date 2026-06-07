@@ -37,7 +37,7 @@ use inkwell::values::{
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 use newbf_ir::{
     BinOp, BlockId, CastKind, CmpPred, Const, Function as IrFunction, InstKind, IrType,
-    Module as IrModule, Param, Terminator, Value,
+    Module as IrModule, Param, ReflectPolicy, Terminator, TypeMeta, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,16 +59,25 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
         ],
         false,
     );
+    // RF-T4: a `TargetData` for concrete struct sizes (the Type global's
+    // `mSize` / FieldInfo offsets — const i32s that can't be a `size_of()`
+    // const-expr). Built from the host target's data layout when the native
+    // target is registered (JIT/AOT init it); a standard 64-bit fallback
+    // otherwise (e.g. a `lower_to_string` call before any target init), so
+    // size computation never panics.
+    let target_data = host_data_layout();
     let mut cg = Codegen {
         ctx,
         module: &module,
         builder: &builder,
         struct_types: Vec::new(),
         classvdata_ty,
+        target_data,
     };
     cg.build_struct_types(ir);
     cg.declare_all(ir);
     cg.emit_classvdata(ir);
+    cg.emit_metadata(ir);
     cg.emit_globals(ir);
     for f in &ir.funcs {
         if !f.is_extern {
@@ -76,6 +85,34 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
         }
     }
     module
+}
+
+/// RF-T4: the host's `TargetData` (for concrete struct sizes), falling back to a
+/// standard x86-64 layout when no native target is registered. The two agree on
+/// scalar/pointer layout (the only shapes reflectable structs use), so `mSize`
+/// is correct in both the JIT/AOT path (target registered) and the
+/// `lower_to_string`/`verify_module` test paths (often not).
+fn host_data_layout() -> inkwell::targets::TargetData {
+    use inkwell::targets::{InitializationConfig, Target, TargetMachine};
+    use inkwell::OptimizationLevel;
+    if Target::initialize_native(&InitializationConfig::default()).is_ok() {
+        let triple = TargetMachine::get_default_triple();
+        if let Ok(target) = Target::from_triple(&triple)
+            && let Some(tm) = target.create_target_machine(
+                &triple,
+                "generic",
+                "",
+                OptimizationLevel::Default,
+                inkwell::targets::RelocMode::Default,
+                inkwell::targets::CodeModel::Default,
+            )
+        {
+            return tm.get_target_data();
+        }
+    }
+    inkwell::targets::TargetData::create(
+        "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
+    )
 }
 
 /// Lower an IR module and render it as LLVM IR text — the `dump-llvm` report.
@@ -113,6 +150,9 @@ struct Codegen<'ctx, 'a> {
     /// (LLVM computes the padded offset; no hand-rolled byte offset). `mType`
     /// (field 0) is read as i32 for `LoadTypeId`.
     classvdata_ty: StructType<'ctx>,
+    /// RF-T4: the host data layout, for concrete struct sizes (`%struct.Type`'s
+    /// `mSize` is a const i32 — `get_abi_size(struct_type)` truncated to i32).
+    target_data: inkwell::targets::TargetData,
 }
 
 impl<'ctx> Codegen<'ctx, '_> {
@@ -272,6 +312,288 @@ impl<'ctx> Codegen<'ctx, '_> {
             g.set_initializer(&init);
             g.set_constant(true);
         }
+    }
+
+    /// RF-T4: the per-type `%struct.Type` constant global's symbol — mirrors
+    /// sema's `type_global_name` (`"Dog."` → `"Dog.$type"`). The sema↔llvm
+    /// contract: sema emits a `GlobalAddr` of this exact name from `typeof(T)`;
+    /// here we DEFINE it. (newbf-sema ⊥ newbf-llvm — agree only via the symbol.)
+    fn type_global_name(prefix: &str) -> String {
+        format!("{prefix}$type")
+    }
+
+    /// RF-T4: emit a private, NUL-terminated `[N x i8]` string constant and
+    /// return a `ptr` to its first byte (a `char8*`). Same shape as `Const::Str`
+    /// lowering, but reusable for metadata name strings.
+    fn emit_cstr(&self, s: &str) -> PointerValue<'ctx> {
+        let i8t = self.ctx.i8_type();
+        let bytes: Vec<_> = s
+            .bytes()
+            .chain(std::iter::once(0u8))
+            .map(|b| i8t.const_int(u64::from(b), false))
+            .collect();
+        let arr = i8t.const_array(&bytes);
+        let g = self.module.add_global(arr.get_type(), None, ".str.meta");
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        g.set_linkage(inkwell::module::Linkage::Private);
+        g.as_pointer_value()
+    }
+
+    /// RF-T4: the reflection metadata pass — modeled on `emit_classvdata`. From
+    /// `ir.type_meta` it emits, all into the SAME module the JIT/AOT compiles:
+    ///   1. The named `%struct.Type` / `%struct.FieldInfo` / `%struct.MethodInfo`
+    ///      aggregate types (ABI-pinned to corlib `Type.bf` — reflection.md §4.2).
+    ///   2. Per `TypeMeta`: a name string, the (policy-gated) `[k x %FieldInfo]` /
+    ///      `[m x %MethodInfo]` arrays, then the `%struct.Type` constant global
+    ///      (`type_global_name(prefix)`), with `mSize` from the DataLayout and
+    ///      `mFields`/`mMethods` NULL when the policy strips them (the strip
+    ///      differential — an unmarked type emits no FieldInfo array at all).
+    ///   3. The dense registry: `@__newbf_type_table` (`[COUNT x ptr]` by type-id),
+    ///      `@__newbf_type_count`, and the never-null `@__newbf_type_unknown`
+    ///      sentinel.
+    ///   4. The IN-MODULE `@__newbf_type_by_id(i32) -> ptr` accessor (a bounds-
+    ///      checked index into the table) — NO Rust runtime symbol, so it resolves
+    ///      in JIT AND AOT with zero linking work (the design's verified fix,
+    ///      reflection.md §3/§4.4).
+    ///
+    /// A program with no reflectable types still emits a `[0 x ptr]` table +
+    /// count 0 + the sentinel + the accessor (so `typeof(non-class)` and the
+    /// accessor always resolve), but pays nothing per-type.
+    fn emit_metadata(&self, ir: &IrModule) {
+        let i32_ty = self.ctx.i32_type();
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+
+        // 1. The metadata aggregate types. `%struct.Type` field order MUST match
+        //    corlib `Type.bf` (the layout unit test pins this):
+        //      { mSize, mTypeId, mFlags, mFieldCount, mMethodCount,
+        //        mName(ptr), mFields(ptr), mMethods(ptr) }
+        let type_ty = self.ctx.opaque_struct_type("struct.Type");
+        type_ty.set_body(
+            &[
+                i32_ty.into(), // mSize
+                i32_ty.into(), // mTypeId
+                i32_ty.into(), // mFlags
+                i32_ty.into(), // mFieldCount
+                i32_ty.into(), // mMethodCount
+                ptr_ty.into(), // mName : char8*
+                ptr_ty.into(), // mFields : %FieldInfo*
+                ptr_ty.into(), // mMethods : %MethodInfo*
+            ],
+            false,
+        );
+        // %struct.FieldInfo  = { name(char8*), offset(i32), typeId(i32) }
+        let field_ty = self.ctx.opaque_struct_type("struct.FieldInfo");
+        field_ty.set_body(&[ptr_ty.into(), i32_ty.into(), i32_ty.into()], false);
+        // %struct.MethodInfo = { name(char8*), symbol(char8*), paramCount(i32) }
+        let method_ty = self.ctx.opaque_struct_type("struct.MethodInfo");
+        method_ty.set_body(&[ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false);
+
+        // A dense type-id → struct-id map so a FieldInfo's `typeId` can name the
+        // field type's own reflection id (0 when the field type isn't reflected).
+        let mut dense_struct_to_typeid: HashMap<u32, u32> = HashMap::new();
+        for tm in &ir.type_meta {
+            dense_struct_to_typeid.insert(tm.struct_id.0, tm.type_id);
+        }
+
+        // 2. Per type: name + (gated) field/method arrays + the Type global.
+        //    Sort by dense type-id so the table below is built in id order.
+        let mut metas: Vec<&TypeMeta> = ir.type_meta.iter().collect();
+        metas.sort_by_key(|t| t.type_id);
+
+        // The Type global pointers in dense-id order (for the registry table).
+        let mut table_entries: Vec<PointerValue<'ctx>> = Vec::with_capacity(metas.len());
+
+        for tm in &metas {
+            let name_ptr = self.emit_cstr(&tm.name);
+
+            // The object instance size (the backend `get_size`), as an i32. The
+            // struct id is into `ir.structs`, built 1:1 in `struct_types`.
+            let size = self
+                .struct_types
+                .get(tm.struct_id.0 as usize)
+                .map(|st| self.target_data.get_abi_size(st) as u32)
+                .unwrap_or(0);
+
+            // Policy-gated FieldInfo array. Emitted ONLY when policy.has(FIELDS);
+            // else `mFields` is null + count 0 (the strip differential).
+            let (fields_ptr, field_count) = if tm.policy.has(ReflectPolicy::FIELDS)
+                && !tm.fields.is_empty()
+            {
+                let infos: Vec<_> = tm
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let fname = self.emit_cstr(&f.name);
+                        // Field byte offset within the object body (from the
+                        // DataLayout); 0 if the struct type is somehow absent.
+                        let offset = self
+                            .struct_types
+                            .get(tm.struct_id.0 as usize)
+                            .and_then(|st| {
+                                self.target_data.offset_of_element(st, f.field_index)
+                            })
+                            .unwrap_or(0) as u32;
+                        // The field type's own reflection type-id (0 if not a
+                        // reflected struct/class type).
+                        let tyid = match f.ty {
+                            IrType::Struct(id) | IrType::Ref(id) => {
+                                dense_struct_to_typeid.get(&id.0).copied().unwrap_or(0)
+                            }
+                            _ => 0,
+                        };
+                        field_ty.const_named_struct(&[
+                            fname.into(),
+                            i32_ty.const_int(u64::from(offset), false).into(),
+                            i32_ty.const_int(u64::from(tyid), false).into(),
+                        ])
+                    })
+                    .collect();
+                let arr = field_ty.const_array(&infos);
+                let g = self.module.add_global(arr.get_type(), None, ".fieldinfo");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                g.set_linkage(inkwell::module::Linkage::Private);
+                (g.as_pointer_value(), infos.len() as u32)
+            } else {
+                (ptr_ty.const_null(), 0)
+            };
+
+            // Policy-gated MethodInfo array (RF-T7 consumes it; emitted here so
+            // the strip policy is symmetric and the count is observable).
+            let (methods_ptr, method_count) = if tm.policy.has(ReflectPolicy::METHODS)
+                && !tm.methods.is_empty()
+            {
+                let infos: Vec<_> = tm
+                    .methods
+                    .iter()
+                    .map(|m| {
+                        let mname = self.emit_cstr(&m.name);
+                        let msym = self.emit_cstr(&m.symbol);
+                        method_ty.const_named_struct(&[
+                            mname.into(),
+                            msym.into(),
+                            i32_ty.const_int(u64::from(m.param_count), false).into(),
+                        ])
+                    })
+                    .collect();
+                let arr = method_ty.const_array(&infos);
+                let g = self.module.add_global(arr.get_type(), None, ".methodinfo");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                g.set_linkage(inkwell::module::Linkage::Private);
+                (g.as_pointer_value(), infos.len() as u32)
+            } else {
+                (ptr_ty.const_null(), 0)
+            };
+
+            // mFlags: bit0 = is_ref (class). (Reserved for richer flags later.)
+            let flags = u64::from(tm.is_ref);
+            let init = type_ty.const_named_struct(&[
+                i32_ty.const_int(u64::from(size), false).into(),
+                i32_ty.const_int(u64::from(tm.type_id), false).into(),
+                i32_ty.const_int(flags, false).into(),
+                i32_ty.const_int(u64::from(field_count), false).into(),
+                i32_ty.const_int(u64::from(method_count), false).into(),
+                name_ptr.into(),
+                fields_ptr.into(),
+                methods_ptr.into(),
+            ]);
+            // The global name is keyed by the struct PREFIX (== sema's
+            // `type_global_name`); recover it from the ClassVData name we emitted
+            // (`"{prefix}$cvdata"`), since `TypeMeta` carries only the simple name.
+            let prefix = ir
+                .vtables
+                .iter()
+                .find(|v| v.type_id == tm.type_id)
+                .and_then(|v| v.name.strip_suffix("$cvdata"))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}.", tm.name));
+            let gname = Self::type_global_name(&prefix);
+            let g = self.module.add_global(type_ty, None, &gname);
+            g.set_initializer(&init);
+            g.set_constant(true);
+            table_entries.push(g.as_pointer_value());
+        }
+
+        // 3. The never-null sentinel Type (id -1, size 0, name "?"), then the
+        //    dense registry table + count.
+        let unknown_name = self.emit_cstr("?");
+        let unknown_init = type_ty.const_named_struct(&[
+            i32_ty.const_zero().into(),                         // mSize
+            i32_ty.const_int(u64::from(u32::MAX), false).into(), // mTypeId = -1
+            i32_ty.const_zero().into(),                         // mFlags
+            i32_ty.const_zero().into(),                         // mFieldCount
+            i32_ty.const_zero().into(),                         // mMethodCount
+            unknown_name.into(),
+            ptr_ty.const_null().into(),
+            ptr_ty.const_null().into(),
+        ]);
+        let unknown = self
+            .module
+            .add_global(type_ty, None, "__newbf_type_unknown");
+        unknown.set_initializer(&unknown_init);
+        unknown.set_constant(true);
+
+        let count = table_entries.len() as u32;
+        let table_arr = ptr_ty.const_array(&table_entries);
+        let table = self
+            .module
+            .add_global(table_arr.get_type(), None, "__newbf_type_table");
+        table.set_initializer(&table_arr);
+        table.set_constant(true);
+
+        let count_g = self
+            .module
+            .add_global(i32_ty, None, "__newbf_type_count");
+        count_g.set_initializer(&i32_ty.const_int(u64::from(count), false));
+        count_g.set_constant(true);
+
+        // 4. The in-module accessor: `ptr @__newbf_type_by_id(i32 %id)`. A
+        //    bounds-checked (unsigned, so negatives are rejected) index into the
+        //    table, returning the sentinel out of range — never null. Built with
+        //    the inkwell builder; resolves in JIT and AOT with no external symbol.
+        let fn_ty = ptr_ty.fn_type(&[i32_ty.into()], false);
+        // Reuse an existing declaration if one was already declared (e.g. an IR
+        // `extern` or a forward call from `declare_all`) so we DEFINE that symbol
+        // rather than emit a name-mangled duplicate; otherwise add it fresh. In
+        // the normal pipeline `emit_metadata` runs before `lower_function`, so a
+        // sema-emitted call (RF-T5) resolves to this definition.
+        let func = self
+            .module
+            .get_function("__newbf_type_by_id")
+            .filter(|f| f.count_basic_blocks() == 0)
+            .unwrap_or_else(|| self.module.add_function("__newbf_type_by_id", fn_ty, None));
+        let entry = self.ctx.append_basic_block(func, "entry");
+        let hit = self.ctx.append_basic_block(func, "hit");
+        let miss = self.ctx.append_basic_block(func, "miss");
+        self.builder.position_at_end(entry);
+        let id = func.get_nth_param(0).unwrap().into_int_value();
+        let cnt = i32_ty.const_int(u64::from(count), false);
+        let ok = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, id, cnt, "ok")
+            .unwrap();
+        self.builder.build_conditional_branch(ok, hit, miss).unwrap();
+
+        self.builder.position_at_end(hit);
+        // GEP `[COUNT x ptr] @__newbf_type_table, i32 0, i32 %id`, then load.
+        let table_ty = ptr_ty.array_type(count);
+        let zero = i32_ty.const_zero();
+        // SAFETY: a 2-index GEP into the table global; `id` is bounds-checked
+        // above (the `hit` block is only reached when `id < count`).
+        let slot = unsafe {
+            self.builder
+                .build_in_bounds_gep(table_ty, table.as_pointer_value(), &[zero, id], "slot")
+                .unwrap()
+        };
+        let t = self.builder.build_load(ptr_ty, slot, "t").unwrap();
+        self.builder.build_return(Some(&t)).unwrap();
+
+        self.builder.position_at_end(miss);
+        self.builder
+            .build_return(Some(&unknown.as_pointer_value()))
+            .unwrap();
     }
 
     /// Emit each `static` field as a mutable, zero-initialized module global.
@@ -1328,5 +1650,117 @@ mod tests {
             "LoadTypeId must struct-GEP %ClassVData field 0 (i32 0, i32 0):\n{ir}"
         );
         assert!(ir.contains("load i32"), "LoadTypeId loads i32 (the type-id):\n{ir}");
+    }
+
+    /// RF-T4 strip differential (the deterministic, non-JIT detector): a marked
+    /// type's Type global references a non-null `%struct.FieldInfo` array; an
+    /// unmarked type's `mFields` is null and NO FieldInfo array global is emitted.
+    /// This proves policy gating at emission, independent of running the JIT.
+    #[test]
+    fn emit_metadata_strips_fields_unless_marked() {
+        use newbf_ir::{
+            FieldDef, FieldMeta, ReflectPolicy, StructDef, TypeMeta, VtableDef,
+        };
+
+        let mut m = IrModule::new("t");
+        // Two classes, each `{ $header: ptr, mX: i32, mY: i32 }`.
+        let mk = |m: &mut IrModule, name: &str| {
+            m.add_struct(StructDef {
+                name: name.into(),
+                fields: vec![
+                    FieldDef { name: "$header".into(), ty: IrType::Ptr },
+                    FieldDef { name: "mX".into(), ty: IrType::I32 },
+                    FieldDef { name: "mY".into(), ty: IrType::I32 },
+                ],
+            })
+        };
+        let marked = mk(&mut m, "Marked");
+        let unmarked = mk(&mut m, "Unmarked");
+
+        // ClassVData globals (so `type_global_name`'s prefix is recoverable).
+        m.add_vtable(VtableDef { name: "Marked.$cvdata".into(), entries: vec![], type_id: 0 });
+        m.add_vtable(VtableDef { name: "Unmarked.$cvdata".into(), entries: vec![], type_id: 1 });
+
+        let user_fields = || {
+            vec![
+                FieldMeta { name: "mX".into(), ty: IrType::I32, field_index: 1 },
+                FieldMeta { name: "mY".into(), ty: IrType::I32, field_index: 2 },
+            ]
+        };
+        // Marked: TYPE|FIELDS ⇒ a FieldInfo array. Unmarked: TYPE only ⇒ stripped.
+        m.add_type_meta(TypeMeta {
+            type_id: 0,
+            struct_id: marked,
+            name: "Marked".into(),
+            policy: ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            is_ref: true,
+            fields: user_fields(),
+            methods: vec![],
+        });
+        m.add_type_meta(TypeMeta {
+            type_id: 1,
+            struct_id: unmarked,
+            name: "Unmarked".into(),
+            policy: ReflectPolicy::TYPE,
+            is_ref: true,
+            fields: vec![], // sema records none when FIELDS is stripped
+            methods: vec![],
+        });
+
+        verify_module(&m).expect("metadata module verifies");
+        let ir = lower_to_string(&m);
+
+        // The marked Type global + its FieldInfo array exist; the registry +
+        // in-module accessor are emitted.
+        assert!(
+            ir.contains("@\"Marked.$type\"") || ir.contains("@Marked.$type"),
+            "marked Type global emitted:\n{ir}"
+        );
+        assert!(
+            ir.contains("%struct.FieldInfo") && ir.contains("@.fieldinfo"),
+            "marked type emits a %struct.FieldInfo array:\n{ir}"
+        );
+        // The strip differential: the marked type emits a FieldInfo array; the
+        // unmarked type's array is absent (its `mFields` is null) — pinned by the
+        // unmarked-only module below.
+        assert!(
+            ir.contains("@__newbf_type_table")
+                && ir.contains("@__newbf_type_count")
+                && ir.contains("@__newbf_type_unknown"),
+            "registry table/count/unknown emitted:\n{ir}"
+        );
+        assert!(
+            ir.contains("define ptr @__newbf_type_by_id(i32"),
+            "in-module accessor emitted:\n{ir}"
+        );
+
+        // A module with ONLY the unmarked type emits NO FieldInfo array at all
+        // (the clean strip side of the differential).
+        let mut m2 = IrModule::new("t2");
+        let only = m2.add_struct(StructDef {
+            name: "Unmarked".into(),
+            fields: vec![
+                FieldDef { name: "$header".into(), ty: IrType::Ptr },
+                FieldDef { name: "mX".into(), ty: IrType::I32 },
+            ],
+        });
+        m2.add_vtable(VtableDef { name: "Unmarked.$cvdata".into(), entries: vec![], type_id: 0 });
+        m2.add_type_meta(TypeMeta {
+            type_id: 0,
+            struct_id: only,
+            name: "Unmarked".into(),
+            policy: ReflectPolicy::TYPE,
+            is_ref: true,
+            fields: vec![],
+            methods: vec![],
+        });
+        let ir2 = lower_to_string(&m2);
+        // The `%struct.FieldInfo` named TYPE is always declared, but NO
+        // `@.fieldinfo` array GLOBAL is emitted when every type strips fields —
+        // the clean strip side of the differential.
+        assert!(
+            !ir2.contains("@.fieldinfo"),
+            "an unmarked-only module emits no FieldInfo array global (strip):\n{ir2}"
+        );
     }
 }
