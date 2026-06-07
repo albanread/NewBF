@@ -679,7 +679,11 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
                             && enum_has_payload(td)
                             && enum_is_layoutable(td))) =>
             {
-                out.entry(td.name.text(src).to_string())
+                // MX-T5: key by (name, arity) so `Result<T>` and `Result<T, E>`
+                // don't shadow each other (FIRST-WINS within an arity is fine —
+                // the prelude decl wins over a same-arity corpus fixture, the
+                // intended single-canonical-Result reconciliation).
+                out.entry((td.name.text(src).to_string(), td.generic_params.len()))
                     .or_insert((td, src));
             }
             _ => {}
@@ -766,8 +770,11 @@ fn index_gmethods_on_monos<'a>(
     generics: &GenericDecls<'a>,
     out: &mut GenMethodDecls<'a>,
 ) {
-    for (mono_id, gen_name, _env) in monos {
-        let Some(&(td, td_src)) = generics.get(gen_name) else {
+    for (mono_id, gen_name, env) in monos {
+        // MX-T5: the mono's env length is its type-arg arity — match the decl of
+        // that exact arity (so a `Result<int32>` mono finds `Result<T>`, not
+        // `Result<T, E>`).
+        let Some(&(td, td_src)) = generics.get(&(gen_name.clone(), env.len())) else {
             continue;
         };
         for m in &td.members {
@@ -989,6 +996,16 @@ fn register_tuple_type(ty: &AstType, src: &str, t: &mut StructTable) {
         | AstType::Nullable { inner, .. }
         | AstType::Array { inner, .. }
         | AstType::Sized { inner, .. } => register_tuple_type(inner, src, t),
+        // MX-T5: recurse into a path's generic args so a tuple nested in a generic
+        // arg (`Result<(StringView, int64)>`, `List<(int, int)>`) is registered,
+        // not just a tuple in a bare/composite position.
+        AstType::Path { segments, .. } => {
+            for seg in segments {
+                for a in &seg.args {
+                    register_tuple_type(a, src, t);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1600,7 +1617,16 @@ fn add_iface_flat(iid: StructId, links: &IfaceLinks, flat: &mut Vec<StructId>) {
 type MonoList<'a> = Vec<(StructId, &'a TypeDecl, &'a str, Vec<(String, IrType)>)>;
 
 /// Generic type declarations indexed by name, each with its owning file's src.
-type GenericDecls<'a> = HashMap<String, (&'a TypeDecl, &'a str)>;
+// MX-T5: keyed by `(simple name, generic-param arity)`, not name alone — so two
+// arities of the SAME name coexist (the corlib prelude declares both `Result<T>`
+// and `Result<T, E>`). A name-only key (the old shape) made the second arity
+// shadow the first under FIRST-WINS `or_insert`, so a `Result<int32>` use would
+// resolve to the 2-param decl and bind only `T` (leaving `E` unbound) — which
+// destabilized the monomorph fixpoint (the `monos2.is_empty()` assert). Arity is
+// part of the resolution discriminator everywhere a use site looks a decl up
+// (`record_inst` by `args.len()`, `index_gmethods_on_monos`/emission by the
+// mono's `env.len()`).
+type GenericDecls<'a> = HashMap<(String, usize), (&'a TypeDecl, &'a str)>;
 
 /// Record the monomorphization a generic type reference demands (`Box<int>` →
 /// register `Box$i64`), then recurse into its arguments and any wrapped type.
@@ -1653,9 +1679,24 @@ fn record_inst<'a>(
     monos: &mut MonoList<'a>,
     env: &[(String, IrType)],
 ) {
-    let Some(&(decl, decl_src)) = generics.get(name) else {
+    // MX-T5: resolve the generic decl by (name, type-arg arity) so `Result<int32>`
+    // (1 arg) finds `Result<T>` and `Result<int32, bool>` (2 args) finds
+    // `Result<T, E>` — two arities of the same name coexist.
+    let Some(&(decl, decl_src)) = generics.get(&(name.to_string(), args.len())) else {
         return;
     };
+    // MX-T5: register any tuple shape that appears INSIDE a type arg (e.g.
+    // `Result<(StringView, int64)>`) up front, so `lower_ty_env` below resolves it
+    // to its `Struct(id)` rather than the `Ptr` fallback. `register_tuples` (step
+    // 3b) only scans non-generic member signatures and does NOT recurse into
+    // generic args, so a tuple that appears solely as a generic arg would be
+    // unregistered during this pass-1 collection and lower to `Ptr` — but be
+    // registered (→ `Struct`) by pass 2, producing a DIFFERENT mangle and a new
+    // pass-2 type-mono that trips the `monos2.is_empty()` fixpoint assert. Pinning
+    // the tuple here makes the arg lower identically in both passes.
+    for a in args {
+        register_tuple_type(a, src, t);
+    }
     // Resolve the type args through the *caller's* env, so a nested `List<T>`
     // inside a `Stack<int32>` body resolves `T → int32` (→ `List$i32`), not the
     // `Ptr` fallback. This is what makes transitive monomorphization correct.
@@ -5121,7 +5162,10 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         index_generic_decls(&f.unit.items, f.src, &mut generics);
     }
     for (id, name, env) in &structs.monos {
-        if let Some(&(decl, decl_src)) = generics.get(name) {
+        // MX-T5: re-find the decl by (name, arity) — the mono's env length is its
+        // arity — so a `Result<int32>` mono emits `Result<T>`'s methods, not
+        // `Result<T, E>`'s.
+        if let Some(&(decl, decl_src)) = generics.get(&(name.clone(), env.len())) {
             let prefix = structs.prefixes[id.0 as usize].clone();
             lower_type_at(decl, Some(*id), &prefix, env, decl_src, &structs, &mut m);
         }

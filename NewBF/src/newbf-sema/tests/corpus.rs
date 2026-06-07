@@ -378,3 +378,46 @@ class C {
     verify_src(src)
         .expect("MX-T3: an untargeted (generic) sub-expression mixin declines and verifies clean");
 }
+
+/// MX-T5 `.Err`-branch verify pin (mixins.md §3.7 / §8): a program that reaches
+/// the PRELUDE `Result<T, E>`'s `.Err → default` arm in IR (it `Unwrap`s an `.Err`
+/// value) must lower verifier-clean. v1 has NO `Internal.FatalError`, so the error
+/// arm returns `default` (zeroed `T`) and emits NO unresolved symbol — a clean
+/// verify confirms both: the error arm + the `default` it needs build, and nothing
+/// dangles. This program declares NO `Result` of its own, so it exercises the
+/// canonical prelude type the whole corpus now shares.
+#[test]
+fn mx_t5_result_err_arm_lowers_clean() {
+    let src = "\
+class Program {
+	public static int32 Main() {
+		Result<int32, bool> err = Result<int32, bool>.Err(true);
+		// Both the method and the property exercise the `.Err → default` arm.
+		int32 a = err.Unwrap();
+		int32 b = err.Value;
+		return a + b;
+	}
+}
+";
+    verify_src(src).expect("MX-T5: the prelude Result's `.Err → default` arm lowers verifier-clean");
+}
+
+/// MX-T5 single-param `.Err` verify pin: the prelude's convenience `Result<T>`
+/// (payloadless `.Err`) — a DISTINCT arity from `Result<T, E>` — also lowers its
+/// `.Err → default` arm clean. Pins that the (name, arity)-keyed generic-decl
+/// resolution picks `Result<T>` for the 1-arg use (not the 2-arg decl).
+#[test]
+fn mx_t5_result_single_param_err_arm_lowers_clean() {
+    let src = "\
+class Program {
+	public static int32 Main() {
+		Result<int32> err = Result<int32>.Err;
+		int32 a = err.Unwrap();
+		int32 b = err.Value;
+		return a + b;
+	}
+}
+";
+    verify_src(src)
+        .expect("MX-T5: the prelude Result<T> (single param) `.Err` arm lowers verifier-clean");
+}

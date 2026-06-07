@@ -37,6 +37,13 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         ("List.bf", include_str!("../bf/List.bf")),
         ("Probe.bf", include_str!("../bf/Probe.bf")),
         ("Option.bf", include_str!("../bf/Option.bf")),
+        // System.Result<T,E> / Result<T> — the canonical Result ADT (MX-T5,
+        // mixins.md §3.7). A generic layoutable payload enum with `Unwrap`/`Value`
+        // (`.Err → default`, NO FatalError in v1). Monomorph keys are by simple
+        // name, so this is the one `Result` the whole corpus resolves to; corpus
+        // fixtures USE it (like `Option`) rather than re-declaring it. MX-T6's
+        // `Try!` builds on this type.
+        ("Result.bf", include_str!("../bf/Result.bf")),
         ("Math.bf", include_str!("../bf/Math.bf")),
     ]
 }
