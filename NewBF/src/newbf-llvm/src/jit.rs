@@ -31,13 +31,16 @@ use llvm_sys::execution_engine::{
 use llvm_sys::orc2::lljit::{
     LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
     LLVMOrcLLJITAddLLVMIRModule, LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator,
-    LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
+    LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib, LLVMOrcLLJITLookup,
+    LLVMOrcLLJITMangleAndIntern, LLVMOrcLLJITRef,
 };
 use llvm_sys::orc2::{
+    LLVMJITEvaluatedSymbol, LLVMJITSymbolFlags, LLVMOrcAbsoluteSymbols,
     LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess,
     LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcCreateNewThreadSafeModule,
-    LLVMOrcDefinitionGeneratorRef, LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutionSessionRef,
-    LLVMOrcExecutorAddress, LLVMOrcJITDylibAddGenerator, LLVMOrcObjectLayerRef,
+    LLVMOrcCSymbolMapPair, LLVMOrcDefinitionGeneratorRef, LLVMOrcDisposeMaterializationUnit,
+    LLVMOrcDisposeThreadSafeContext, LLVMOrcExecutionSessionRef, LLVMOrcExecutorAddress,
+    LLVMOrcJITDylibAddGenerator, LLVMOrcJITDylibDefine, LLVMOrcObjectLayerRef,
 };
 use newbf_ir::Module as IrModule;
 
@@ -163,20 +166,113 @@ impl OrcJit {
             }
         }
 
+        // Take ownership of the LLJIT now so `add_absolute_symbol` can run and
+        // so any early return below disposes the JIT via `Drop`. (The donated
+        // module/context raw pointers are not yet wrapped into a ThreadSafeModule
+        // here; on the registration error path they leak — an error-only path.)
+        let jit_obj = OrcJit { jit };
+
+        // A0 (memory-safety.md §5): register the host-EXE Rust runtime helpers
+        // as ORC absolute symbols **before** the IR module is added, so the
+        // renamed alloc path (MS-T2) and the comptime/driver hosts all resolve
+        // `newbf_alloc`/`newbf_free`/`newbf_install_crash_handler` through this
+        // one seam. These are NOT PE exports, so the process generator above
+        // cannot find them; absolute definitions in the JITDylib win over the
+        // (on-demand) generator, so there is no duplicate-definition error.
+        // Additive for MS-T0: existing IR still calls malloc/free, so these
+        // symbols are defined-but-unused until the rename.
+        // Cast through `*const ()` (a fn item -> integer cast directly is a
+        // lint; the pointer hop is the canonical fix).
+        jit_obj.add_absolute_symbol(
+            "newbf_alloc",
+            newbf_runtime::newbf_alloc as *const () as usize,
+        )?;
+        jit_obj.add_absolute_symbol(
+            "newbf_free",
+            newbf_runtime::newbf_free as *const () as usize,
+        )?;
+        jit_obj.add_absolute_symbol(
+            "newbf_install_crash_handler",
+            newbf_runtime::newbf_install_crash_handler as *const () as usize,
+        )?;
+
         // Wrap the donated context + module and hand the module to the JIT.
         let tsc = unsafe { LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx_raw) };
         let tsm = unsafe { LLVMOrcCreateNewThreadSafeModule(mod_raw, tsc) };
         // The ThreadSafeModule keeps its own reference to the context's data.
         unsafe { LLVMOrcDisposeThreadSafeContext(tsc) };
 
-        let err = unsafe { LLVMOrcLLJITAddLLVMIRModule(jit, jd, tsm) };
+        let err = unsafe { LLVMOrcLLJITAddLLVMIRModule(jit_obj.jit, jd, tsm) };
         if !err.is_null() {
             let msg = take_error(err);
-            unsafe { LLVMOrcDisposeLLJIT(jit) };
+            // `jit_obj`'s Drop disposes the LLJIT.
             return Err(format!("adding module failed: {msg}"));
         }
 
-        Ok(OrcJit { jit })
+        Ok(jit_obj)
+    }
+
+    /// Define `name` in the main JITDylib as an **ORC absolute symbol** bound
+    /// to host address `addr`. This is how JIT'd code calls a Rust `fn` living
+    /// in the host EXE (e.g. `newbf_alloc`) — those are *not* PE exports, so the
+    /// process-search generator (which resolves CRT/Win32 via `GetProcAddress`)
+    /// cannot find them. Absolute symbols define the name directly, so it
+    /// resolves regardless of which host links it (memory-safety.md §A0).
+    ///
+    /// The name is mangled+interned with the JIT's own mangler
+    /// (`LLVMOrcLLJITMangleAndIntern`) so it matches exactly the name JIT'd IR
+    /// looks up — sidestepping the platform global-prefix question by
+    /// construction. Since the symbol is *defined* in the JITDylib, it wins over
+    /// the on-demand process generator (which is only consulted for names not
+    /// already present), so there is no duplicate-definition error.
+    ///
+    /// Register **before** adding the IR module (and re-registering the same
+    /// name later would fail with a duplicate-definition error). Idempotency is
+    /// the caller's responsibility — call once per name per JIT instance.
+    pub fn add_absolute_symbol(&self, name: &str, addr: usize) -> Result<(), String> {
+        let cname = CString::new(name).map_err(|_| format!("symbol name has NUL: {name:?}"))?;
+
+        // Mangle+intern under the JIT's own scheme. This returns a *retained*
+        // pool entry; `LLVMOrcAbsoluteSymbols` takes ownership of that ref (it
+        // is consumed into the MaterializationUnit), so we must not release it
+        // ourselves on the success path.
+        let interned = unsafe { LLVMOrcLLJITMangleAndIntern(self.jit, cname.as_ptr()) };
+        if interned.is_null() {
+            return Err(format!("interning symbol failed: {name}"));
+        }
+
+        // One (name -> evaluated address) pair. `Exported | Callable` so the
+        // symbol is visible to lookups and treated as a code address.
+        let mut pairs = [LLVMOrcCSymbolMapPair {
+            Name: interned,
+            Sym: LLVMJITEvaluatedSymbol {
+                Address: addr as LLVMOrcExecutorAddress,
+                Flags: LLVMJITSymbolFlags {
+                    GenericFlags: 0b101, // Exported (1) | Callable (4)
+                    TargetFlags: 0,
+                },
+            },
+        }];
+
+        // AbsoluteSymbols consumes the interned name ref(s) and yields an MU.
+        let mu = unsafe { LLVMOrcAbsoluteSymbols(pairs.as_mut_ptr(), pairs.len()) };
+        if mu.is_null() {
+            // The name ref was *not* consumed (no MU produced); but llvm-sys
+            // does not expose a release of the entry here without an MU, and a
+            // null MU from AbsoluteSymbols is a hard internal failure. Report.
+            return Err(format!("AbsoluteSymbols returned null for {name}"));
+        }
+
+        let jd = unsafe { LLVMOrcLLJITGetMainJITDylib(self.jit) };
+        // Define consumes the MU on success; on error the MU is NOT consumed,
+        // so dispose it before returning.
+        let err = unsafe { LLVMOrcJITDylibDefine(jd, mu) };
+        if !err.is_null() {
+            let msg = take_error(err);
+            unsafe { LLVMOrcDisposeMaterializationUnit(mu) };
+            return Err(format!("defining {name} failed: {msg}"));
+        }
+        Ok(())
     }
 
     /// Look up a JIT'd symbol's address (0 / `None` if unresolved). ORC
@@ -241,6 +337,98 @@ mod tests {
         let add: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(addr) };
         assert_eq!(add(3, 4), 7);
         assert_eq!(add(-10, 32), 22);
+    }
+
+    /// MS-T0 — the load-bearing seam proof. JIT'd code calls
+    /// `newbf_alloc(16, -1, 0)` (a Rust `fn` in `newbf-runtime`, a host-EXE
+    /// symbol that is NOT a PE export), writes+reads the buffer to prove it is
+    /// real memory, then calls `newbf_free(p)`. `OrcJit::from_ir` registers
+    /// these as ORC absolute symbols, so they resolve through that seam rather
+    /// than the process-search generator (which could never find them). Running
+    /// fault-free + returning the non-null check (1) proves the seam works.
+    #[test]
+    fn jit_resolves_host_runtime_alloc_thunks() {
+        use newbf_ir::{CastKind, CmpPred, Value};
+
+        // i32 alloc_roundtrip():
+        //   p = newbf_alloc(16, -1, 0);
+        //   *(i64*)p = 0xCAFEBABE;          // prove p is writable real memory
+        //   ok = (*(i64*)p == 0xCAFEBABE) && (p != null);
+        //   newbf_free(p);
+        //   return (i32)ok;                 // 1 on success
+        let mut m = IrModule::new("jit_alloc_seam");
+        m.declare_extern(
+            "newbf_alloc",
+            vec![
+                Param { name: None, ty: IrType::I64 },
+                Param { name: None, ty: IrType::I32 },
+                Param { name: None, ty: IrType::I32 },
+            ],
+            IrType::Ptr,
+        );
+        m.declare_extern(
+            "newbf_free",
+            vec![Param { name: None, ty: IrType::Ptr }],
+            IrType::Void,
+        );
+
+        let mut f = FunctionBuilder::new("alloc_roundtrip", vec![], IrType::I32);
+        let p = f.call(
+            "newbf_alloc",
+            vec![
+                Value::int(16, IrType::I64),
+                Value::int(-1, IrType::I32),
+                Value::int(0, IrType::I32),
+            ],
+            IrType::Ptr,
+        );
+        let sentinel = Value::int(0xCAFE_BABE, IrType::I64);
+        f.store(p.clone(), sentinel.clone());
+        let readback = f.load(p.clone(), IrType::I64);
+        let val_ok = f.cmp(CmpPred::Eq, readback, sentinel);
+        let non_null = f.cmp(CmpPred::Ne, p.clone(), Value::Const(newbf_ir::Const::Null));
+        let ok = f.bin(BinOp::And, val_ok, non_null, IrType::Bool);
+        // Free *before* widening so the buffer is released while still valid.
+        f.call("newbf_free", vec![p], IrType::Void);
+        let ret = f.cast(CastKind::ZExt, ok, IrType::I32);
+        f.ret(Some(ret));
+        m.add_function(f.finish());
+
+        let jit = OrcJit::from_ir(&m).expect("jit builds (seam registers absolute symbols)");
+        let addr = jit
+            .lookup("alloc_roundtrip")
+            .expect("alloc_roundtrip resolves");
+        let run: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        // Runs fault-free (the host Rust thunks resolved) and the allocation
+        // round-tripped a value through real heap memory.
+        assert_eq!(run(), 1, "alloc/free round-trip via the absolute-symbol seam");
+    }
+
+    /// `add_absolute_symbol` resolves an arbitrary host address by name — the
+    /// generic mechanism CB-T2 reuses for `__newbf_ct_emit`. JIT a function
+    /// that calls a host `extern "C" fn() -> i32` bound under a custom name.
+    #[test]
+    fn add_absolute_symbol_binds_a_named_host_fn() {
+        use newbf_ir::Value;
+
+        extern "C" fn host_answer() -> i32 {
+            42
+        }
+
+        let mut m = IrModule::new("jit_named_host_fn");
+        m.declare_extern("ct_probe", vec![], IrType::I32);
+        let mut f = FunctionBuilder::new("call_probe", vec![], IrType::I32);
+        let r = f.call("ct_probe", vec![] as Vec<Value>, IrType::I32);
+        f.ret(Some(r));
+        m.add_function(f.finish());
+
+        let jit = OrcJit::from_ir(&m).expect("jit builds");
+        // Register the custom symbol BEFORE looking up the entry that calls it.
+        jit.add_absolute_symbol("ct_probe", host_answer as *const () as usize)
+            .expect("absolute symbol defines");
+        let addr = jit.lookup("call_probe").expect("call_probe resolves");
+        let run: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(run(), 42, "JIT'd code calls the named host fn");
     }
 
     /// The compiler autogenerates a real Win32 call. JIT a function that calls

@@ -10,6 +10,12 @@ description = "NewBF: LLVM lowering, JIT, and AOT object/executable emission."
 # for the Win64-SEH unwind-registration memory manager ported from NewM2.
 [dependencies]
 newbf-ir.workspace = true
+# newbf-runtime supplies the alloc-path C-ABI thunks (`newbf_alloc`/
+# `newbf_free`) + the crash-handler installer; the JIT takes their host-EXE
+# addresses and registers them as ORC absolute symbols in `from_ir` so JIT'd
+# Beef code can call them (memory-safety.md §A0). Clean new edge, no cycle:
+# newbf-runtime depends on nothing in the workspace.
+newbf-runtime.workspace = true
 inkwell.workspace  = true
 llvm-sys.workspace = true
 # `cc::windows_registry::find` locates MSVC `link.exe` (with %LIB% set) to

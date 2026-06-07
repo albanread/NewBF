@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "NewBF: manual-memory runtime, debug memory guard, reflection, FFI."
 
+# rlib  — so `newbf-llvm` can depend on this crate and take the runtime
+#         ADDRESSES of `newbf_alloc`/`newbf_free`/`newbf_install_crash_handler`
+#         to register them as ORC absolute symbols (memory-safety.md §A0).
+# staticlib — for the AOT executable link in MS-T3 (`/ENTRY:newbf_entry`).
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [lints]
 workspace = true
