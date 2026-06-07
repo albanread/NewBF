@@ -4654,8 +4654,14 @@ fn body_has_free_name(body: &MethodBody, params: &[MixinParam], body_src: &str) 
     found
 }
 
-/// Collect the names a block body binds (its `Stmt::Local` declarations), so the
-/// free-name check doesn't flag a body-local as free.
+/// Collect the names a block body binds (its `Stmt::Local` declarations **and**
+/// its case-test payload bindings), so the free-name check doesn't flag a
+/// body-bound name as free. MX-T6: a `case`-test in a condition — `if (res case
+/// .Err(let e))` — binds `e` into the live scope when the splice lowers the
+/// condition (`case_test` calls `self.bind`), so the body's `return .Err(e)` DOES
+/// resolve. The gate must treat `e` as bound (not a free name) or it would
+/// wrongly DECLINE the v1 `Try!` shape. We collect those `let`/`var` payload
+/// names from every condition's case-test pattern alongside the ordinary locals.
 fn collect_body_local_names(stmt: &Stmt, src: &str, out: &mut HashSet<String>) {
     match stmt {
         Stmt::Local { name, .. } => {
@@ -4671,17 +4677,54 @@ fn collect_body_local_names(stmt: &Stmt, src: &str, out: &mut HashSet<String>) {
                 collect_body_local_names(s, src, out);
             }
         }
-        Stmt::If { then, els, .. } => {
+        Stmt::Expr { expr, .. } => collect_case_bind_names(expr, src, out),
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            collect_case_bind_names(cond, src, out);
             collect_body_local_names(then, src, out);
             if let Some(e) = els {
                 collect_body_local_names(e, src, out);
             }
         }
-        Stmt::While { body, .. }
-        | Stmt::DoWhile { body, .. }
-        | Stmt::For { body, .. }
-        | Stmt::ForEach { body, .. }
-        | Stmt::Defer { body, .. } => collect_body_local_names(body, src, out),
+        Stmt::While { cond, body, .. } | Stmt::DoWhile { cond, body, .. } => {
+            collect_case_bind_names(cond, src, out);
+            collect_body_local_names(body, src, out);
+        }
+        Stmt::For { body, .. } | Stmt::ForEach { body, .. } | Stmt::Defer { body, .. } => {
+            collect_body_local_names(body, src, out)
+        }
+        _ => {}
+    }
+}
+
+/// MX-T6: collect every `case`-test payload binding name in an expression tree — a
+/// `Binary { op: Case, rhs }` whose pattern (`enum_pattern`) carries `let`/`var`
+/// payload `Ident`s (`x case .Err(let e)` → `e`). The case-test machinery
+/// (`case_test`) binds these into the live scope at lower time, so the mixin
+/// free-name gate must not treat them as free. Walks the boolean structure a
+/// condition can take (`&&`/`||`/`!`/parens/`not case`), since a case-test can
+/// appear under those without changing that `e` is bound for the guarded branch.
+fn collect_case_bind_names(e: &Expr, src: &str, out: &mut HashSet<String>) {
+    match e {
+        Expr::Binary {
+            op: AstBin::Case,
+            rhs,
+            ..
+        } => {
+            if let Some((_, binds)) = enum_pattern(rhs, src) {
+                for b in binds {
+                    out.insert(b.text(src).to_string());
+                }
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_case_bind_names(lhs, src, out);
+            collect_case_bind_names(rhs, src, out);
+        }
+        Expr::Unary { operand, .. } | Expr::Paren { inner: operand, .. } => {
+            collect_case_bind_names(operand, src, out)
+        }
         _ => {}
     }
 }
