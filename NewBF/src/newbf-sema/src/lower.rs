@@ -425,10 +425,8 @@ impl StructTable {
     /// first-registered ctor (`>` is strict). `None` if no ctor survives — the
     /// caller then diagnoses/recovers rather than constructing against a wrong
     /// param type. (Ctors are not variadic, so arity is an exact match.)
-    // Used only under the `has_pending` fork wired in TA-5/TA-6; until then
-    // exercised only by the TA-2 unit tests, so `allow(dead_code)` keeps the
-    // build warning-clean.
-    #[allow(dead_code)]
+    // Used under the `has_pending` fork wired in TA-5 (`lower_new`) and TA-6
+    // (`construct_value_struct`).
     fn ctor_for_partial(&self, id: StructId, arg_shapes: &[ArgShape]) -> Option<MethodSig> {
         let mut best: Option<(&MethodSig, u32)> = None;
         'ctor: for c in &self.ctors[id.0 as usize] {
@@ -6963,10 +6961,30 @@ impl<'a> Lowerer<'a> {
                     self.fb.call(ctor.full_name, vec![p.clone()], IrType::Void);
                 }
             }
-            // Run the constructor overload matching the argument count; coercion
-            // makes each arg its declared param type.
+            // Run the constructor matching the args; coercion makes each arg its
+            // declared param type. TA-5 fork (§3.7, mirrors the TA-3
+            // `lower_method_call` fork): the hot path is "no pending args" — a
+            // single O(args) syntactic scan gates the two-phase machinery. With no
+            // target-typed dot-form arg the EXISTING arity-only `ctor_for` + eager
+            // loop runs verbatim (byte-identical to pre-TA-5). When any arg is a
+            // pending dot-form, resolve the ctor with the shape gate
+            // (`ctor_for_partial`) and emit the final args via `finish_args` against
+            // the resolved ctor's params past the leading `this` — pending slots
+            // lowered NOW against their formal param type. Exactly one Phase-1 +
+            // one `finish_args`, all in the current block (the values dominate the
+            // single terminal ctor `call`), so each pending arg is constructed once.
             let args = ctor_args(operand);
-            if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
+            if args.iter().any(|a| arg_is_pending(a, src)) {
+                let (partial, shapes) = self.lower_args_phase1(args, src);
+                if let Some(ctor) = self.structs.ctor_for_partial(id, &shapes) {
+                    // Formal params exclude the leading `this` (the ctor's own
+                    // receiver, prepended below). Ctors are not variadic.
+                    let formal: Vec<IrType> = ctor.params[1..].to_vec();
+                    let mut call_args = vec![p.clone()];
+                    call_args.extend(self.finish_args(&formal, None, partial, args, src));
+                    self.fb.call(ctor.full_name, call_args, IrType::Void);
+                }
+            } else if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
                 let mut call_args = vec![p.clone()];
                 for (i, a) in args.iter().enumerate() {
                     let (v, t) = self.expr(a, src);
@@ -7237,7 +7255,33 @@ impl<'a> Lowerer<'a> {
         let ty = IrType::Struct(id);
         let slot = self.fb.alloca(ty);
         self.emit_field_inits(slot.clone(), id);
-        if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
+        // TA-6 fork (§3.7, mirrors TA-5/TA-3): the hot path is "no pending args" —
+        // a single O(args) syntactic scan gates the two-phase machinery. With no
+        // pending dot-form arg the EXISTING arity-only `ctor_for` + eager loop runs
+        // verbatim (byte-identical to pre-TA-6). When any arg is a pending dot-form,
+        // resolve the ctor with the shape gate (`ctor_for_partial`) and emit the
+        // final args via `finish_args` against the ctor's params past the leading
+        // `this`; pending slots are lowered NOW against their formal param type.
+        //
+        // **Nesting** (`.( .(…), .(…) )`): an inner `.(…)` arg is itself pending, so
+        // `finish_args` back-fills it via `lower_arg_targeted(inner_param_ty, …)` →
+        // `try_target_typed_ctor` → `construct_value_struct` (REENTRANT). The inner
+        // call runs its OWN Phase-1/`finish_args` against the inner ctor's params on
+        // its OWN fresh stack-local `partial`/`shapes`/`slot` — no shared-state
+        // clobber (these vectors and the alloca are function-local; only `self.fb`,
+        // the intended emission target, is shared). All emission stays in the
+        // current block, so every value dominates the single terminal ctor `call`.
+        if args.iter().any(|a| arg_is_pending(a, src)) {
+            let (partial, shapes) = self.lower_args_phase1(args, src);
+            if let Some(ctor) = self.structs.ctor_for_partial(id, &shapes) {
+                // Formal params exclude the leading `this` (the slot, prepended
+                // below). Ctors are not variadic.
+                let formal: Vec<IrType> = ctor.params[1..].to_vec();
+                let mut call_args = vec![slot.clone()];
+                call_args.extend(self.finish_args(&formal, None, partial, args, src));
+                self.fb.call(ctor.full_name, call_args, IrType::Void);
+            }
+        } else if let Some(ctor) = self.structs.ctor_for(id, args.len()) {
             let mut call_args = vec![slot.clone()];
             for (i, a) in args.iter().enumerate() {
                 let (v, t) = self.expr(a, src);
