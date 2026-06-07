@@ -165,6 +165,15 @@ struct StructTable {
     /// mutability, and read back when the lambda body is emitted. Empty (or
     /// absent) ⇒ a non-capturing lambda (a bare function pointer).
     lambda_captures: RefCell<HashMap<String, Vec<(String, IrType)>>>,
+    /// FV-T6b: resolved inner signature `(ret, ptys)` for each INLINE-arg lambda
+    /// symbol (`$lambdaN`). An inline lambda (`xs.Map<int32>(x => x*10)`) has no
+    /// declared `function`-typed local to supply its param types; they come from
+    /// the callee parameter resolved at the call site. Filled via interior
+    /// mutability when the call is lowered (the param sig is known then), and read
+    /// back in `lower_program`'s emit pass to bind the lambda body's params at the
+    /// right IR types. Absent ⇒ the lambda was never reached as a typed call arg
+    /// (it emits with no params — a degenerate but well-typed body).
+    inline_lambda_sigs: RefCell<HashMap<String, (IrType, Vec<IrType>)>>,
     /// Anonymous tuple types → the synthetic value-struct id backing each
     /// distinct shape, keyed by element `type_codes` (so `(int32, int32)`
     /// everywhere is one struct, fields named "0", "1", …). A pre-pass over
@@ -1201,6 +1210,9 @@ fn collect_iface_own_type(
                     params: ps,
                     is_instance: true,
                     variadic,
+                    // Interface slot methods are non-generic and dispatched via
+                    // the vtable, not target-typed for inline-lambda args.
+                    param_fn_sigs: Vec::new(),
                 };
                 slots.push((nm, sig, default_sym));
             }
@@ -1586,6 +1598,19 @@ fn record_method_inst(
         .filter(|p| matches!(p.modifier, Some((ParamModifier::Params, _))))
         .and_then(|p| pointer_elem_env(&p.ty, mdecl_src, t, &env));
     let ret = lower_value_ty(return_ty, mdecl_src, t, &env);
+    // FV-T6b: parallel inner `(ret, ptys)` for each explicit `function R(P)`
+    // param of the generic method (e.g. `Map<R>`'s `function R(T) f`), so an
+    // inline-lambda arg at `xs.Map<int32>(x => …)` is target-typed from the
+    // resolved monomorph sig. Indexed by explicit param (no leading `this`).
+    let fn_param_sigs: Vec<Option<(IrType, Vec<IrType>)>> = params
+        .iter()
+        .map(|p| param_fn_sig(p, mdecl_src, t, &env))
+        .collect();
+    let fn_param_sigs = if fn_param_sigs.iter().any(|s| s.is_some()) {
+        fn_param_sigs
+    } else {
+        Vec::new()
+    };
     t.gen_method_sigs.insert(
         key,
         MethodSig {
@@ -1594,6 +1619,7 @@ fn record_method_inst(
             params: psig,
             is_instance,
             variadic,
+            param_fn_sigs: fn_param_sigs,
         },
     );
     t.gen_method_monos.push(GenMethodMono {
@@ -2764,6 +2790,7 @@ fn fill_members_at(
                         params: ps,
                         is_instance: true,
                         variadic: None,
+                        param_fn_sigs: Vec::new(),
                     });
                 }
             }
@@ -2791,6 +2818,17 @@ fn fill_members_at(
                     .iter()
                     .map(|p| param_ir_ty(p, src, t, env))
                     .collect();
+                // FV-T6b: parallel inner `(ret, ptys)` for any `function R(P)`
+                // param, so an inline-lambda arg at this method can be
+                // target-typed from the resolved sig (kept only if some param is
+                // a function type — otherwise an empty vec, no cost).
+                let fn_param_sigs: Vec<Option<(IrType, Vec<IrType>)>> =
+                    params.iter().map(|p| param_fn_sig(p, src, t, env)).collect();
+                let fn_param_sigs = if fn_param_sigs.iter().any(|s| s.is_some()) {
+                    fn_param_sigs
+                } else {
+                    Vec::new()
+                };
                 // An `abstract` instance method is body-less but reserves a
                 // vtable slot a derived `override` fills; it mangles like a real
                 // method (below) so the base vtable entry references a symbol
@@ -2844,6 +2882,7 @@ fn fill_members_at(
                     params: ps,
                     is_instance,
                     variadic,
+                    param_fn_sigs: fn_param_sigs,
                 };
                 // A `virtual`/`override`/`abstract` instance method occupies a
                 // vtable slot; record it (in declaration order) for layout. A
@@ -2912,6 +2951,7 @@ fn fill_members_at(
                             params: ps,
                             is_instance,
                             variadic: None,
+                            param_fn_sigs: Vec::new(),
                         };
                         let bucket = t.methods[id.0 as usize]
                             .entry(format!("get_{nm}"))
@@ -2936,6 +2976,7 @@ fn fill_members_at(
                             params: ps,
                             is_instance,
                             variadic: None,
+                            param_fn_sigs: Vec::new(),
                         };
                         let bucket = t.methods[id.0 as usize]
                             .entry(format!("set_{nm}"))
@@ -2984,6 +3025,15 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
 /// type) pairs, body, source)`.
 type LambdaEmit<'a> = (String, IrType, Vec<(String, IrType)>, &'a Stmt, &'a str);
 
+/// FV-T6a: an INLINE-arg lambda queued for emission. Unlike [`LambdaEmit`] the
+/// param TYPES (and the return type) are unknown at collection — they come from
+/// the callee param resolved at the call site (recorded in
+/// `StructTable::inline_lambda_sigs`). So this carries only the `$lambdaN`
+/// symbol, the lambda's param NAME spans, its body, and the source: the emit
+/// pass zips the param names with the recorded `(ret, ptys)` to build the final
+/// `(name, ty)` pairs. `(symbol, param name spans, body, source)`.
+type InlineLambdaEmit<'a> = (String, &'a [Span], &'a Stmt, &'a str);
+
 /// Collect anonymous lambdas to emit as free functions. Minimal slice:
 /// paramless lambdas assigned to a `function R()` local (`function R() f =
 /// () => …;`) — the target type gives the signature (no inference/capture).
@@ -2993,12 +3043,13 @@ fn collect_lambdas<'a>(
     src: &'a str,
     structs: &mut StructTable,
     emits: &mut Vec<LambdaEmit<'a>>,
+    inline: &mut Vec<InlineLambdaEmit<'a>>,
 ) {
     for item in items {
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => collect_lambdas(body, src, structs, emits),
+            } => collect_lambdas(body, src, structs, emits, inline),
             Item::Type(td) => {
                 for m in &td.members {
                     let body = match m {
@@ -3017,7 +3068,7 @@ fn collect_lambdas<'a>(
                         _ => None,
                     };
                     if let Some(s) = body {
-                        collect_lambdas_stmt(s, src, structs, emits);
+                        collect_lambdas_stmt(s, src, structs, emits, inline);
                     }
                 }
             }
@@ -3031,11 +3082,12 @@ fn collect_lambdas_stmt<'a>(
     src: &'a str,
     structs: &mut StructTable,
     emits: &mut Vec<LambdaEmit<'a>>,
+    inline: &mut Vec<InlineLambdaEmit<'a>>,
 ) {
     match stmt {
         Stmt::Block { stmts, .. } => {
             for s in stmts {
-                collect_lambdas_stmt(s, src, structs, emits);
+                collect_lambdas_stmt(s, src, structs, emits, inline);
             }
         }
         Stmt::Local {
@@ -3069,23 +3121,207 @@ fn collect_lambdas_stmt<'a>(
                 .collect();
             structs.lambda_names.insert(*span, name.clone());
             emits.push((name, ret, param_pairs, &**body, src));
+            // The local-init lambda's BODY may itself contain inline-arg lambdas
+            // (`function … f = x => xs.Map(y => y + x)`); walk it too.
+            collect_lambdas_in_body(body, src, structs, inline);
         }
         Stmt::If { then, els, .. } => {
-            collect_lambdas_stmt(then, src, structs, emits);
+            collect_lambdas_stmt(then, src, structs, emits, inline);
             if let Some(e) = els {
-                collect_lambdas_stmt(e, src, structs, emits);
+                collect_lambdas_stmt(e, src, structs, emits, inline);
             }
         }
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::For { body, .. }
         | Stmt::ForEach { body, .. }
-        | Stmt::Defer { body, .. } => collect_lambdas_stmt(body, src, structs, emits),
+        | Stmt::Defer { body, .. } => collect_lambdas_stmt(body, src, structs, emits, inline),
         Stmt::Locals { decls, .. } => {
             for d in decls {
-                collect_lambdas_stmt(d, src, structs, emits);
+                collect_lambdas_stmt(d, src, structs, emits, inline);
             }
         }
+        _ => {}
+    }
+    // FV-T6a: after the statement's own (local-init) lambda handling and nested
+    // recursion, walk every expression the statement carries for INLINE lambdas
+    // in call-arg (or any nested) position. The local-init arm above already
+    // inserted its lambda's symbol into `lambda_names`, so the walker's
+    // already-collected guard skips it (no double collection).
+    for_each_stmt_expr(stmt, &mut |e| collect_lambdas_expr(e, src, structs, inline));
+}
+
+/// Walk a lambda BODY (`=> e` expression-body or `=> { … }` block-body) for
+/// nested INLINE lambdas (a curried `x => ys.Map(y => x + y)` or a block body
+/// whose statements call a HOF with an inline lambda). An expression body is
+/// handed straight to [`collect_lambdas_expr`]; a block (or any other) body is
+/// driven through [`for_each_stmt_expr`], reaching every expression position.
+fn collect_lambdas_in_body<'a>(
+    body: &'a Stmt,
+    src: &'a str,
+    structs: &mut StructTable,
+    inline: &mut Vec<InlineLambdaEmit<'a>>,
+) {
+    match body {
+        Stmt::Expr { expr, .. } => collect_lambdas_expr(expr, src, structs, inline),
+        other => for_each_stmt_expr(other, &mut |e| collect_lambdas_expr(e, src, structs, inline)),
+    }
+}
+
+/// Invoke `f` on each *direct* top-level expression a statement carries (its
+/// init/cond/value/call exprs), and recurse into nested statements so the whole
+/// method body is covered. This is the driver behind FV-T6a's inline-lambda
+/// collection: it reaches every expression position where a lambda could appear
+/// as a (possibly nested) call argument. Statements that only contain other
+/// statements (blocks, loops, if) recurse; statements with expressions feed
+/// them to `f` (which then walks each expression tree).
+fn for_each_stmt_expr<'a>(stmt: &'a Stmt, f: &mut dyn FnMut(&'a Expr)) {
+    match stmt {
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                for_each_stmt_expr(s, f);
+            }
+        }
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                for_each_stmt_expr(d, f);
+            }
+        }
+        Stmt::Local { init: Some(e), .. } => f(e),
+        Stmt::Expr { expr, .. } => f(expr),
+        Stmt::Return { value: Some(e), .. } => f(e),
+        Stmt::If {
+            cond, then, els, ..
+        } => {
+            f(cond);
+            for_each_stmt_expr(then, f);
+            if let Some(e) = els {
+                for_each_stmt_expr(e, f);
+            }
+        }
+        Stmt::While { cond, body, .. } | Stmt::DoWhile { cond, body, .. } => {
+            f(cond);
+            for_each_stmt_expr(body, f);
+        }
+        Stmt::For {
+            init,
+            init_extra,
+            cond,
+            update,
+            update_extra,
+            body,
+            ..
+        } => {
+            if let Some(i) = init {
+                for_each_stmt_expr(i, f);
+            }
+            for s in init_extra {
+                for_each_stmt_expr(s, f);
+            }
+            if let Some(c) = cond {
+                f(c);
+            }
+            if let Some(u) = update {
+                f(u);
+            }
+            for u in update_extra {
+                f(u);
+            }
+            for_each_stmt_expr(body, f);
+        }
+        Stmt::ForEach { iter, body, .. } => {
+            f(iter);
+            for_each_stmt_expr(body, f);
+        }
+        Stmt::Defer { body, .. } => for_each_stmt_expr(body, f),
+        _ => {}
+    }
+}
+
+/// FV-T6a: walk an expression tree and assign a `$lambdaN` symbol to every
+/// INLINE `Expr::Lambda` found in a (possibly nested) call-argument or any other
+/// sub-expression position — recording it for emission with its param types
+/// filled in later (T6b, from the resolved callee sig). An `Expr::Lambda` that
+/// ALREADY has a symbol (the local-init shape handled by the `Stmt::Local` arm)
+/// is skipped via the `lambda_names` guard, so there is no double collection.
+/// The walk descends into both `Expr::Call` and `Expr::Generic` argument lists
+/// (and through every other expression form), so a lambda arg anywhere — to a
+/// bare/qualified/instance generic method (`xs.Map<int32>(x => …)`) or a plain
+/// method — is found.
+fn collect_lambdas_expr<'a>(
+    e: &'a Expr,
+    src: &'a str,
+    structs: &mut StructTable,
+    inline: &mut Vec<InlineLambdaEmit<'a>>,
+) {
+    match e {
+        Expr::Lambda {
+            span, params, body, ..
+        } => {
+            // Skip a lambda already collected by the local-init pre-pass (its
+            // span is in `lambda_names`); only an as-yet-unknown inline lambda
+            // gets a fresh symbol here.
+            if !structs.lambda_names.contains_key(span) {
+                let name = format!("$lambda{}", structs.lambda_names.len());
+                structs.lambda_names.insert(*span, name.clone());
+                inline.push((name, params.as_slice(), &**body, src));
+            }
+            // A lambda body may nest further inline lambdas (e.g. a curried
+            // `x => ys.Map(y => x + y)`); walk it.
+            collect_lambdas_in_body(body, src, structs, inline);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_lambdas_expr(callee, src, structs, inline);
+            for a in args {
+                collect_lambdas_expr(a, src, structs, inline);
+            }
+        }
+        // `Generic.args` are TYPES, never expressions — only the base can carry a
+        // lambda (it won't, but stay uniform). The lambda lives in the enclosing
+        // `Call`'s arg list, walked above.
+        Expr::Generic { base, .. } => {
+            collect_lambdas_expr(base, src, structs, inline);
+        }
+        Expr::Paren { inner, .. } => collect_lambdas_expr(inner, src, structs, inline),
+        Expr::Member { base, .. } => collect_lambdas_expr(base, src, structs, inline),
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => collect_lambdas_expr(operand, src, structs, inline),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_lambdas_expr(lhs, src, structs, inline);
+            collect_lambdas_expr(rhs, src, structs, inline);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_lambdas_expr(target, src, structs, inline);
+            collect_lambdas_expr(value, src, structs, inline);
+        }
+        Expr::Ternary {
+            cond, then, els, ..
+        } => {
+            collect_lambdas_expr(cond, src, structs, inline);
+            collect_lambdas_expr(then, src, structs, inline);
+            collect_lambdas_expr(els, src, structs, inline);
+        }
+        Expr::Index { base, args, .. } => {
+            collect_lambdas_expr(base, src, structs, inline);
+            for a in args {
+                collect_lambdas_expr(a, src, structs, inline);
+            }
+        }
+        Expr::Initializer { base, entries, .. } => {
+            collect_lambdas_expr(base, src, structs, inline);
+            for ent in entries {
+                collect_lambdas_expr(ent, src, structs, inline);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                collect_lambdas_expr(el, src, structs, inline);
+            }
+        }
+        Expr::Named { value, .. } => collect_lambdas_expr(value, src, structs, inline),
         _ => {}
     }
 }
@@ -3214,8 +3450,19 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         collect_local_fns(&f.unit.items, f.src, &mut structs, &mut local_fn_emits);
     }
     let mut lambda_emits: Vec<LambdaEmit> = Vec::new();
+    // FV-T6a: inline-arg lambdas collected separately — their param TYPES are
+    // unknown here (they come from the resolved callee sig during lowering), so
+    // each carries only its symbol + param-name spans + body; the emit pass
+    // below fills in the types from `structs.inline_lambda_sigs`.
+    let mut inline_lambda_emits: Vec<InlineLambdaEmit> = Vec::new();
     for f in &all {
-        collect_lambdas(&f.unit.items, f.src, &mut structs, &mut lambda_emits);
+        collect_lambdas(
+            &f.unit.items,
+            f.src,
+            &mut structs,
+            &mut lambda_emits,
+            &mut inline_lambda_emits,
+        );
     }
     m.structs = structs.defs.clone();
     // Emit a vtable global for each class that has virtual methods.
@@ -3256,6 +3503,38 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         // call passes a `null` target). This is the one callee ABI behind the
         // single uniform calling convention (`code(target, args…)`).
         if let Some(func) = emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs) {
+            m.add_function(func);
+        }
+    }
+    // FV-T6b: emit each INLINE-arg lambda. Its `(ret, ptys)` were recorded by the
+    // call site into `inline_lambda_sigs` when the callee param was resolved; zip
+    // those param types with the lambda's param NAME spans to build the `(name,
+    // ty)` pairs, then emit through the SAME `emit_closure` path as a declared
+    // lambda (so captures and the `$self`-leading ABI are identical). An inline
+    // lambda that was never reached as a typed call arg has no recorded sig — it
+    // emits paramless (a degenerate but well-typed body; it is never called).
+    let inline_sigs = structs.inline_lambda_sigs.borrow().clone();
+    for (name, pspans, body, lsrc) in &inline_lambda_emits {
+        let mb = match *body {
+            Stmt::Expr { expr, .. } => MethodBody::Expr(expr.clone()),
+            other => MethodBody::Block(other.clone()),
+        };
+        let (ret, ptys) = inline_sigs.get(name).cloned().unwrap_or((IrType::Void, vec![]));
+        // Pair each lambda param name with the resolved callee param type. If the
+        // arity disagrees (a malformed call), zip stops at the shorter — the call
+        // site won't have produced a usable value either way.
+        let param_pairs: Vec<(String, IrType)> = pspans
+            .iter()
+            .zip(ptys.iter())
+            .map(|(nspan, t)| (nspan.text(lsrc).to_string(), *t))
+            .collect();
+        let caps = structs
+            .lambda_captures
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(func) = emit_closure(name, ret, &param_pairs, &caps, &mb, lsrc, &structs) {
             m.add_function(func);
         }
     }
@@ -3450,6 +3729,15 @@ struct MethodSig {
     /// `Some(element type)` if the last explicit parameter is `params T[]`: the
     /// call site packs the trailing arguments into a fresh `T[]` for it.
     variadic: Option<IrType>,
+    /// FV-T6b: per-EXPLICIT-parameter inner function signature `(ret, ptys)` for
+    /// a `function R(P)` param, `None` otherwise. Indexed by *explicit* parameter
+    /// position (parallel to the explicit args at a call site — the leading
+    /// `this` of an instance method is NOT included). Lets the call site
+    /// target-type an inline-lambda argument's params from the resolved callee
+    /// signature (`xs.Map<int32>(x => x*10)`), since `params[i]` only records the
+    /// erased `$Func` value-struct. Empty when no explicit param is a function
+    /// type (the common case), so non-HOF signatures pay nothing.
+    param_fn_sigs: Vec<Option<(IrType, Vec<IrType>)>>,
 }
 
 /// Whether `e` is a *target-typed pending* expression: a leading-dot dot-form
@@ -7482,6 +7770,44 @@ impl<'a> Lowerer<'a> {
         self.expr(a, src)
     }
 
+    /// FV-T6b: record the resolved callee function-parameter signatures for any
+    /// INLINE-lambda arguments of a call, so the emit pass can bind each lambda
+    /// body's params at the right IR types. `param_fn_sigs` is the resolved
+    /// callee's per-EXPLICIT-param inner `(ret, ptys)` (`None` for a non-function
+    /// param), parallel to `args` (no leading `this`). For each arg that is an
+    /// `Expr::Lambda` collected with a `$lambdaN` symbol (T6a), key its recorded
+    /// signature into `inline_lambda_sigs`. A no-op when the callee has no
+    /// function params (`param_fn_sigs` empty) — the common hot path. Must be
+    /// called BEFORE lowering the args (so the symbol is bound before
+    /// `Expr::Lambda` lowers and `emit_closure` runs in the later emit pass);
+    /// calling it twice is idempotent (same key → same value).
+    fn record_inline_lambda_sigs(
+        &self,
+        param_fn_sigs: &[Option<(IrType, Vec<IrType>)>],
+        args: &[Expr],
+    ) {
+        if param_fn_sigs.is_empty() {
+            return;
+        }
+        for (i, a) in args.iter().enumerate() {
+            // Look through a parenthesized lambda (`(x => …)`), the only wrapper a
+            // lambda arg realistically carries.
+            let mut e = a;
+            while let Expr::Paren { inner, .. } = e {
+                e = inner;
+            }
+            if let Expr::Lambda { span, .. } = e
+                && let Some(sym) = self.structs.lambda_names.get(span)
+                && let Some(Some((ret, ptys))) = param_fn_sigs.get(i)
+            {
+                self.structs
+                    .inline_lambda_sigs
+                    .borrow_mut()
+                    .insert(sym.clone(), (*ret, ptys.clone()));
+            }
+        }
+    }
+
     /// Whether class `c` is `t` or a transitive subclass of it (walks `bases`).
     fn is_subtype_of(&self, c: StructId, t: StructId) -> bool {
         let mut cur = Some(c);
@@ -7802,6 +8128,13 @@ impl<'a> Lowerer<'a> {
             return None;
         }
 
+        // FV-T6b: before evaluating the args, record any INLINE-lambda arg's
+        // param types from this resolved generic-method sig (`param_fn_sigs` is
+        // by explicit param, parallel to `args` — the leading `this` is not in
+        // it). This is the headline path: `xs.Map<int32>(x => x*10)` — the `x`
+        // binds at the callee's `function R(T) f` param type.
+        self.record_inline_lambda_sigs(&sig.param_fn_sigs, args);
+
         // Build the call args: a leading `this` for an instance method, then the
         // explicit args coerced to the signature's formal params (variadic-aware).
         let mut call_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
@@ -7971,6 +8304,9 @@ impl<'a> Lowerer<'a> {
                     .and_then(|cands| pick_overload(cands, &arg_tys, false))
                     .cloned()
             {
+                // FV-T6b: record inline-lambda arg param types from this
+                // qualified-static HOF method's resolved sig.
+                self.record_inline_lambda_sigs(&sig.param_fn_sigs, args);
                 let call_args: Vec<Value> = if let Some(elem) = sig.variadic {
                     self.pack_variadic_args(&sig.params, elem, arg_vals.clone())
                 } else {
@@ -8013,6 +8349,11 @@ impl<'a> Lowerer<'a> {
                 .and_then(|cands| pick_overload(cands, &arg_tys, true))
                 .cloned()
         {
+            // FV-T6b: record any inline-lambda arg's param types from the
+            // resolved sig (a non-generic HOF instance method, e.g.
+            // `scaled.Filter(x => x > 15)`). The lambda's value was already
+            // lowered above; this only feeds the emit pass.
+            self.record_inline_lambda_sigs(&sig.param_fn_sigs, args);
             let mut call_args = Vec::new();
             if sig.is_instance {
                 call_args.push(body_ptr.clone());
@@ -8873,6 +9214,43 @@ fn param_ir_ty(p: &AstParam, src: &str, structs: &StructTable, env: TyEnv) -> Ir
     }
 }
 
+/// FV-T6b: the *inner* Beef function signature `(ret, ptys)` of a by-value
+/// `function R(P)` parameter, lowered to IR types under `env` — `None` for any
+/// other parameter (including a `ref`/`out` function pointer, a `delegate`, or a
+/// non-function param). This is the per-param companion to [`param_ir_ty`]: where
+/// `param_ir_ty` erases the signature down to a uniform `$Func` value-struct,
+/// this preserves the `(ret, ptys)` so the call site can target-type an INLINE
+/// lambda argument's params (`xs.Map<int32>(x => x*10)`) — the lambda's `x`
+/// binds at `ptys[0]` even though no declared `function`-typed local supplied it.
+/// Recorded parallel to `MethodSig.params` and read in `lower_program`'s emit
+/// pass. Nested function types inside `P`/`R` lower to `$Func` (one layer).
+fn param_fn_sig(
+    p: &AstParam,
+    src: &str,
+    structs: &StructTable,
+    env: TyEnv,
+) -> Option<(IrType, Vec<IrType>)> {
+    if is_by_ref(p) {
+        return None;
+    }
+    match &p.ty {
+        AstType::Function {
+            return_ty,
+            params: fps,
+            is_delegate: false,
+            ..
+        } => {
+            let ret = lower_value_ty(return_ty, src, structs, env);
+            let ptys: Vec<IrType> = fps
+                .iter()
+                .map(|t| lower_value_ty(t, src, structs, env))
+                .collect();
+            Some((ret, ptys))
+        }
+        _ => None,
+    }
+}
+
 /// The monomorphized symbol name of a generic instantiation: `Box<int>` →
 /// `Box$i64`, `Pair<int32>` → `Pair$i32` (reusing the overload type codes).
 fn mangle_generic(name: &str, args: &[IrType]) -> String {
@@ -9258,6 +9636,59 @@ mod tests {
         }
         assert!(saw_lambda, "expected at least one $lambda* function");
         assert!(saw_mref, "expected the $mref$ thunk for Mathx.Square");
+    }
+
+    /// FV-T6 (inline lambda in call-arg position): an inline lambda written
+    /// directly as a generic-HOF arg (`xs.Map<int32>(x => x + 1)`) with NO
+    /// declared `function`-typed local must still (a) be COLLECTED a `$lambdaN`
+    /// symbol (T6a's pre-pass walk of call args) and emitted as a free function —
+    /// NOT lowered to `undef` — and (b) bind its body param at the RESOLVED
+    /// callee param type (T6b: `function int32(int32)`'s `int32`), so the emitted
+    /// `$lambdaN($self: Ptr, x: i32)` is `$self`-leading with `x : I32`. The
+    /// run-corpus (`lambda_direct_arg.bf`) gates the behavior; this pins the ABI.
+    #[test]
+    fn fv_t6_inline_arg_lambda_emits_with_targeted_params() {
+        let src = r#"
+            class Program {
+                public static int32 Main() {
+                    List<int32> xs = new List<int32>();
+                    xs.Add(1);
+                    // INLINE lambda — no `function`-typed local supplies its type.
+                    List<int32> ys = xs.Map<int32>(x => x + 1);
+                    return ys.Fold<int32>(0, (acc, x) => acc + x);
+                }
+            }
+        "#;
+        let (unit, _pd) = parse_file(src, FileId(0));
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // The single-param inline `Map` lambda must be emitted as a `$lambdaN`
+        // function whose param[0] is the Ptr `$self` and param[1] is the
+        // target-typed `x : i32` — proving T6a collected it and T6b typed it.
+        let one_param_lambda = module
+            .funcs
+            .iter()
+            .filter(|f| f.name.starts_with("$lambda"))
+            .find(|f| f.params.len() == 2)
+            .expect("an inline 1-param ($self + x) lambda was emitted (not undef)");
+        assert_eq!(
+            one_param_lambda.params[0].ty,
+            IrType::Ptr,
+            "{}: param[0] must be the Ptr $self",
+            one_param_lambda.name
+        );
+        assert_eq!(
+            one_param_lambda.params[1].ty,
+            IrType::I32,
+            "{}: inline lambda's `x` must be target-typed to the callee param (i32)",
+            one_param_lambda.name
+        );
     }
 
     /// IT-T2 data-shape gate (itables.md §8): `fill_iface_members` /
@@ -9649,6 +10080,7 @@ mod tests {
             params: params.to_vec(),
             is_instance: false,
             variadic: None,
+            param_fn_sigs: Vec::new(),
         }
     }
 
