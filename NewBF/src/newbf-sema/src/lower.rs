@@ -3716,6 +3716,8 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             m.add_vtable(VtableDef {
                 name: vtable_name(&structs.prefixes[i]),
                 entries: structs.vimpls[i].clone(),
+                // RF-T1: default 0; RF-T3 assigns the dense type-id here.
+                type_id: 0,
             });
         }
     }

@@ -277,6 +277,15 @@ pub enum InstKind {
         a: Value,
         b: Value,
     },
+    /// Load the runtime **type-id** from an object's `$header`:
+    /// `obj.$header` → `ClassVData` field 0 (`i32 mType`). Result type is
+    /// **`I32`** (matches the reflection-registry index width — never `i64`).
+    /// `obj` is a `Ref(_)` heap instance. **RF-T1 only declares the
+    /// instruction**; sema emits it for `obj.GetType()` in RF-T5 and the backend
+    /// lowers it then — it is unreachable until then.
+    LoadTypeId {
+        obj: Value,
+    },
     /// A trap intrinsic. `debug: true` is a resumable breakpoint
     /// (`int3` / `@llvm.debugtrap`) — a Vectored/SEH handler can catch it,
     /// dump the stack, and continue. `debug: false` is a fatal illegal

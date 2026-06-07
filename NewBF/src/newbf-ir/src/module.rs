@@ -35,6 +35,75 @@ pub struct VtableDef {
     pub name: String,
     /// Slot → implementing function name, in slot order.
     pub entries: Vec<String>,
+    /// The class's dense runtime **type-id** — the `i32 mType` word that leads
+    /// the `ClassVData { i32 mType, [N x ptr] }` header (the reflection registry
+    /// index). **RF-T1 only declares the field (default `0`); RF-T3 populates it
+    /// (name-sorted dense ids), and RF-T2/RF-T5 read it** when reworking the
+    /// header ABI / lowering `GetType`.
+    pub type_id: u32,
+}
+
+/// The per-type reflection **strip policy** — a bitflags-like set deciding which
+/// metadata tables a type emits. Computed by sema from `[Reflect(flags)]` /
+/// `[AlwaysInclude]` + a module default (RF-T3); consumed by the backend
+/// (RF-T4) to gate field/method table emission. `TYPE` (name+id+size) is the
+/// always-on minimum.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReflectPolicy(pub u32);
+
+impl ReflectPolicy {
+    pub const NONE: ReflectPolicy = ReflectPolicy(0);
+    pub const FIELDS: ReflectPolicy = ReflectPolicy(1);
+    pub const METHODS: ReflectPolicy = ReflectPolicy(2);
+    /// Always-on minimum (name + id + size).
+    pub const TYPE: ReflectPolicy = ReflectPolicy(4);
+    pub const ALL: ReflectPolicy = ReflectPolicy(7);
+
+    /// `true` when `self` includes every bit of `b`.
+    pub fn has(self, b: ReflectPolicy) -> bool {
+        self.0 & b.0 == b.0
+    }
+}
+
+/// One reflected field of a [`TypeMeta`]: its source name, IR type, and ordinal
+/// field index in the struct body. Emitted (policy-gated) as a `%FieldInfo`
+/// constant by the backend (RF-T4/RF-T6).
+#[derive(Clone, PartialEq, Debug)]
+pub struct FieldMeta {
+    pub name: String,
+    pub ty: IrType,
+    pub field_index: u32,
+}
+
+/// One reflected method of a [`TypeMeta`]: its source name, mangled symbol, and
+/// parameter count. Emitted (policy-gated) as a `%MethodInfo` constant by the
+/// backend (RF-T7).
+#[derive(Clone, PartialEq, Debug)]
+pub struct MethodMeta {
+    pub name: String,
+    pub symbol: String,
+    pub param_count: u32,
+}
+
+/// One per reflectable type. Recorded by sema (RF-T3) into [`Module::type_meta`]
+/// and emitted (policy-gated) as a constant `%struct.Type` global by the backend
+/// (RF-T4). Owned data only — no lifetimes, so [`IrType`] stays `Copy` and the
+/// metadata lives entirely on the [`Module`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct TypeMeta {
+    /// The dense runtime type-id (matches the owning [`VtableDef::type_id`]).
+    pub type_id: u32,
+    /// For the backend to compute instance size + field offsets at emit time.
+    pub struct_id: StructId,
+    /// The simple type name, e.g. `"Dog"`.
+    pub name: String,
+    pub policy: ReflectPolicy,
+    /// Class (heap, has `ClassVData`) vs value struct.
+    pub is_ref: bool,
+    /// Empty unless `policy.has(FIELDS)`.
+    pub fields: Vec<FieldMeta>,
+    /// Empty unless `policy.has(METHODS)`.
+    pub methods: Vec<MethodMeta>,
 }
 
 /// A mutable module global (a `static` field). Emitted zero-initialized.
@@ -57,6 +126,11 @@ pub struct Module {
     /// list is what tells the fold pass which functions are compile-time only.
     /// Empty for any module without `[Comptime]` methods.
     pub comptime: Vec<String>,
+    /// Per-type reflection metadata, one [`TypeMeta`] per reflectable type.
+    /// **Default empty** — a program with no reflectable types pays nothing.
+    /// Populated by sema (RF-T3); emitted as Type globals by the backend
+    /// (RF-T4). Dead until those tasks wire it.
+    pub type_meta: Vec<TypeMeta>,
 }
 
 impl Module {
@@ -68,12 +142,20 @@ impl Module {
             vtables: Vec::new(),
             globals: Vec::new(),
             comptime: Vec::new(),
+            type_meta: Vec::new(),
         }
     }
 
     /// Register a class vtable global.
     pub fn add_vtable(&mut self, def: VtableDef) {
         self.vtables.push(def);
+    }
+
+    /// Record one type's reflection metadata. Sema calls this (RF-T3) after
+    /// monomorphization + vtable layout, so field indices and method symbols are
+    /// final; the backend (RF-T4) iterates `type_meta` to emit Type globals.
+    pub fn add_type_meta(&mut self, meta: TypeMeta) {
+        self.type_meta.push(meta);
     }
 
     /// Register a mutable module global (a `static` field).

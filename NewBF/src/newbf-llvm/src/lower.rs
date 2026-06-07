@@ -532,6 +532,13 @@ impl<'ctx> Codegen<'ctx, '_> {
             InstKind::SizeOf { struct_id } => self.struct_types[struct_id.0 as usize]
                 .size_of()
                 .map(Into::into),
+            // RF-T1 plumbing-only: no pass emits `LoadTypeId` yet (sema starts
+            // emitting it for `obj.GetType()` in RF-T5), so this arm is never
+            // reached by any corpus program. RF-T5 replaces it with the real
+            // lowering (load `$header` → `ClassVData` field 0 as i32).
+            InstKind::LoadTypeId { .. } => {
+                unimplemented!("LoadTypeId lowering is RF-T5")
+            }
             InstKind::ElemAddr { base, elem, index } => {
                 let basep = self.as_ptr(self.value_of(base, results, llvm_fn)?);
                 let idx = self.as_int(self.value_of(index, results, llvm_fn)?);

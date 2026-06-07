@@ -26,7 +26,10 @@ pub use func::{Block, Function, FunctionBuilder, Param};
 pub use inst::{
     BinOp, BlockId, Callee, CastKind, CmpPred, Const, InstData, InstId, InstKind, Terminator, Value,
 };
-pub use module::{FieldDef, GlobalDef, Module, StructDef, VtableDef};
+pub use module::{
+    FieldDef, FieldMeta, GlobalDef, MethodMeta, Module, ReflectPolicy, StructDef, TypeMeta,
+    VtableDef,
+};
 pub use print::format_ir;
 pub use ty::{IrType, StructId};
 
