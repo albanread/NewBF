@@ -3005,6 +3005,131 @@ fn fill_members_at(
     }
 }
 
+/// CB-T0 — Merge a non-generic `extension Foo { … }` into the already-registered
+/// type `id` (the reopened `class`/`struct Foo`), APPENDING members rather than
+/// rebuilding the type. Distinct from [`fill_members_at`]'s full-type fill, which
+/// OWNS the type's field list (`t.defs[id].fields = …`, clobbering it) and records
+/// the inheritance base. Here:
+///
+/// * **Fields ADD, never replace.** Each extension instance field (and any
+///   auto-property backing field) is *appended* after the base type's existing
+///   fields/`$header`; the original field list and its per-field pointer-element
+///   types are untouched. A `$header` is **not** re-added — the base class already
+///   carries one at offset 0.
+/// * **Field defaults survive.** New defaults are pushed onto the *existing*
+///   `field_inits[id]` Vec (via `entry(id).or_default().push`), so the base type's
+///   recorded defaults are preserved and the extension's are added.
+/// * **Ctors/methods/virtuals/properties APPEND** through `fill_members_at` with
+///   `fill_layout = false` (the same path the payload-enum reclassification uses
+///   to avoid re-laying-out fields). Its existing per-signature dedup guards
+///   (`ctors` arity check, `methods` `params`-equality check) mean a duplicate
+///   member signature is **not** double-added; a legitimate `override`/`new` (a
+///   distinct symbol/slot) still composes normally.
+fn fill_extension_at(td: &TypeDecl, id: StructId, kind: StructKind, src: &str, t: &mut StructTable) {
+    append_extension_fields(td, id, kind, src, t);
+    // Append ctors / methods / virtuals / property accessors. `fill_layout =
+    // false` skips `fill_fields_at` (we just appended the layout) and the
+    // base-recording (the base type already set `t.bases[id]`).
+    fill_members_at(td, id, kind, &[], src, t, false);
+}
+
+/// Append `td`'s instance fields (and auto-property backing fields) onto the
+/// existing layout at `id`, preserving everything already there. Mirrors the
+/// field/static/property handling of [`fill_fields_at`] but **never** writes
+/// `$header` and **never** assigns `t.defs[id].fields` wholesale.
+fn append_extension_fields(
+    td: &TypeDecl,
+    id: StructId,
+    _kind: StructKind,
+    src: &str,
+    t: &mut StructTable,
+) {
+    let env: TyEnv = &[];
+    for m in &td.members {
+        if let Member::Field {
+            ty,
+            name,
+            modifiers,
+            init,
+            ..
+        } = m
+        {
+            // Static fields become module globals (not layout); consts hold no
+            // storage. Mirror `fill_fields_at` exactly so an extension `static`
+            // field registers its global, then skip the instance layout.
+            if modifiers
+                .iter()
+                .any(|(mo, _)| matches!(mo, Modifier::Static | Modifier::Const))
+            {
+                if modifiers
+                    .iter()
+                    .any(|(mo, _)| matches!(mo, Modifier::Static))
+                {
+                    let fty = lower_ty_env(ty, src, t, env);
+                    if matches!(
+                        fty,
+                        IrType::Bool
+                            | IrType::Int { .. }
+                            | IrType::Float { .. }
+                            | IrType::Ptr
+                            | IrType::Ref(_)
+                    ) {
+                        let sym = format!("{}{}", t.prefixes[id.0 as usize], name.text(src));
+                        t.statics.insert(sym, fty);
+                    }
+                }
+                continue;
+            }
+            let fty = lower_ty_env(ty, src, t, env);
+            let elem = pointer_elem_env(ty, src, t, env);
+            t.field_elems[id.0 as usize].push(elem);
+            t.defs[id.0 as usize].fields.push(FieldDef {
+                name: name.text(src).to_string(),
+                ty: fty,
+            });
+            // ADD (don't reset) this id's field defaults: the base type's recorded
+            // initializers stay, the extension's are appended.
+            if let Some(e) = init
+                && let Some(c) = const_field_init(e, fty, src)
+            {
+                t.field_inits
+                    .entry(id)
+                    .or_default()
+                    .push((name.text(src).to_string(), c));
+            }
+        }
+    }
+    // Auto-property (a body-less accessor) backing field `{Name}$prop`, same rule
+    // as `fill_fields_at`: skip statics and all-computed properties.
+    for m in &td.members {
+        if let Member::Property {
+            ty,
+            name,
+            accessors,
+            modifiers,
+            ..
+        } = m
+        {
+            if modifiers
+                .iter()
+                .any(|(mo, _)| matches!(mo, Modifier::Static))
+            {
+                continue;
+            }
+            if !accessors.iter().any(|a| matches!(a.body, MethodBody::None)) {
+                continue;
+            }
+            let pty = lower_ty_env(ty, src, t, env);
+            let pelem = pointer_elem_env(ty, src, t, env);
+            t.field_elems[id.0 as usize].push(pelem);
+            t.defs[id.0 as usize].fields.push(FieldDef {
+                name: format!("{}$prop", name.text(src)),
+                ty: pty,
+            });
+        }
+    }
+}
+
 fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     // Interfaces are registered (empty `StructDef`) in IT-T1 but their members
     // are filled separately by IT-T2's `fill_iface_members` (into `imethods`,
@@ -3012,6 +3137,31 @@ fn fill_type_struct(td: &TypeDecl, src: &str, t: &mut StructTable) {
     // has no `$header`, no instance fields, and its default-bodied methods must
     // NOT land in `methods[iface]` (itables.md §5 T2). Excluding `Interface`
     // keeps T1's StructDef genuinely empty.
+    // CB-T0: a non-generic `extension Foo { … }` REOPENS the already-declared
+    // `class`/`struct Foo` rather than declaring a new type. Resolve the existing
+    // id via `by_name` (never allocate a new one) and merge the extension's
+    // members into it — APPENDING ctors/methods/virtuals and ADDING (never
+    // replacing) fields, so the base type's fields and their defaults survive.
+    // A generic extension (`extension Foo<T>`) follows the monomorph path and is
+    // not handled here; an extension whose base type isn't registered in this
+    // (standalone) compilation — e.g. `extension LibClassA` lowered without LibA —
+    // resolves to `None` and is skipped, exactly as before this task.
+    if td.kind == TypeKind::Extension {
+        if td.generic_params.is_empty()
+            && let Some(&id) = t.by_name.get(td.name.text(src))
+        {
+            let kind = t.kinds[id.0 as usize];
+            if !matches!(kind, StructKind::Interface) {
+                fill_extension_at(td, id, kind, src, t);
+            }
+        }
+        for m in &td.members {
+            if let Member::Nested(n) = m {
+                fill_type_struct(n, src, t);
+            }
+        }
+        return;
+    }
     let kind = struct_kind(td)
         .filter(|k| !matches!(k, StructKind::Interface))
         .filter(|_| td.generic_params.is_empty());
