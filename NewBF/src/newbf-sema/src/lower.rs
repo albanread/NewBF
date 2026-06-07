@@ -23,8 +23,8 @@ use newbf_ir::{
 };
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
-    AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, InterpPart, Item, Member,
-    MethodBody, Modifier, Param as AstParam, ParamModifier, PrefixKw, Stmt, SwitchArm,
+    AccessorKind, AssignOp, Attribute, BinOp as AstBin, CompUnit, Expr, GenericParam, InterpPart,
+    Item, Member, MethodBody, Modifier, Param as AstParam, ParamModifier, PrefixKw, Stmt, SwitchArm,
     Type as AstType, TypeDecl, TypeKind, UnOp, parse_file,
 };
 
@@ -197,6 +197,84 @@ struct StructTable {
     /// inheritance's field reindexing. Non-constant inits (calls/`new`) aren't
     /// captured yet.
     field_inits: HashMap<StructId, Vec<(String, Const)>>,
+    /// MX-T2: mixin definitions, keyed by mixin NAME → its overloads (by arity in
+    /// v1) (mixins.md §3.2). A `Member::Mixin` records `owner = Some(id)`; a
+    /// `Stmt::MixinDecl` (local mixin) records `owner = None`. Generic mixins are
+    /// collected too (with `generic_params` non-empty) so the MX-T3 expansion gate
+    /// can defer them. Populated by [`collect_mixins`]; READ by MX-T3 (expansion).
+    mixins: HashMap<String, Vec<MixinDef>>,
+    /// MX-T2: owned per-file source strings, indexed by `MixinDef.src_file` (NOT
+    /// by `FileId`, which is sparse — prelude files use `FileId(10_000+i)`). This
+    /// is the cross-src resolution (mixins.md §1.1/§3.2): a mixin is spliced at its
+    /// CALL site but its body's spans resolve against the DECLARING file's source.
+    /// Owning the strings keeps the StructTable's no-lifetime invariant. Populated
+    /// in [`StructTable::build`] (one copy per file, in file-slice order); READ by
+    /// MX-T3 (which slices the body's spans against `srcs[def.src_file]`).
+    srcs: Vec<String>,
+}
+
+/// MX-T2: a collected mixin declaration — owned data only (no lifetime), so the
+/// StructTable's no-lifetime invariant holds. Clones the body (`MethodBody`) and
+/// param types (`AstType`) in; records the declaring file as an INDEX into
+/// [`StructTable::srcs`] (mixins.md §3.2). Collection only — MX-T3 reads this to
+/// splice; nothing here is expanded yet.
+//
+// MX-T3 consumes every field (resolve/gate/splice). Until then the registry is
+// populated but unread by lowering, so the fields are dead in the non-test
+// build; the MX-T2 unit test reads them. Allow dead_code (cited to MX-T3) rather
+// than prematurely `pub`-ing private collection state.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct MixinDef {
+    /// The mixin's simple name (the registry is keyed by this; stored here too so
+    /// a `Vec<MixinDef>` value is self-describing).
+    name: String,
+    /// The declaring type's id for a member mixin (`Member::Mixin`); `None` for a
+    /// free/local mixin (`Stmt::MixinDecl`).
+    owner: Option<StructId>,
+    /// Generic type-parameter names (`mixin M<T>`). v1: collected; the MX-T3 gate
+    /// refuses to expand when this is non-empty.
+    generic_params: Vec<String>,
+    /// The mixin's parameters (name, kind, optional declared type) — owned clones.
+    params: Vec<MixinParam>,
+    /// The mixin body — an owned clone of the `MethodBody` (block or `=> expr`).
+    body: MethodBody,
+    /// Index into [`StructTable::srcs`] of the file that DECLARED this mixin, so
+    /// MX-T3 can slice the body's spans against the right source.
+    src_file: usize,
+    /// Set during collection if the body contains a lambda or a local function —
+    /// a GATED shape for MX-T3 (mixins.md §3.8/§6); expansion refuses it.
+    has_lambda_or_localfn: bool,
+    /// Set during collection if the body's trailing yielded expression is a place
+    /// (`ref …`) — the lvalue-yield GATED shape for MX-T3 (mixins.md §3.8).
+    yields_place: bool,
+}
+
+/// MX-T2: a mixin parameter — owned (cloned declared type, if any).
+// MX-T3 reads these to bind args at the splice; unread by lowering until then.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct MixinParam {
+    name: String,
+    kind: MixinParamKind,
+    /// The declared parameter type, cloned from the AST. `None` for a `var` param
+    /// (`MixinParamKind::VarInfer`), whose type is inferred at the call site.
+    ty: Option<AstType>,
+}
+
+/// MX-T2: the nature of a mixin parameter (mixins.md §3.2/§3.3). v1 (MX-T3) will
+/// support `ByValue` + a limited `VarInfer`; `ByRef`/`Out` are gated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MixinParamKind {
+    /// An ordinary value parameter (declared type, no modifier).
+    ByValue,
+    /// A `ref` parameter.
+    ByRef,
+    /// A `var`-inferred parameter (`mixin M(var x)`): no declared type; the type
+    /// is inferred from the call-site argument.
+    VarInfer,
+    /// An `out` parameter (write-back).
+    Out,
 }
 
 /// A monomorphization to lower: `(mono id, generic type name, type-param env)`.
@@ -266,6 +344,13 @@ impl StructTable {
         //    (`StructId(t.defs.len())`) or `by_name`/loop indices — nothing
         //    hardcodes a numeric id.
         t.func_struct = register_func_struct(&mut t);
+        // MX-T2: own a copy of each file's source, indexed by its position in
+        // `files` (NOT by `FileId`, which is sparse — prelude files are
+        // `FileId(10_000+i)`). `collect_mixins` records each `MixinDef.src_file`
+        // as this same index, so `srcs[def.src_file]` resolves the body's source
+        // at splice time (MX-T3). Done once up front; the index is stable for the
+        // collection pass below.
+        t.srcs = files.iter().map(|f| f.src.to_string()).collect();
         // 1. Register every non-generic type's name/id, and int-backed enums.
         for f in files {
             register_struct_names(&f.unit.items, "", f.src, &mut t);
@@ -397,6 +482,15 @@ impl StructTable {
         //     in its (grown, null-padded) vtable at the interface's slot base; the
         //     call site does not dispatch through it yet (that is IT-T5).
         apply_itables(&mut t);
+        // MX-T2: collect every declared mixin into `t.mixins` (collection only —
+        // expansion is MX-T3). Runs last, after `by_name` is fully populated (so a
+        // member mixin's owner id resolves) and `srcs` is filled (so `src_file`
+        // indexes correctly). Walks each file at its `files`-slice index so the
+        // recorded `src_file` matches `srcs`. Behavior-preserving: nothing reads
+        // `t.mixins` during lowering yet.
+        for (i, f) in files.iter().enumerate() {
+            collect_mixins(&f.unit.items, "", i, f.src, &mut t);
+        }
         // Default-id hazard guard: `func_struct` must genuinely be the `$Func`
         // value-struct (registered first, at `StructId(0)`), with exactly two
         // `Ptr` fields. If this ever fails, an unset/aliased `func_struct` would
@@ -3656,6 +3750,319 @@ fn collect_local_fns_stmt<'a>(
         Stmt::MixinDecl { .. } => {}
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// MX-T2: mixin collection. Walks every type's `Member::Mixin` and every method
+// body's `Stmt::MixinDecl` (local mixins), recording each into `t.mixins` keyed
+// by mixin NAME (mixins.md §3.2). Collection ONLY — nothing is expanded (MX-T3
+// reads this registry). Behavior-preserving.
+// ---------------------------------------------------------------------------
+
+/// Walk `items` recording every declared mixin into `t.mixins`. `prefix` mirrors
+/// the type-name prefix the rest of `build` uses (for nested types); `src_file`
+/// is the index into `t.srcs` of THIS file (set by the caller in file-slice
+/// order). Recurses into namespaces and nested types so a mixin declared in
+/// `Outer.Inner` is reached; also descends into method/ctor/dtor *block* bodies
+/// to collect local mixins (`Stmt::MixinDecl`).
+fn collect_mixins(items: &[Item], prefix: &str, src_file: usize, src: &str, t: &mut StructTable) {
+    for item in items {
+        match item {
+            Item::Namespace {
+                body: Some(body), ..
+            } => collect_mixins(body, prefix, src_file, src, t),
+            Item::Type(td) => collect_mixins_type(td, prefix, src_file, src, t),
+            _ => {}
+        }
+    }
+}
+
+/// Collect mixins declared in (or under) a single type declaration: its member
+/// mixins (owner = this type's id), local mixins inside its method bodies (owner
+/// = None), and recursively its nested types.
+fn collect_mixins_type(td: &TypeDecl, prefix: &str, src_file: usize, src: &str, t: &mut StructTable) {
+    let new_prefix = format!("{prefix}{}.", td.name.text(src));
+    // The declaring type's id, if it is a registered (non-generic) type. A
+    // member mixin on a generic type (uninstantiated) or an unregistered type
+    // gets `owner = None` — still collected, just owner-less (MX-T3 gates
+    // generic mixins anyway). Resolving by simple name matches how the rest of
+    // collection keys non-generic types.
+    let owner = t.by_name.get(td.name.text(src)).copied();
+    for m in &td.members {
+        match m {
+            Member::Mixin {
+                name,
+                generic_params,
+                params,
+                body,
+                ..
+            } => {
+                record_mixin(
+                    name.text(src).to_string(),
+                    owner,
+                    generic_params,
+                    params,
+                    body.clone(),
+                    src_file,
+                    src,
+                    t,
+                );
+            }
+            // Descend into a member method/ctor/dtor BLOCK body for any local
+            // mixins (`Stmt::MixinDecl`) declared inside it.
+            Member::Method {
+                body: MethodBody::Block(s),
+                ..
+            }
+            | Member::Constructor {
+                body: MethodBody::Block(s),
+                ..
+            }
+            | Member::Destructor {
+                body: MethodBody::Block(s),
+                ..
+            } => collect_mixins_stmt(s, src_file, src, t),
+            // A property accessor body can also host a local mixin.
+            Member::Property { accessors, .. } => {
+                for a in accessors {
+                    if let MethodBody::Block(s) = &a.body {
+                        collect_mixins_stmt(s, src_file, src, t);
+                    }
+                }
+            }
+            // A nested type declares its own (member/local) mixins.
+            Member::Nested(n) => collect_mixins_type(n, &new_prefix, src_file, src, t),
+            _ => {}
+        }
+    }
+}
+
+/// Walk a statement tree collecting local mixins (`Stmt::MixinDecl`). A local
+/// mixin is owner-less (`owner = None`); its body is itself a `Stmt`, wrapped as
+/// a `MethodBody::Block` so the registry is uniform with member mixins. Recurses
+/// into nested statement scopes (blocks/loops/if) AND into a local mixin's own
+/// body (a local mixin may nest another).
+fn collect_mixins_stmt(stmt: &Stmt, src_file: usize, src: &str, t: &mut StructTable) {
+    match stmt {
+        Stmt::MixinDecl {
+            name,
+            generic_params,
+            params,
+            body,
+            ..
+        } => {
+            // A `Stmt::MixinDecl.body` is a `Box<Stmt>` (block or a `=> expr`
+            // wrapped as `Stmt::Expr`). Mirror member-mixin storage: a block
+            // stays a block; a bare-expr statement becomes a `MethodBody::Expr`
+            // so the `=> expr` yield form is uniform across member/local mixins.
+            let mb = match &**body {
+                Stmt::Expr { expr, .. } => MethodBody::Expr(expr.clone()),
+                other => MethodBody::Block(other.clone()),
+            };
+            record_mixin(
+                name.text(src).to_string(),
+                None,
+                generic_params,
+                params,
+                mb,
+                src_file,
+                src,
+                t,
+            );
+            // A local mixin's body may itself host another local mixin.
+            collect_mixins_stmt(body, src_file, src, t);
+        }
+        Stmt::Block { stmts, .. } => {
+            for s in stmts {
+                collect_mixins_stmt(s, src_file, src, t);
+            }
+        }
+        Stmt::Locals { decls, .. } => {
+            for d in decls {
+                collect_mixins_stmt(d, src_file, src, t);
+            }
+        }
+        Stmt::If { then, els, .. } => {
+            collect_mixins_stmt(then, src_file, src, t);
+            if let Some(e) = els {
+                collect_mixins_stmt(e, src_file, src, t);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_mixins_stmt(body, src_file, src, t),
+        Stmt::LocalFunction { body, .. } => collect_mixins_stmt(body, src_file, src, t),
+        _ => {}
+    }
+}
+
+/// Record one mixin into `t.mixins` (keyed by name), computing the two gate
+/// flags from its body. Shared by member mixins and local mixins.
+#[allow(clippy::too_many_arguments)]
+fn record_mixin(
+    name: String,
+    owner: Option<StructId>,
+    generic_params: &[GenericParam],
+    params: &[AstParam],
+    body: MethodBody,
+    src_file: usize,
+    src: &str,
+    t: &mut StructTable,
+) {
+    let gparams: Vec<String> = generic_params
+        .iter()
+        .map(|g| g.name.text(src).to_string())
+        .collect();
+    let mparams: Vec<MixinParam> = params
+        .iter()
+        .map(|p| {
+            let kind = mixin_param_kind(p);
+            MixinParam {
+                name: p.name.map(|n| n.text(src).to_string()).unwrap_or_default(),
+                kind,
+                // A `var` param (`VarInfer`) has an inferred type — store `None`.
+                // Every other param keeps its declared type (owned clone).
+                ty: match kind {
+                    MixinParamKind::VarInfer => None,
+                    _ => Some(p.ty.clone()),
+                },
+            }
+        })
+        .collect();
+    let has_lambda_or_localfn = body_has_lambda_or_localfn(&body);
+    let yields_place = body_yields_place(&body);
+    t.mixins.entry(name.clone()).or_default().push(MixinDef {
+        name,
+        owner,
+        generic_params: gparams,
+        params: mparams,
+        body,
+        src_file,
+        has_lambda_or_localfn,
+        yields_place,
+    });
+}
+
+/// Classify a mixin parameter's nature (mixins.md §3.2). A `var`-typed param with
+/// no modifier is `VarInfer`; `ref`/`out` modifiers map to `ByRef`/`Out`; an
+/// ordinary declared-type param is `ByValue`.
+fn mixin_param_kind(p: &AstParam) -> MixinParamKind {
+    match p.modifier.map(|(m, _)| m) {
+        Some(ParamModifier::Ref) => MixinParamKind::ByRef,
+        Some(ParamModifier::Out) => MixinParamKind::Out,
+        // `mut`/`in`/`params`/`this` modifiers — treat as by-value for v1
+        // collection (MX-T3 gates anything it can't bind). A `var` type with no
+        // modifier is the inferred form.
+        _ if matches!(p.ty, AstType::Var(_)) => MixinParamKind::VarInfer,
+        _ => MixinParamKind::ByValue,
+    }
+}
+
+/// Whether a mixin body contains a lambda (`Expr::Lambda`) or a local function
+/// (`Stmt::LocalFunction`) anywhere — the `has_lambda_or_localfn` GATED shape for
+/// MX-T3 (mixins.md §3.8/§6: `MixB`'s inner `void AddIt()`, a lambda calling
+/// `ToScopeCStr!()`). Reuses [`for_each_stmt_expr`] (the inline-lambda driver) to
+/// reach every expression position, plus a small statement walk for the
+/// local-function shape.
+fn body_has_lambda_or_localfn(body: &MethodBody) -> bool {
+    match body {
+        MethodBody::Expr(e) => expr_has_lambda(e),
+        MethodBody::Block(s) => stmt_has_lambda_or_localfn(s),
+        MethodBody::None => false,
+    }
+}
+
+fn stmt_has_lambda_or_localfn(stmt: &Stmt) -> bool {
+    // A local function anywhere in the body trips the flag directly.
+    if stmt_contains_localfn(stmt) {
+        return true;
+    }
+    // A lambda anywhere in any expression position trips it too. `for_each_stmt_expr`
+    // reaches every direct/nested expression of the statement tree; each is walked
+    // for a (possibly nested) `Expr::Lambda`.
+    let mut found = false;
+    for_each_stmt_expr(stmt, &mut |e| {
+        if expr_has_lambda(e) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Recursively test whether a statement tree contains a `Stmt::LocalFunction`.
+fn stmt_contains_localfn(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::LocalFunction { .. } => true,
+        Stmt::Block { stmts, .. } => stmts.iter().any(stmt_contains_localfn),
+        Stmt::Locals { decls, .. } => decls.iter().any(stmt_contains_localfn),
+        Stmt::If { then, els, .. } => {
+            stmt_contains_localfn(then) || els.as_deref().is_some_and(stmt_contains_localfn)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => stmt_contains_localfn(body),
+        _ => false,
+    }
+}
+
+/// Recursively test whether an expression tree contains an `Expr::Lambda`.
+fn expr_has_lambda(e: &Expr) -> bool {
+    match e {
+        Expr::Lambda { .. } => true,
+        Expr::Paren { inner, .. } | Expr::Member { base: inner, .. } => expr_has_lambda(inner),
+        Expr::Unary { operand, .. }
+        | Expr::Prefix { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::PostInc { operand, .. }
+        | Expr::PostDec { operand, .. } => expr_has_lambda(operand),
+        Expr::Binary { lhs, rhs, .. } => expr_has_lambda(lhs) || expr_has_lambda(rhs),
+        Expr::Assign { target, value, .. } => expr_has_lambda(target) || expr_has_lambda(value),
+        Expr::Ternary {
+            cond, then, els, ..
+        } => expr_has_lambda(cond) || expr_has_lambda(then) || expr_has_lambda(els),
+        Expr::Call { callee, args, .. } | Expr::MixinCall { callee, args, .. } => {
+            expr_has_lambda(callee) || args.iter().any(expr_has_lambda)
+        }
+        Expr::Generic { base, .. } => expr_has_lambda(base),
+        Expr::Index { base, args, .. } => {
+            expr_has_lambda(base) || args.iter().any(expr_has_lambda)
+        }
+        Expr::Initializer { base, entries, .. } => {
+            expr_has_lambda(base) || entries.iter().any(expr_has_lambda)
+        }
+        Expr::Tuple { elems, .. } => elems.iter().any(expr_has_lambda),
+        Expr::Named { value, .. } => expr_has_lambda(value),
+        _ => false,
+    }
+}
+
+/// Whether the body's trailing YIELDED expression is a place (`ref …`) — the
+/// `yields_place` lvalue-yield GATED shape for MX-T3 (mixins.md §3.8: `GetRef!`'s
+/// body yields `ref a`). The yield is the operand of a `=> expr` body, or a
+/// block body's trailing bare `Stmt::Expr` (the block-trailing-yield form,
+/// §3.5). A `..`-chained yield (`Unwrap!(svRes)..Trim()`) is NOT a `ref`-place
+/// here; v1 detects only the explicit `ref` form (the other lvalue shapes are
+/// gated by other predicates in MX-T3).
+fn body_yields_place(body: &MethodBody) -> bool {
+    let trailing = match body {
+        MethodBody::Expr(e) => Some(e),
+        MethodBody::Block(Stmt::Block { stmts, .. }) => match stmts.last() {
+            Some(Stmt::Expr { expr, .. }) => Some(expr),
+            _ => None,
+        },
+        _ => None,
+    };
+    matches!(
+        trailing,
+        Some(Expr::Prefix {
+            kw: PrefixKw::Ref,
+            ..
+        })
+    )
 }
 
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
@@ -10776,5 +11183,212 @@ mod tests {
 
         // A concrete expression → None (stays in lockstep with arg_is_pending).
         assert_eq!(pending_kind(&Expr::Ident(sp), src), None);
+    }
+
+    /// MX-T2: `collect_mixins` records every declared mixin into `t.mixins`
+    /// (keyed by name) with the right owner, `src_file`, and gate flags
+    /// (`has_lambda_or_localfn`, `yields_place`, generic). This pins the MX-T2
+    /// acceptance: a known mixin lands with correct source + flags so MX-T3 can
+    /// splice it. Collection only — nothing is expanded.
+    #[test]
+    fn mx_t2_collects_mixins_with_owner_src_and_gate_flags() {
+        // A condensed mirror of `feature-suite/src/Mixins.bf`'s shapes:
+        //   - `MixNums`     — block-trailing-yield (`(a<<8)|b`), NOT a place.
+        //   - `MixA`        — `var` param, statement body (write-through).
+        //   - `MixB`        — a local fn `AddIt()` inside → has_lambda_or_localfn.
+        //   - `MixC`        — `var` param, block-trailing value yield.
+        //   - `GetRef`      — block-trailing `ref a` → yields_place.
+        //   - `Lam`         — a lambda in the body → has_lambda_or_localfn.
+        //   - `CircularMixin<T>` — generic (generic_params non-empty).
+        //   - `AppendAndNullify` — a LOCAL mixin (Stmt::MixinDecl) → owner None.
+        let src = r#"
+            class Owner {
+                static mixin MixNums(int a, int b) { (a << 8) | b }
+                mixin MixA(var addTo) { mA += addTo; }
+                mixin MixB(var addTo) {
+                    void AddIt() { mA += addTo; }
+                    AddIt();
+                }
+                static mixin MixC(var val) { val + sA }
+                static mixin GetRef(var a) { a += 1000; ref a }
+                static mixin Lam() {
+                    function void() f = () => { };
+                    f();
+                }
+                public static mixin CircularMixin<T>(T value) { 10 }
+
+                static void Host() {
+                    mixin AppendAndNullify(String str) {
+                        str.Append("B");
+                        str = null;
+                    }
+                    AppendAndNullify!(str0);
+                }
+            }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+
+        // The owning type's id, so we can assert member-mixin ownership.
+        let owner_id = *t.by_name.get("Owner").expect("Owner type registered");
+
+        // Every member mixin landed in the registry keyed by its NAME.
+        for name in ["MixNums", "MixA", "MixB", "MixC", "GetRef", "Lam", "CircularMixin"] {
+            assert!(
+                t.mixins.contains_key(name),
+                "member mixin `{name}` must be collected"
+            );
+        }
+        // The LOCAL mixin landed too (collected from a method body).
+        assert!(
+            t.mixins.contains_key("AppendAndNullify"),
+            "local mixin must be collected"
+        );
+
+        // A single-file program: every mixin's `src_file` indexes srcs[0].
+        assert_eq!(t.srcs.len(), 1, "one source file → one owned src copy");
+        for defs in t.mixins.values() {
+            for d in defs {
+                assert_eq!(d.src_file, 0, "{}: src_file indexes srcs[0]", d.name);
+            }
+        }
+
+        // Helper: the (single) overload of a known mixin name.
+        let only = |name: &str| -> &MixinDef {
+            let v = t.mixins.get(name).unwrap();
+            assert_eq!(v.len(), 1, "`{name}` has exactly one overload here");
+            &v[0]
+        };
+
+        // --- owner: member mixins own the declaring type; the local one is None.
+        assert_eq!(only("MixNums").owner, Some(owner_id), "member mixin owner");
+        assert_eq!(
+            only("AppendAndNullify").owner,
+            None,
+            "local mixin is owner-less"
+        );
+
+        // --- generic flag: CircularMixin<T> is generic; MixNums is not.
+        assert_eq!(
+            only("CircularMixin").generic_params,
+            vec!["T".to_string()],
+            "generic mixin records its type-param names"
+        );
+        assert!(
+            only("MixNums").generic_params.is_empty(),
+            "non-generic mixin has no generic params"
+        );
+
+        // --- has_lambda_or_localfn: MixB (local fn) and Lam (lambda) are gated;
+        //     MixNums/MixC/GetRef are not.
+        assert!(
+            only("MixB").has_lambda_or_localfn,
+            "MixB's inner `void AddIt()` trips the local-fn gate"
+        );
+        assert!(
+            only("Lam").has_lambda_or_localfn,
+            "Lam's lambda body trips the lambda gate"
+        );
+        assert!(
+            !only("MixNums").has_lambda_or_localfn,
+            "a plain block-yield mixin has no lambda/local-fn"
+        );
+
+        // --- yields_place: GetRef's trailing `ref a` is a place; MixNums' and
+        //     MixC's trailing bare value are not.
+        assert!(
+            only("GetRef").yields_place,
+            "GetRef's trailing `ref a` yields a place"
+        );
+        assert!(
+            !only("MixNums").yields_place,
+            "MixNums' trailing `(a<<8)|b` is a value, not a place"
+        );
+        assert!(
+            !only("MixC").yields_place,
+            "MixC's trailing `val + sA` is a value, not a place"
+        );
+
+        // --- param kinds: `var` → VarInfer (ty None); a declared-type param →
+        //     ByValue (ty Some).
+        let mixc = only("MixC");
+        assert_eq!(mixc.params.len(), 1);
+        assert_eq!(mixc.params[0].name, "val");
+        assert_eq!(mixc.params[0].kind, MixinParamKind::VarInfer);
+        assert!(mixc.params[0].ty.is_none(), "a var param has no declared type");
+
+        let mixnums = only("MixNums");
+        assert_eq!(mixnums.params.len(), 2);
+        assert_eq!(mixnums.params[0].kind, MixinParamKind::ByValue);
+        assert!(
+            mixnums.params[0].ty.is_some(),
+            "a declared-type param keeps its type"
+        );
+
+        // --- the body is an owned clone (block-yield form preserved).
+        assert!(
+            matches!(only("MixNums").body, MethodBody::Block(_)),
+            "MixNums keeps its block body"
+        );
+    }
+
+    /// MX-T2: collecting against the REAL `Mixins.bf` verify-corpus fixture pins
+    /// that the actual shapes the design enumerates are captured with the right
+    /// flags. `GetVal2(out int a)` records an `Out` param; the `out` form is a
+    /// gated kind for MX-T3. (Reads the corpus file relative to the crate.)
+    #[test]
+    fn mx_t2_collects_real_mixins_bf_fixture() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../beef-tests/feature-suite/src/Mixins.bf");
+        let src = std::fs::read_to_string(&path).expect("Mixins.bf fixture exists");
+        let unit = parse_file(&src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src: &src,
+            unit: &unit,
+        }];
+        let t = StructTable::build(&files);
+
+        // The header static mixin: a non-generic, non-place, value-yield mixin.
+        let mixnums = &t.mixins.get("MixNums").expect("MixNums collected")[0];
+        assert_eq!(mixnums.src_file, 0);
+        assert!(!mixnums.has_lambda_or_localfn);
+        assert!(!mixnums.yields_place);
+        assert!(mixnums.generic_params.is_empty());
+
+        // `GetRef` yields `ref a` — the lvalue-yield gated shape.
+        assert!(
+            t.mixins.get("GetRef").expect("GetRef collected")[0].yields_place,
+            "GetRef yields a place"
+        );
+
+        // `MixB` carries a local `void AddIt()` — the lambda/local-fn gate.
+        assert!(
+            t.mixins.get("MixB").expect("MixB collected")[0].has_lambda_or_localfn,
+            "MixB has a local function"
+        );
+
+        // `CircularMixin` is generic — and OVERLOADED (`<T>` and `<K,V>`); both
+        // are collected with non-empty generic params.
+        let circ = t.mixins.get("CircularMixin").expect("CircularMixin collected");
+        assert_eq!(circ.len(), 2, "two CircularMixin overloads");
+        assert!(circ.iter().all(|d| !d.generic_params.is_empty()));
+
+        // `GetVal2(out int a)` records an `Out` param kind (gated in MX-T3).
+        let getval2 = &t.mixins.get("GetVal2").expect("GetVal2 collected")[0];
+        assert_eq!(getval2.params.len(), 1);
+        assert_eq!(getval2.params[0].kind, MixinParamKind::Out);
+
+        // The LOCAL mixin inside `TestLocalMixin` is collected, owner-less.
+        let aan = &t
+            .mixins
+            .get("AppendAndNullify")
+            .expect("local mixin AppendAndNullify collected")[0];
+        assert_eq!(aan.owner, None, "a local mixin has no owner");
     }
 }
