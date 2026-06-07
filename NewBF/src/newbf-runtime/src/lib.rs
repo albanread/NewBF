@@ -33,6 +33,7 @@
 //! memory-guard section is a hook the stomp allocator fills in Sprints 09–11.
 
 mod crash_dump;
+pub mod guard;
 
 #[cfg(windows)]
 pub use crash_dump::ensure_stack_overflow_reserve_this_thread;
@@ -41,58 +42,133 @@ pub use crash_dump::{
     update_guard_metrics,
 };
 
-// ──────────────────────────────────────────────────────────────────── //
-// Alloc-path C-ABI thunks                                              //
-// ──────────────────────────────────────────────────────────────────── //
-//
-// The two stable C-ABI symbols the alloc path will route through
-// (`new`/`delete` → `newbf_alloc`/`newbf_free`, memory-safety.md §4/§5).
-// JIT'd and AOT'd Beef code calls these by name; the JIT resolves them as
-// **ORC absolute symbols** (the host-EXE Rust addresses), registered in
-// `OrcJit::from_ir` — see `newbf-llvm/src/jit.rs` and memory-safety.md §A0.
-//
-// For MS-T0 these are plain `malloc`/`free` wrappers — purely a *resolution
-// seam*. The real stomp allocator / ledger (MS-T1) replaces the bodies
-// without changing these signatures (the ABI is the contract).
+pub use guard::{GuardMode, LeakReport, report_leaks, set_guard_mode};
 
-unsafe extern "C" {
-    fn malloc(size: usize) -> *mut u8;
-    fn free(ptr: *mut u8);
-}
+// ──────────────────────────────────────────────────────────────────── //
+// Alloc-path C-ABI: route through the guard mode                       //
+// ──────────────────────────────────────────────────────────────────── //
+//
+// The two stable C-ABI symbols the alloc path routes through (`new`/`delete`
+// → `newbf_alloc`/`newbf_free`, memory-safety.md §4/§5). JIT'd and AOT'd Beef
+// code calls these by name; the JIT resolves them as **ORC absolute symbols**
+// (the host-EXE Rust addresses), registered in `OrcJit::from_ir` — see
+// `newbf-llvm/src/jit.rs` and memory-safety.md §A0.
+//
+// MS-T1: the bodies now route through `guard::route_*`, selected by a runtime
+// mode flag (memory-safety.md §A5). The **DEFAULT mode is Thunk** (straight
+// malloc/free passthrough), so un-guarded callers — MS-T0's smoke test and the
+// run-corpus, which don't enable the guard until MS-T3 — keep working
+// unchanged. The Stomp guard activates only on `newbf_set_guard_mode(Stomp)`.
+// The C-ABI signatures are byte-identical to MS-T0 (the ABI is the contract
+// MS-T2's call sites depend on).
 
 /// Allocate `size` bytes. `type_id` / `site_id` are guard metadata
-/// (`StructId.0` for objects, `-1` for arrays/raw; the alloc-site index) —
-/// accepted and ignored by this MS-T0 thunk, consumed by the stomp
-/// allocator in MS-T1. Returns a front-aligned base pointer (malloc-like),
-/// or null on failure. A `size` of 0 is forwarded to `malloc` (which may
-/// return null or a unique pointer — the stomp allocator handles the
-/// size-0 / page-multiple edge cases in MS-T1).
+/// (`StructId.0` for objects, `-1` for arrays/raw; the alloc-site index),
+/// consumed by the stomp allocator in `Stomp` mode and ignored in `Thunk`
+/// mode. Returns a front-aligned base pointer, or null on failure / negative
+/// size.
 ///
 /// # Safety
 /// C-ABI export; the returned pointer must eventually be passed to
-/// [`newbf_free`]. Callers must not read/write past `size` bytes.
+/// [`newbf_free`] **in the same guard mode**. Callers must not read/write past
+/// `size` bytes (in `Stomp` mode an overrun past the page faults).
 #[unsafe(no_mangle)]
-pub extern "C" fn newbf_alloc(size: i64, _type_id: i32, _site_id: i32) -> *mut u8 {
+pub extern "C" fn newbf_alloc(size: i64, type_id: i32, site_id: i32) -> *mut u8 {
     if size < 0 {
         return core::ptr::null_mut();
     }
-    // SAFETY: `malloc` is the CRT allocator; `size as usize` is non-negative.
-    unsafe { malloc(size as usize) }
+    guard::route_alloc(size as usize, type_id, site_id as u32)
 }
 
-/// Free a pointer previously returned by [`newbf_alloc`]. A null pointer is
-/// a no-op (matching `free(NULL)`). The ledger (MS-T1) will map the user
-/// pointer to its real allocation base; this thunk forwards directly.
+/// Free a pointer previously returned by [`newbf_alloc`]. A null pointer is a
+/// no-op (matching `free(NULL)`). In `Stomp` mode the ledger maps the user
+/// pointer to its allocation base and a double/wild free aborts with a crash
+/// dump; in `Thunk` mode it forwards to `free`.
 ///
 /// # Safety
-/// C-ABI export; `ptr` must be a pointer returned by [`newbf_alloc`] and not
-/// already freed (double-free is UB in this thunk — MS-T1's guard detects it).
+/// C-ABI export; `ptr` must be null or a pointer returned by [`newbf_alloc`]
+/// in the current guard mode and (in `Thunk` mode) not already freed.
 #[unsafe(no_mangle)]
 pub extern "C" fn newbf_free(ptr: *mut u8) {
-    if ptr.is_null() {
-        return;
+    guard::route_free(ptr);
+}
+
+// ──────────────────────────────────────────────────────────────────── //
+// Guard lifecycle C-ABI (memory-safety.md §A5/§A6, §4)                 //
+// ──────────────────────────────────────────────────────────────────── //
+
+/// Mode values for the C-ABI [`newbf_set_guard_mode`]: 0 = Thunk
+/// (passthrough), 1 = Stomp (debug guard). Any other value selects Thunk.
+///
+/// # Safety
+/// C-ABI export; no pointers, always safe to call.
+#[unsafe(no_mangle)]
+pub extern "C" fn newbf_set_guard_mode(mode: i32) {
+    let m = if mode == 1 {
+        GuardMode::Stomp
+    } else {
+        GuardMode::Thunk
+    };
+    set_guard_mode(m);
+}
+
+/// Clear the guard ledger and release all quarantined VM ranges (the in-process
+/// corpus harness calls this between programs — memory-safety.md §4). No-op if
+/// the guard was never used.
+///
+/// # Safety
+/// C-ABI export; no pointers, always safe to call. Must not be called
+/// concurrently with live guarded allocations of pointers still in use.
+#[unsafe(no_mangle)]
+pub extern "C" fn newbf_guard_reset() {
+    guard::reset();
+}
+
+/// Print the current leak report (still-live, non-comptime allocations) to
+/// stderr and return the count. The atexit/explicit leak report
+/// (memory-safety.md §A4).
+///
+/// # Safety
+/// C-ABI export; no pointers, always safe to call.
+#[unsafe(no_mangle)]
+pub extern "C" fn newbf_guard_report_leaks() -> u64 {
+    use std::io::Write as _;
+    let leaks = report_leaks();
+    let mut stderr = std::io::stderr();
+    if leaks.is_empty() {
+        let _ = writeln!(stderr, "newbf guard: no leaks");
+    } else {
+        let _ = writeln!(stderr, "newbf guard: {} leak(s)", leaks.len());
+        for l in &leaks {
+            let _ = writeln!(
+                stderr,
+                "  leak: ptr={:#018x} size={} type_id={} site_id={}",
+                l.ptr, l.size, l.type_id, l.site_id
+            );
+        }
     }
-    // SAFETY: `ptr` is non-null and (per the C-ABI contract) came from
-    // `newbf_alloc`'s `malloc`.
-    unsafe { free(ptr) }
+    let _ = stderr.flush();
+    leaks.len() as u64
+}
+
+/// Enter a comptime evaluation scope: allocations until the matching
+/// [`newbf_guard_exit_comptime`] are tagged comptime and excluded from leak
+/// reports (memory-safety.md §A6). Called by `newbf-comptime` around the
+/// per-call JIT in a later task.
+///
+/// # Safety
+/// C-ABI export; no pointers, always safe to call. Must be paired with
+/// [`newbf_guard_exit_comptime`].
+#[unsafe(no_mangle)]
+pub extern "C" fn newbf_guard_enter_comptime() {
+    guard::guard_enter_comptime();
+}
+
+/// Exit a comptime evaluation scope (pair of [`newbf_guard_enter_comptime`]).
+///
+/// # Safety
+/// C-ABI export; no pointers, always safe to call.
+#[unsafe(no_mangle)]
+pub extern "C" fn newbf_guard_exit_comptime() {
+    guard::guard_exit_comptime();
 }
