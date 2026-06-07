@@ -287,7 +287,17 @@ fn dump_ir(input: &str) {
         .collect();
 
     let program = newbf_sema::analyze(&files);
-    let mut module = newbf_sema::lower_program(&files, &program);
+    let module = newbf_sema::lower_program(&files, &program);
+    // Drive comptime member emission to a fixpoint (CB-T2: a no-op when the
+    // module records no emit generators — every program today). Runs before
+    // value folding: emission changes the program's *shape*, folding its values.
+    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dump-ir: comptime emission failed: {e}");
+            std::process::exit(1);
+        }
+    };
     // Fold comptime call sites so the IR report reflects the real compiled
     // output (a no-op for programs without `[Comptime]`).
     if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
@@ -346,7 +356,17 @@ fn dump_llvm(input: &str) {
         .collect();
 
     let program = newbf_sema::analyze(&files);
-    let mut module = newbf_sema::lower_program(&files, &program);
+    let module = newbf_sema::lower_program(&files, &program);
+    // Drive comptime member emission to a fixpoint (CB-T2: a no-op when the
+    // module records no emit generators — every program today). Runs before
+    // value folding: emission changes the program's *shape*, folding its values.
+    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dump-llvm: comptime emission failed: {e}");
+            std::process::exit(1);
+        }
+    };
     // Fold comptime call sites so the LLVM report reflects the real compiled
     // output (a no-op for programs without `[Comptime]`).
     if let Err(e) = newbf_comptime::fold_comptime(&mut module) {
@@ -405,7 +425,19 @@ fn compile(input: &str, output: Option<&str>) {
         .collect();
 
     let program = newbf_sema::analyze(&files);
-    let mut module = newbf_sema::lower_program(&files, &program);
+    let module = newbf_sema::lower_program(&files, &program);
+
+    // Drive comptime member emission to a fixpoint before codegen (CB-T2: a
+    // no-op when the module records no emit generators — every program today).
+    // Emission changes the program's *shape* (new members); it must run before
+    // value folding, which collapses values.
+    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("compile: comptime emission failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Evaluate `[Comptime]` functions and fold their call sites into literals
     // (then drop them) before codegen — they are compile-time-only.

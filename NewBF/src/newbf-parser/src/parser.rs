@@ -4127,6 +4127,49 @@ mod tests {
         assert!(attr.args.is_empty(), "AlwaysInclude takes no args");
     }
 
+    /// CB-T2: `[EmitGenerator]` — the comptime member-emission generator marker
+    /// — must PARSE on a method and be RETRIEVABLE from that method's attribute
+    /// list (CB-T3 finds emit generators by this marker). It rides the existing
+    /// attribute grammar (no grammar change), exactly like `[Comptime]`. This
+    /// confirms both that `[Comptime, EmitGenerator]` parses cleanly and that the
+    /// `EmitGenerator` name is recoverable via `attr.name.span().text(src)` — the
+    /// same retrieval `has_comptime_attr` uses in sema.
+    #[test]
+    fn emit_generator_attribute_is_retrievable_on_a_method() {
+        let src = "\
+class Vec2 {
+    [Comptime, EmitGenerator]
+    public static void Generate() { }
+}";
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected a type declaration, got {:?}", unit.items[0]);
+        };
+        let Some(Member::Method { attributes, .. }) = td.members.first() else {
+            panic!("expected a method member, got {:?}", td.members.first());
+        };
+        // `[Comptime, EmitGenerator]` is one bracket → two attributes.
+        let names: Vec<&str> = attributes
+            .iter()
+            .map(|a| a.name.span().text(src))
+            .collect();
+        assert!(
+            names.contains(&"Comptime"),
+            "Comptime must be retrievable, got {names:?}"
+        );
+        assert!(
+            names.contains(&"EmitGenerator"),
+            "EmitGenerator must be retrievable, got {names:?}"
+        );
+        // The marker is bare (no args) — CB-T3 keys off the name alone.
+        let eg = attributes
+            .iter()
+            .find(|a| a.name.span().text(src) == "EmitGenerator")
+            .unwrap();
+        assert!(eg.args.is_empty(), "EmitGenerator takes no args");
+    }
+
     /// MX-T1: a mixin invocation `Foo!(x)` parses to `Expr::MixinCall`
     /// (callee `Foo`, no `::`, no type args, one arg `x`) — NOT a plain
     /// `Expr::Call` (the `!` is preserved as the mixin-ness).

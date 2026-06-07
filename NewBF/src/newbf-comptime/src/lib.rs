@@ -22,8 +22,14 @@
 //! bodies), and JITDylib + `ResourceTracker` world management — lands in
 //! Sprints 19–21. Reference: `E:\beef\IDEHelper\Compiler\CeMachine.cpp`.
 
+mod emit;
 mod eval;
 mod fold;
 
+pub use emit::{run_emission, EmitOutcome, __newbf_ct_emit};
 pub use eval::{eval_const, eval_const_i64, EvalError};
 pub use fold::fold_comptime;
+
+// Re-export the IR-side emit-job record so emission consumers (the driver,
+// CB-T3's sema integration) can name it via `newbf_comptime::EmitJob` too.
+pub use newbf_ir::EmitJob;

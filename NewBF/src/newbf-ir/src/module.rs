@@ -118,6 +118,26 @@ pub struct GlobalDef {
     pub ty: IrType,
 }
 
+/// A comptime member-emitting generator recorded by sema (comptime-breadth §4.1).
+///
+/// A `[Comptime, EmitGenerator]` static method that, when JIT-run at compile time,
+/// appends Beef *source text* to its owning type (re-parsed as an `extension
+/// Owner { … }` unit by the fixpoint loop). This record is **owned data only** —
+/// no lifetimes, and no `StructId` held across emission rounds — so [`IrType`]
+/// stays `Copy` and the cross-round routing key is the qualified name.
+///
+/// **CB-T2 declares this; CB-T3 populates `Module::emit_jobs`; CB-T4 consumes it**
+/// in `newbf_comptime::run_emission`. Empty `emit_jobs` ⇒ the emission loop is a
+/// no-op (the fast path), which is every current corpus program.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EmitJob {
+    /// The owner's qualified name, e.g. `"Demo.Vec2"` — the cross-round routing
+    /// key (StructIds shift between rounds, names do not).
+    pub owner_qual_name: String,
+    /// The generator's mangled symbol (a nullary `void` function) to JIT-run.
+    pub symbol: String,
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
     pub name: String,
@@ -136,6 +156,13 @@ pub struct Module {
     /// Populated by sema (RF-T3); emitted as Type globals by the backend
     /// (RF-T4). Dead until those tasks wire it.
     pub type_meta: Vec<TypeMeta>,
+    /// Comptime member-emitting generators recorded by sema (comptime-breadth
+    /// §4.1). **Default empty** — empty ⇒ `newbf_comptime::run_emission` is a
+    /// no-op (the fast path), so every generator-free program pays nothing.
+    /// **CB-T3 populates this**; CB-T4's fixpoint loop drives each job. Held as
+    /// owned data (no lifetimes, no cross-round `StructId`) so [`IrType`] stays
+    /// `Copy`.
+    pub emit_jobs: Vec<EmitJob>,
 }
 
 impl Module {
@@ -148,6 +175,7 @@ impl Module {
             globals: Vec::new(),
             comptime: Vec::new(),
             type_meta: Vec::new(),
+            emit_jobs: Vec::new(),
         }
     }
 

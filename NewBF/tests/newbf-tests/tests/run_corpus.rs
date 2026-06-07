@@ -40,6 +40,11 @@ fn run(src: &str) -> i32 {
     }];
     let program = analyze(&files);
     let module = lower_program(&files, &program);
+    // Drive comptime member emission to a fixpoint (CB-T2: a no-op fast path for
+    // every current corpus program — none records an emit generator, so the
+    // module passes through verbatim and behavior is unchanged).
+    let (module, _emit) =
+        newbf_comptime::run_emission(module).expect("comptime emission succeeds");
     let jit = OrcJit::from_ir(&module).expect("jit builds");
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     // SAFETY: corpus entries are `static int32 Main()` — a nullary `i32` fn.
