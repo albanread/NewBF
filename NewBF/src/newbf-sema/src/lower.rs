@@ -658,9 +658,14 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
             Item::Namespace {
                 body: Some(body), ..
             } => index_generic_decls(body, src, out),
-            // Generic value structs / classes — and generic *simple payload enums*
-            // (`Option<T>`), which monomorphize into tagged-union structs the same
+            // Generic value structs / classes — and generic *layoutable payload
+            // enums* (`Option<T>`, and MX-T4.5 `Result<T,E>` with instance methods
+            // like `Unwrap`), which monomorphize into tagged-union structs the same
             // way (their `struct_kind` is `None`, so name them explicitly).
+            // `enum_is_layoutable` (not `enum_is_simple`) so a method/property-
+            // bearing generic payload enum is collected — its methods then emit at
+            // the mono id like any generic type's, the precondition for a generic
+            // enum *instance* method that `switch (this)` to monomorphize + run.
             // Generic *interfaces* are EXCLUDED (itables.md §6/§10): they stay on
             // the generic-constraint static path and are never monomorphized in
             // v1, so `IFaceD<int16>` must resolve to `Ptr` (the unregistered
@@ -672,7 +677,7 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
                     && (struct_kind(td).is_some()
                         || (td.kind == TypeKind::Enum
                             && enum_has_payload(td)
-                            && enum_is_simple(td))) =>
+                            && enum_is_layoutable(td))) =>
             {
                 out.entry(td.name.text(src).to_string())
                     .or_insert((td, src));
@@ -2556,6 +2561,21 @@ fn enum_pattern(pat: &Expr, src: &str) -> Option<(String, Vec<Span>)> {
     }
 }
 
+/// Whether `e` is the `default` value expression — bare `default` (which parses
+/// to `Expr::Ident("default")`, since `default` is a prefix keyword treated as a
+/// primary) or `default(T)` (an `Expr::Call` on that ident). Used to give a
+/// target-typed `default` a proper zero (MX-T4.5 `.Err → default`) instead of
+/// the unresolved-ident `undef`.
+fn is_default_expr(e: &Expr, src: &str) -> bool {
+    match e {
+        Expr::Ident(s) => s.text(src) == "default",
+        Expr::Call { callee, .. } => {
+            matches!(&**callee, Expr::Ident(s) if s.text(src) == "default")
+        }
+        _ => false,
+    }
+}
+
 fn register_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
     // Record EVERY enum's case→value table (the int-backed view). A payload-bearing
     // enum may *also* be reclassified as a tagged-union struct by
@@ -2617,24 +2637,14 @@ fn register_payload_enums(items: &[Item], src: &str, t: &mut StructTable) {
     }
 }
 
-/// Whether an enum is a *simple* tagged union we can lay out: every member is a
-/// case (no methods/properties/ctors on the enum) and it has no base/interface.
-/// Method-bearing enums (e.g. corlib `Result<T> : IDisposable`) stay int-backed —
-/// reclassifying them would strand their methods, which we don't lower yet.
-fn enum_is_simple(td: &TypeDecl) -> bool {
-    td.bases.is_empty()
-        && td
-            .members
-            .iter()
-            .all(|m| matches!(m, Member::EnumCase { .. }))
-}
-
-/// Whether a *non-generic* payload enum can be laid out as a tagged-union struct
-/// that also carries methods: no base/interface, and every member is a case or a
-/// method (so we can register and emit those methods, e.g. `Option`'s
-/// `GetValueOrDefault`). A base-bearing enum (corlib `Result<T> : IDisposable`)
-/// stays int-backed, exactly as before. Looser than [`enum_is_simple`], which
-/// still gates the *generic* monomorphization path (cases only).
+/// Whether a payload enum can be laid out as a tagged-union struct that also
+/// carries methods: no base/interface, and every member is a case, a method, or
+/// a computed (body-having) property (so we can register and emit those members,
+/// e.g. `Option`'s `GetValueOrDefault`, MX-T4.5 `Result<T,E>`'s `Unwrap`). A
+/// base-bearing enum (corlib `Result<T> : IDisposable`) stays int-backed, exactly
+/// as before. Gates both the non-generic layout (`register_payload_enum_type`)
+/// and the generic monomorphization path (`index_generic_decls` /
+/// `register_payload_enum_mono`).
 fn enum_is_layoutable(td: &TypeDecl) -> bool {
     td.bases.is_empty()
         && td.members.iter().all(|m| match m {
@@ -2800,7 +2810,12 @@ fn register_payload_enum_mono(
     env: TyEnv,
     t: &mut StructTable,
 ) {
-    if !(enum_has_payload(td) && enum_is_simple(td)) {
+    // `enum_is_layoutable` (not `enum_is_simple`) so a method/property-bearing
+    // generic payload enum (MX-T4.5 `Result<T,E>` with `Unwrap`) still gets its
+    // `{$disc, $p0…}` tagged-union layout + `enum_cases` + `payload_enums` entry
+    // at the mono id — matching the non-generic layoutable path (register_payload_
+    // enum_type). Methods are emitted by the generic-type mono machinery.
+    if !(enum_has_payload(td) && enum_is_layoutable(td)) {
         return;
     }
     // Collect cases (payload types resolved through the mono env).
@@ -6934,11 +6949,14 @@ impl<'a> Lowerer<'a> {
                 // switch; `continue` still targets the enclosing loop.
                 let (sv, st) = self.expr(scrutinee, src);
                 // Payload-enum `match`: a discriminant test per arm + payload
-                // binding, instead of the scalar value-equality chain below.
-                if let IrType::Struct(eid) = st
+                // binding, instead of the scalar value-equality chain below. The
+                // scrutinee is either the enum value (`Struct(eid)`) or a pointer
+                // to it (`Ref(eid)` — `switch (this)` in an enum instance method,
+                // the MX-T4.5 shape); both route to the payload match.
+                if let IrType::Struct(eid) | IrType::Ref(eid) = st
                     && self.structs.enum_cases.contains_key(&eid)
                 {
-                    self.lower_enum_match(sv, eid, arms, src);
+                    self.lower_enum_match(sv, st, eid, arms, src);
                     return;
                 }
                 let exit = self.fb.create_block("switch.exit");
@@ -8326,6 +8344,14 @@ impl<'a> Lowerer<'a> {
         {
             return Some(r);
         }
+        // MX-T4.5: `default` / `default(T)` in a target-typed position (a
+        // `return default` in a `Result<T,E>.Unwrap()` `.Err` arm, a typed local
+        // init, a typed arg) yields the zeroed target type — the design's
+        // `.Err → default` (zeroed `T`). Without this it falls through to
+        // `Expr::Ident("default")` → `undef(I64)` (garbage when coerced).
+        if is_default_expr(e, src) {
+            return Some((zero_of(target), target));
+        }
         self.try_target_typed_enum(target, e, src)
             .or_else(|| self.try_target_typed_tuple(target, e, src))
             .or_else(|| self.try_target_typed_ctor(target, e, src))
@@ -8874,14 +8900,28 @@ impl<'a> Lowerer<'a> {
     /// case discriminant; in a matched arm, bind its payload fields (`$p{j}`) to the
     /// pattern's binding names before running the body. Mirrors the value-switch's
     /// block + `break` structure (a patternless arm is the default; no fallthrough).
-    fn lower_enum_match(&mut self, sv: Value, id: StructId, arms: &[SwitchArm], src: &str) {
+    ///
+    /// The scrutinee may be the enum *value* (`Struct(id)` — a local/field) or a
+    /// *pointer* to it (`Ref(id)` — `this` inside an enum instance method, the
+    /// MX-T4.5 `switch (this)` shape). Both resolve to a body address: a value is
+    /// spilled into a fresh slot; a pointer is already the body address. Mirrors
+    /// `case_test`'s value/pointer handling so a generic enum instance method that
+    /// `switch (this)` lowers + monomorphizes + binds payloads correctly.
+    fn lower_enum_match(&mut self, sv: Value, sty: IrType, id: StructId, arms: &[SwitchArm], src: &str) {
         let i32t = IrType::Int {
             bits: 32,
             signed: true,
         };
-        let sty = IrType::Struct(id);
-        let slot = self.fb.alloca(sty);
-        self.fb.store(slot.clone(), sv);
+        let slot = match sty {
+            // A pointer scrutinee (`switch (this)`) is already the body address.
+            IrType::Ref(_) => sv,
+            // A value scrutinee is spilled so its fields are addressable.
+            _ => {
+                let slot = self.fb.alloca(IrType::Struct(id));
+                self.fb.store(slot.clone(), sv);
+                slot
+            }
+        };
         let disc_addr = self.fb.field_addr(slot.clone(), id, 0);
         let disc = self.fb.load(disc_addr, i32t);
 
