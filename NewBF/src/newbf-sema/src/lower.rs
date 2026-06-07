@@ -3379,6 +3379,50 @@ struct MethodSig {
     variadic: Option<IrType>,
 }
 
+/// Whether `e` is a *target-typed pending* expression: a leading-dot dot-form
+/// whose `IrType` is not known without a target type to construct it against.
+/// Pure, no `self`, no emission, O(1) — a syntactic shape check only. This is
+/// the single classification point for the targeted-call-args feature (§3.1).
+///
+/// Returns `true` for the three pending shapes:
+///   - `Expr::DotIdent` — a bare `.Case`.
+///   - `Expr::Call { callee: Expr::DotIdent, .. }` — covers *both* `.(args)`
+///     (the ctor shorthand, callee name `"."`) *and* `.Case(args)` (an enum
+///     case); we match the `DotIdent` callee regardless of its name, so an
+///     *ambiguous* `.Case(payload)` is classified pending and can be resolved
+///     against the now-known param type (§3.1 classification note).
+///   - `Expr::Initializer { base: Expr::DotIdent, .. }` — the `.{ … }` form.
+///
+/// Returns `false` for everything else, including: ordinary expressions; a bare
+/// `Expr::Tuple` (concrete for the first slice — it evaluates via `build_tuple`,
+/// §3.6); `ref`/`out` (a `Prefix`, which never wraps a pending form since a
+/// dot-form is never an lvalue); and a *qualified* `Enum.Case(…)` / `Type.{ … }`
+/// (those have a concrete base and resolve without a target).
+///
+/// `src` is unused in the first slice but kept in the signature: when
+/// `Expr::Named` (named call args) lands, this is the one place to look through
+/// `Named` to its value (§5.1 / §10).
+// TA-1 lands this classifier as the feature foundation; its first *production*
+// caller is the `has_pending` fork wired at the call sites in TA-2/TA-3. Until
+// then it is exercised only by the `arg_is_pending_classifies_dot_forms` unit
+// test, so `allow(dead_code)` keeps the build warning-clean (the standing gate).
+#[allow(dead_code)]
+fn arg_is_pending(e: &Expr, _src: &str) -> bool {
+    match e {
+        // bare `.Case`
+        Expr::DotIdent { .. } => true,
+        // `.{ … }` (a `DotIdent`-based initializer; `new T() { … }` / `Type { … }`
+        // have a concrete base and stay concrete).
+        Expr::Initializer { base, .. } => matches!(&**base, Expr::DotIdent { .. }),
+        // BOTH `.(args)` (callee name `"."`) and `.Case(args)` (callee a case
+        // name): match the `DotIdent` callee regardless of its name. A qualified
+        // `Enum.Case(args)` has a `Member`/`Ident` callee, not a `DotIdent`, so
+        // it stays concrete.
+        Expr::Call { callee, .. } => matches!(&**callee, Expr::DotIdent { .. }),
+        _ => false,
+    }
+}
+
 /// Pick the best-matching overload from `cands` (all sharing a name) for the
 /// given argument types — the receiver is *not* among `arg_tys`. An instance
 /// candidate matches against its params past the leading `this`; it's eligible
@@ -4247,12 +4291,7 @@ impl<'a> Lowerer<'a> {
                 let (init_val, init_ty) = match init {
                     Some(e) => {
                         let (v, t) = declared
-                            .and_then(|target| {
-                                self.try_target_typed_enum(target, e, src)
-                                    .or_else(|| self.try_target_typed_tuple(target, e, src))
-                                    .or_else(|| self.try_target_typed_ctor(target, e, src))
-                                    .or_else(|| self.try_target_typed_initializer(target, e, src))
-                            })
+                            .and_then(|target| self.lower_arg_targeted(target, e, src))
                             .unwrap_or_else(|| self.expr(e, src));
                         (Some(v), Some(t))
                     }
@@ -4310,13 +4349,14 @@ impl<'a> Lowerer<'a> {
                     None
                 } else {
                     value.as_ref().map(|e| {
-                        // Target-type a `.Some(x)` / `.(args)` return against the
-                        // function's return type before falling back to a plain eval.
+                        // Target-type a `.Some(x)` / `.(args)` / `(a,b)` / `.{ }`
+                        // return against the function's return type before falling
+                        // back to a plain eval — via the one canonical try-order.
+                        let ret_ty = self.ret_ty;
                         let (v, t) = self
-                            .try_target_typed_enum(self.ret_ty, e, src)
-                            .or_else(|| self.try_target_typed_ctor(self.ret_ty, e, src))
+                            .lower_arg_targeted(ret_ty, e, src)
                             .unwrap_or_else(|| self.expr(e, src));
-                        self.coerce(v, t, self.ret_ty)
+                        self.coerce(v, t, ret_ty)
                     })
                 };
                 // The return value is captured (above) *before* `defer`s run, so a
@@ -5867,6 +5907,37 @@ impl<'a> Lowerer<'a> {
         ))
     }
 
+    /// Lower `e` *target-typed against `target`* — the single canonical path for
+    /// every target-typed dot-form construction site (local-init, assignment RHS,
+    /// `return`, and — from TA-2 on — call arguments). Tries the four
+    /// `try_target_typed_*` constructors in the canonical order
+    /// **enum → tuple → ctor → initializer** and returns the first that fires;
+    /// `None` if `e` is not a recognized dot-form for `target` (the caller then
+    /// falls back to a plain `self.expr(e, src)`).
+    ///
+    /// The order is immaterial for correctness (§3.5): the four guards are
+    /// pairwise disjoint on the `Expr` shape — `try_target_typed_enum` fires only
+    /// on `DotIdent` / `Call(DotIdent)`, `try_target_typed_tuple` only on
+    /// `Expr::Tuple`, `try_target_typed_ctor` only on `Call(DotIdent ".")`, and
+    /// `try_target_typed_initializer` only on `Expr::Initializer` — so no single
+    /// expression can match two of them. (The enum and ctor guards both look at
+    /// `Call(DotIdent)`, but enum requires `target` be a payload-enum struct while
+    /// ctor requires the callee name be exactly `"."`; for a `.(args)` against a
+    /// non-enum struct only ctor fires, and for a `.Case(args)` only enum fires.)
+    /// This is the single source of truth for the try-order; the three existing
+    /// sites now delegate here (§9 Task 1).
+    fn lower_arg_targeted(
+        &mut self,
+        target: IrType,
+        e: &Expr,
+        src: &str,
+    ) -> Option<(Value, IrType)> {
+        self.try_target_typed_enum(target, e, src)
+            .or_else(|| self.try_target_typed_tuple(target, e, src))
+            .or_else(|| self.try_target_typed_ctor(target, e, src))
+            .or_else(|| self.try_target_typed_initializer(target, e, src))
+    }
+
     /// Construct a `.Case(args)` / bare `.Case` initializer against a *known
     /// target type* (a local's declared type, a return type). Unlike
     /// [`Self::try_enum_construct_dot`] this resolves the enum by the target — not
@@ -6881,8 +6952,21 @@ impl<'a> Lowerer<'a> {
         (self.fb.load(slot, ty), ty)
     }
 
-    /// A target-typed `.{ field = value }` initializer on a `Stmt::Local` whose
-    /// declared type is `target`. `None` if the init isn't an `Initializer`.
+    /// A target-typed `.{ field = value }` initializer against a known `target`
+    /// (a local's declared type, an assignment place, a return type). `None` if
+    /// `e` isn't an `Initializer`.
+    ///
+    /// **TA-1 silent-undef fix (§3.4 / §2 critical asymmetry):** a *leading-dot*
+    /// `.{ }` (a `DotIdent` base) only has a meaning the first slice can build for
+    /// a **value struct** `Struct(id)`. For any other target — notably a `Ref(id)`
+    /// (class) — `lower_initializer` used to return a silent `(undef(Ref(id)),
+    /// Ref(id))` that the `.or_else` chain accepted, masking a real hole. We now
+    /// **decline** (return `None`) for a `.{ }` whose target isn't `Struct(id)`,
+    /// mirroring `try_target_typed_ctor`'s `Struct(id)` gate, so the caller falls
+    /// through to its plain path instead of accepting an undef. (`.{ }` against a
+    /// class — `new`-allocate + run field inits + assign entries — is a documented
+    /// follow-up, §10.) A concrete-base initializer (`new T() { … }` / `Type
+    /// { … }`) is unaffected: it never hit the undef arm and still lowers here.
     fn try_target_typed_initializer(
         &mut self,
         target: IrType,
@@ -6890,6 +6974,11 @@ impl<'a> Lowerer<'a> {
         src: &str,
     ) -> Option<(Value, IrType)> {
         if let Expr::Initializer { base, entries, .. } = e {
+            // Decline a leading-dot `.{ }` whose target is not a value struct —
+            // the only shape `lower_initializer` would answer with a silent undef.
+            if matches!(&**base, Expr::DotIdent { .. }) && !matches!(target, IrType::Struct(_)) {
+                return None;
+            }
             return Some(self.lower_initializer(base, entries, Some(target), src));
         }
         None
@@ -7553,10 +7642,7 @@ impl<'a> Lowerer<'a> {
             && let Some((slot, ty)) = self.lvalue(target, src)
         {
             let (rhs, rhs_ty) = self
-                .try_target_typed_enum(ty, value, src)
-                .or_else(|| self.try_target_typed_ctor(ty, value, src))
-                .or_else(|| self.try_target_typed_tuple(ty, value, src))
-                .or_else(|| self.try_target_typed_initializer(ty, value, src))
+                .lower_arg_targeted(ty, value, src)
                 .unwrap_or_else(|| self.expr(value, src));
             let rhs = self.coerce(rhs, rhs_ty, ty);
             self.fb.store(slot, rhs.clone());
@@ -8800,5 +8886,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TA-1: `arg_is_pending` classifies exactly the target-typed dot-forms whose
+    /// `IrType` is unknown without a target. The pending shapes (`.X`, `.{ … }`,
+    /// `.(args)`, `.Case(args)`) are `true`; ordinary exprs, `ref x`, a bare
+    /// `Expr::Tuple`, and a *qualified* `Enum.Case(args)` are `false`. The check is
+    /// purely syntactic, so the `Expr`s are built directly (no parser dependency).
+    #[test]
+    fn arg_is_pending_classifies_dot_forms() {
+        let f = FileId(0);
+        // A dummy span; `arg_is_pending` is structural and never reads the text.
+        let sp = Span::new(f, 0, 0);
+        let dot = || Box::new(Expr::DotIdent { span: sp, name: sp });
+
+        // `.X` — bare dot-case → pending.
+        let bare_case = Expr::DotIdent { span: sp, name: sp };
+        // `.{ … }` — DotIdent-based initializer → pending.
+        let dot_init = Expr::Initializer {
+            span: sp,
+            base: dot(),
+            entries: vec![],
+        };
+        // `.(args)` — ctor shorthand, callee is a `DotIdent` → pending.
+        let dot_ctor = Expr::Call {
+            span: sp,
+            callee: dot(),
+            args: vec![],
+        };
+        // `.Some(40)` — case call, callee is a `DotIdent` → pending (covers the
+        // ambiguous `.Case(payload)` the param type is needed to resolve).
+        let dot_case_call = Expr::Call {
+            span: sp,
+            callee: dot(),
+            args: vec![Expr::Int(sp)],
+        };
+
+        assert!(arg_is_pending(&bare_case, ""), ".X is pending");
+        assert!(arg_is_pending(&dot_init, ""), ".{{ … }} is pending");
+        assert!(arg_is_pending(&dot_ctor, ""), ".(args) is pending");
+        assert!(arg_is_pending(&dot_case_call, ""), ".Some(40) is pending");
+
+        // An ordinary expression → concrete.
+        let ordinary = Expr::Ident(sp);
+        // `ref x` — a `Prefix`; never wraps a pending form (no lvalue) → concrete.
+        let ref_x = Expr::Prefix {
+            span: sp,
+            kw: PrefixKw::Ref,
+            qualifier: None,
+            operand: Box::new(Expr::Ident(sp)),
+        };
+        // A bare tuple `(a, b)` → concrete for the first slice (§3.6).
+        let tuple = Expr::Tuple {
+            span: sp,
+            elems: vec![Expr::Int(sp), Expr::Int(sp)],
+        };
+        // A *qualified* `Enum.Case(40)` — callee is a `Member`, not a `DotIdent`;
+        // it has a concrete base and resolves without a target → concrete.
+        let qualified_enum = Expr::Call {
+            span: sp,
+            callee: Box::new(Expr::Member {
+                span: sp,
+                base: Box::new(Expr::Ident(sp)),
+                name: sp,
+                conditional: false,
+            }),
+            args: vec![Expr::Int(sp)],
+        };
+
+        assert!(!arg_is_pending(&ordinary, ""), "an Ident is concrete");
+        assert!(!arg_is_pending(&ref_x, ""), "ref x is concrete");
+        assert!(!arg_is_pending(&tuple, ""), "a bare tuple is concrete");
+        assert!(
+            !arg_is_pending(&qualified_enum, ""),
+            "a qualified Enum.Case(args) is concrete"
+        );
     }
 }
