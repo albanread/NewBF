@@ -30,7 +30,7 @@ pub use module::{
     EmitJob, FieldDef, FieldMeta, GlobalDef, MethodMeta, Module, ReflectPolicy, StructDef,
     TypeMeta, VtableDef,
 };
-pub use print::format_ir;
+pub use print::{format_ir, format_reflection};
 pub use ty::{IrType, StructId};
 
 #[cfg(test)]

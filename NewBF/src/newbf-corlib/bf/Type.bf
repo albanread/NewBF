@@ -19,11 +19,13 @@
 // is wired by RF-T7. `mFieldCount`/`mMethodCount` are 0 when stripped, so
 // `GetFieldCount()` observes the strip differential.
 //
-// `mFields` is typed `FieldInfo*` (not `void*`): it points at the policy-gated
-// `[k x %FieldInfo]` array the backend emits, so `this.mFields[i]` strides by
-// `FieldInfo`'s ABI size (16 bytes — identical to `%struct.FieldInfo`) and
-// reads the i-th entry by copy. The ABI is unchanged — both `void*` and
-// `FieldInfo*` lower to a bare `ptr`; the typed form just lets us index it.
+// `mFields`/`mMethods` are typed `FieldInfo*`/`MethodInfo*` (not `void*`): each
+// points at the policy-gated `[k x %FieldInfo]` / `[m x %MethodInfo]` array the
+// backend emits, so `this.mFields[i]` / `this.mMethods[i]` stride by the
+// element's ABI size (FieldInfo 16 bytes, MethodInfo 24 bytes — identical to
+// `%struct.FieldInfo` / `%struct.MethodInfo`) and read the i-th entry by copy.
+// The ABI is unchanged — both `void*` and the typed pointer lower to a bare
+// `ptr`; the typed form just lets us index it.
 struct Type {
 	int32 mSize;
 	int32 mTypeId;
@@ -32,7 +34,7 @@ struct Type {
 	int32 mMethodCount;
 	char8* mName;
 	FieldInfo* mFields;
-	void* mMethods;
+	MethodInfo* mMethods;
 
 	// The type's simple name (a NUL-terminated `char8*` into .rodata). Compare
 	// it with `Internal.StrEq` (a char8*-vs-char8* compare), not String.Equals.
@@ -61,5 +63,22 @@ struct Type {
 		if (i < 0) { return empty; }
 		if (i >= this.mFieldCount) { return empty; }
 		return this.mFields[i];
+	}
+
+	// The i-th reflected method's metadata (RF-T7 — symmetric with GetField).
+	// Indexes the policy-gated `[m x %MethodInfo]` array `mMethods` points at;
+	// `mMethods[i]` strides by MethodInfo's ABI size. For an out-of-range `i`
+	// (i < 0 or i >= count) or a stripped/unmarked type (`mMethods == null`),
+	// returns a sentinel/empty MethodInfo (NUL name+symbol, paramCount -1) rather
+	// than dereferencing out of bounds — never faults (reflection.md §9 RF-T7).
+	public MethodInfo GetMethod(int32 i) {
+		MethodInfo empty;
+		empty.mName = null;
+		empty.mSymbol = null;
+		empty.mParamCount = -1;
+		if (this.mMethods == null) { return empty; }
+		if (i < 0) { return empty; }
+		if (i >= this.mMethodCount) { return empty; }
+		return this.mMethods[i];
 	}
 }

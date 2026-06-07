@@ -1,0 +1,12 @@
+reflection report: 5 types
+type Animal [TYPE|FIELDS|METHODS] kind=ref fields=1 methods=1
+    field mAge idx=1 ty=i32
+    method Speak sym=Animal.Speak params=0
+type Plain [TYPE] kind=ref fields=0 methods=0
+type Point [TYPE|FIELDS] kind=ref fields=2 methods=0
+    field mX idx=1 ty=i32
+    field mY idx=2 ty=i32
+type Program [TYPE] kind=ref fields=0 methods=0
+type Widget [TYPE|METHODS] kind=ref fields=0 methods=2
+    method Area sym=Widget.Area params=0
+    method Width sym=Widget.Width params=0

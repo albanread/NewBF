@@ -13894,6 +13894,61 @@ mod tests {
         );
     }
 
+    /// RF-T7: the corlib `MethodInfo` value-`struct`'s lowered layout MUST be
+    /// ABI-identical to the `%struct.MethodInfo` aggregate `emit_metadata` writes:
+    ///   { ptr, ptr, i32 } = { mName(char8*), mSymbol(char8*), mParamCount }
+    /// As a `struct` (not a class) `MethodInfo` carries NO `$header`, so field 0
+    /// is `mName` and the struct's ABI size (24 bytes) matches the array element
+    /// the backend packs — so `Type.mMethods[i]` (a `MethodInfo*` index) strides
+    /// correctly over the emitted `[m x %MethodInfo]` array. If this drifts,
+    /// `typeof(T).GetMethod(i)` reads the wrong entry. Symmetric with the RF-T6
+    /// FieldInfo layout test.
+    #[test]
+    fn corlib_methodinfo_layout_matches_struct_methodinfo_aggregate() {
+        let src = "class Program { public static int32 Main() { return 0; } }";
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // The corlib `MethodInfo` struct (registered by the prelude).
+        let mi = module
+            .structs
+            .iter()
+            .find(|s| s.name == "MethodInfo" || s.name.ends_with(".MethodInfo"))
+            .unwrap_or_else(|| panic!(
+                "corlib `MethodInfo` struct present (have: {:?})",
+                module.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+            ));
+
+        // The exact field IR types `emit_metadata`'s `%struct.MethodInfo` uses, in
+        // order. A value struct has NO `$header`, so field 0 is `mName`.
+        let expected: [IrType; 3] = [
+            IrType::Ptr, // mName : char8*
+            IrType::Ptr, // mSymbol : char8*
+            IrType::I32, // mParamCount
+        ];
+        assert_eq!(
+            mi.fields.len(),
+            expected.len(),
+            "corlib `MethodInfo` field count must match %struct.MethodInfo (no $header): got {:?}",
+            mi.fields.iter().map(|f| (&f.name, f.ty)).collect::<Vec<_>>()
+        );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                mi.fields[i].ty, *want,
+                "corlib `MethodInfo` field {} ({}) IR type must match %struct.MethodInfo",
+                i, mi.fields[i].name
+            );
+        }
+        // The first field must NOT be a `$header` (the value-struct guarantee).
+        assert_ne!(
+            mi.fields[0].name, "$header",
+            "corlib `MethodInfo` must be a value struct (no $header), else field indices shift"
+        );
+    }
+
     /// CB-T3: a `[Comptime, EmitGenerator]` method must (a) record an `EmitJob`
     /// keyed by its owner's qualified name + its mangled symbol, (b) STILL appear
     /// in `module.comptime` (the generator is also a comptime fn — the strip/fold

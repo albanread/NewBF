@@ -22,10 +22,20 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         // value `struct` whose layout mirrors the emitted `%struct.FieldInfo`.
         // `Type.mFields` is `FieldInfo*`, so it must register BEFORE `Type.bf`.
         ("FieldInfo.bf", include_str!("../bf/FieldInfo.bf")),
+        // System.Reflection.MethodInfo — a reflected method's metadata (RF-T7). A
+        // value `struct` whose layout mirrors the emitted `%struct.MethodInfo`.
+        // `Type.mMethods` is `MethodInfo*`, so it must register BEFORE `Type.bf`.
+        ("MethodInfo.bf", include_str!("../bf/MethodInfo.bf")),
         // System.Type — the reflection metatype (RF-T4). A value `struct` whose
-        // layout mirrors the emitted `%struct.Type`; uses `char8*` + `FieldInfo`,
-        // so it lands after Internal/String/FieldInfo and before any consumer.
+        // layout mirrors the emitted `%struct.Type`; uses `char8*` + `FieldInfo`
+        // + `MethodInfo`, so it lands after Internal/String/FieldInfo/MethodInfo
+        // and before any consumer.
         ("Type.bf", include_str!("../bf/Type.bf")),
+        // System.Reflection stubs (RF-T7): the `BindingFlags` flag-enum stub,
+        // plus a doc note reconciling the global metatype `MethodInfo` as the
+        // facade's `System.Reflection.MethodInfo` (simple-name dedup would drop a
+        // namespaced redeclaration). Rides the prelude; no consumer in v1.
+        ("Reflection.bf", include_str!("../bf/Reflection.bf")),
         // System.Compiler — the comptime emission surface (comptime-breadth
         // §3.2, CB-T3). A `static class` whose `EmitTypeBody(text)` call sema
         // rewrites to the `__newbf_ct_emit` host shim; rides the prelude like
