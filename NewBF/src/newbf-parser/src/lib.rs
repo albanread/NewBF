@@ -95,6 +95,23 @@ mod tests {
                 s.push(')');
                 s
             }
+            Expr::MixinCall {
+                callee,
+                type_args,
+                args,
+                ..
+            } => {
+                let mut s = format!("(mixin-call {}", sx(src, callee));
+                for t in type_args {
+                    s.push_str(&format!(" <{}>", sxt(src, t)));
+                }
+                for a in args {
+                    s.push(' ');
+                    s.push_str(&sx(src, a));
+                }
+                s.push(')');
+                s
+            }
             Expr::Index { base, args, .. } => {
                 let mut s = format!("(index {}", sx(src, base));
                 for a in args {
@@ -324,6 +341,9 @@ mod tests {
             Stmt::Defer { body, .. } => format!("(defer {})", sxs(src, body)),
             Stmt::LocalFunction { name, body, .. } => {
                 format!("(fn {} {})", name.text(src), sxs(src, body))
+            }
+            Stmt::MixinDecl { name, body, .. } => {
+                format!("(mixin {} {})", name.text(src), sxs(src, body))
             }
             Stmt::Switch {
                 scrutinee, arms, ..

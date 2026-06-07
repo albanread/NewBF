@@ -145,6 +145,27 @@ impl Printer<'_> {
                     self.expr(a, d + 2);
                 }
             }
+            Expr::MixinCall {
+                callee,
+                scope_qualifier,
+                type_args,
+                args,
+                ..
+            } => {
+                let q = if *scope_qualifier { "::" } else { "" };
+                self.line(d, &format!("MixinCall{q}"));
+                self.labeled_expr(d + 1, "callee", callee);
+                if !type_args.is_empty() {
+                    self.line(d + 1, "type_args:");
+                    for t in type_args {
+                        self.ty(t, d + 2);
+                    }
+                }
+                self.line(d + 1, "args:");
+                for a in args {
+                    self.expr(a, d + 2);
+                }
+            }
             Expr::Index { base, args, .. } => {
                 self.line(d, "Index");
                 self.labeled_expr(d + 1, "base", base);
@@ -551,6 +572,37 @@ impl Printer<'_> {
                 }
                 self.method_body(body, d + 1);
             }
+            Member::Mixin {
+                attributes,
+                modifiers,
+                name,
+                generic_params,
+                params,
+                body,
+                ..
+            } => {
+                self.attrs(attributes, d);
+                let mods = mods_string(modifiers);
+                let head = if mods.is_empty() {
+                    format!("Mixin {}", self.txt(*name))
+                } else {
+                    format!("Mixin [{mods}] {}", self.txt(*name))
+                };
+                self.line(d, &head);
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+                self.method_body(body, d + 1);
+            }
             Member::Constructor {
                 attributes,
                 modifiers,
@@ -827,6 +879,29 @@ impl Printer<'_> {
                 }
                 self.line(d + 1, "returns:");
                 self.ty(return_ty, d + 2);
+                if !params.is_empty() {
+                    self.line(d + 1, "params:");
+                    for p in params {
+                        self.param(p, d + 2);
+                    }
+                }
+                self.line(d + 1, "body:");
+                self.stmt(body, d + 2);
+            }
+            Stmt::MixinDecl {
+                name,
+                generic_params,
+                params,
+                body,
+                ..
+            } => {
+                self.line(d, &format!("MixinDecl {}", self.txt(*name)));
+                if !generic_params.is_empty() {
+                    self.line(d + 1, "generics:");
+                    for g in generic_params {
+                        self.line(d + 2, &format!("GP {}", self.txt(g.name)));
+                    }
+                }
                 if !params.is_empty() {
                     self.line(d + 1, "params:");
                     for p in params {

@@ -297,6 +297,43 @@ impl Builder {
                         span: *span,
                     })));
                 }
+                // A member mixin (mixins.md §3.1). MX-T1 keeps the *model*
+                // identical to the pre-MX-T1 world, where a member mixin was a
+                // `Member::Method { return_ty: Type::Error, … }`: register it as
+                // a `MethodKind::Method` with an `Error` return type and no
+                // explicit interface. Sema's mixin expansion (MX-T3) reads the
+                // mixin from the parser AST, not this model entry, so this
+                // registration is purely behavior-preserving for `analyze`'s
+                // diagnostics. (No mixin expansion happens in MX-T1.)
+                Member::Mixin {
+                    span,
+                    attributes,
+                    modifiers,
+                    name,
+                    generic_params,
+                    params,
+                    body,
+                } => {
+                    let ret = self.lower_type(&Type::Error(*name), f);
+                    let attrs = self.lower_attrs(attributes, f);
+                    let gps = self.lower_generic_params(generic_params, f);
+                    let params = self.lower_params(params, f);
+                    let name_sym = self.interner.intern(name.text(f.src));
+                    member_ids.push(self.push_member(MemberDef::Method(MethodDef {
+                        owner: tid,
+                        name: name_sym,
+                        method_kind: MethodKind::Method,
+                        modifiers: strip_mods(modifiers),
+                        attributes: attrs,
+                        return_ty: Some(ret),
+                        generic_params: gps,
+                        params,
+                        constraints: Vec::new(),
+                        body: body_kind(body),
+                        explicit_iface: None,
+                        span: *span,
+                    })));
+                }
                 Member::Constructor {
                     span,
                     attributes,

@@ -1947,6 +1947,64 @@ fn collect_insts_stmt<'a>(
     }
 }
 
+/// Record the generic-type/method monomorphs a `base<args>` call form demands
+/// (factored out of `collect_insts_expr`'s `Expr::Generic` arm so the MX-T1
+/// `Expr::MixinCall { type_args, .. }` form — which carries the same `(base,
+/// args)` shape — reproduces the identical recording). `base` is the callee
+/// (`Ident` for a bare/qualified-static call, `Member` for an instance/qualified
+/// call); `args` are the generic type args.
+#[allow(clippy::too_many_arguments)] // recursive collector: threaded visitor state
+fn collect_insts_gen_call<'a>(
+    base: &Expr,
+    args: &[AstType],
+    src: &'a str,
+    generics: &GenericDecls<'a>,
+    gmethods: &GenMethodDecls<'a>,
+    t: &mut StructTable,
+    seen: &mut Vec<String>,
+    monos: &mut MonoList<'a>,
+    env: &[(String, IrType)],
+    cur_owner: Option<StructId>,
+    locals: &mut Vec<(String, IrType)>,
+) {
+    if let Expr::Ident(s) = base {
+        let name = s.text(src);
+        record_inst(name, args, src, generics, gmethods, t, seen, monos, env);
+        // Bare `M<T>(x)`: owner = the enclosing type if it declares `M`,
+        // else `None` (the retained bare-cross-class static bucket — e.g.
+        // `list_hof.bf`'s `Map`/`Filter`/`Fold`). Must match the call
+        // site's rule exactly (see `bare_gen_owner`).
+        let owner = bare_gen_owner(cur_owner, name, gmethods);
+        record_method_inst(name, args, src, gmethods, t, env, owner);
+    } else if let Expr::Member { name, base: mbase, .. } = base {
+        let mname = name.text(src);
+        // First try a *qualified static* call `Type.Method<Args>(…)`: the
+        // receiver names a registered type. Otherwise treat it as an
+        // *instance* call `recv.Method<Args>(…)` and resolve the receiver's
+        // concrete-owner `StructId` from the same shapes the call site's
+        // `struct_base` resolves (declared local/param, `this`,
+        // `this`-field, `new T()`) — R4: identical owner rule both passes.
+        let owner = if let Some(id) = qualified_gen_owner(mbase, src, t) {
+            Some(id)
+        } else {
+            let lookup = |n: &str| locals.iter().find(|(ln, _)| ln == n).map(|(_, ty)| *ty);
+            instance_recv_owner(mbase, src, &lookup, cur_owner, env, t)
+        };
+        // A `Member`-base call is *qualified-static* or *instance* — it is
+        // never a bare-cross-class `None`-bucket call. So record ONLY when
+        // the owner resolves to a concrete type; an unsupported instance
+        // receiver (`var` local, call-return, …) records NOTHING — a clean
+        // diagnosis (no `None`-bucket static mono, no dangling symbol),
+        // matching the call site, which emits no call for that shape.
+        if let Some(owner) = owner {
+            record_method_inst(mname, args, src, gmethods, t, env, Some(owner));
+        }
+        collect_insts_expr(
+            mbase, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        );
+    }
+}
+
 /// Walk an expression for generic instantiations in expression position —
 /// chiefly `new Name<Args>(…)` (where the `Name<Args>` is an `Expr::Generic`),
 /// so an instantiation reaches monomorphization even without a typed local.
@@ -1965,42 +2023,37 @@ fn collect_insts_expr<'a>(
 ) {
     match e {
         Expr::Generic { base, args, .. } => {
-            if let Expr::Ident(s) = &**base {
-                let name = s.text(src);
-                record_inst(
-                    name, args, src, generics, gmethods, t, seen, monos, env,
-                );
-                // Bare `M<T>(x)`: owner = the enclosing type if it declares `M`,
-                // else `None` (the retained bare-cross-class static bucket — e.g.
-                // `list_hof.bf`'s `Map`/`Filter`/`Fold`). Must match the call
-                // site's rule exactly (see `bare_gen_owner`).
-                let owner = bare_gen_owner(cur_owner, name, gmethods);
-                record_method_inst(name, args, src, gmethods, t, env, owner);
-            } else if let Expr::Member { name, base: mbase, .. } = &**base {
-                let mname = name.text(src);
-                // First try a *qualified static* call `Type.Method<Args>(…)`: the
-                // receiver names a registered type. Otherwise treat it as an
-                // *instance* call `recv.Method<Args>(…)` and resolve the receiver's
-                // concrete-owner `StructId` from the same shapes the call site's
-                // `struct_base` resolves (declared local/param, `this`,
-                // `this`-field, `new T()`) — R4: identical owner rule both passes.
-                let owner = if let Some(id) = qualified_gen_owner(mbase, src, t) {
-                    Some(id)
-                } else {
-                    let lookup = |n: &str| locals.iter().find(|(ln, _)| ln == n).map(|(_, ty)| *ty);
-                    instance_recv_owner(mbase, src, &lookup, cur_owner, env, t)
-                };
-                // A `Member`-base call is *qualified-static* or *instance* — it is
-                // never a bare-cross-class `None`-bucket call. So record ONLY when
-                // the owner resolves to a concrete type; an unsupported instance
-                // receiver (`var` local, call-return, …) records NOTHING — a clean
-                // diagnosis (no `None`-bucket static mono, no dangling symbol),
-                // matching the call site, which emits no call for that shape.
-                if let Some(owner) = owner {
-                    record_method_inst(mname, args, src, gmethods, t, env, Some(owner));
-                }
+            collect_insts_gen_call(
+                base, args, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+        }
+        // A mixin call `Name!(args)` / `Name!<T>(args)` (MX-T1). MX-T1 does NOT
+        // expand mixins, so for the collector this must behave EXACTLY as the
+        // pre-MX-T1 shapes it replaced: `Name!(args)` was an `Expr::Call`
+        // (recurse callee + args); `Name!<T>(args)` was a
+        // `Call { callee: Generic{base, args: T}, args }` (the generic-call
+        // recording on `(base, T)` plus the arg walk). Reproduce both so the
+        // same generic-type/method monomorphs are demanded and no symbol dangles
+        // (R7 — keeps `Mixins.bf`/`VarArgs.bf` verify-clean).
+        Expr::MixinCall {
+            callee,
+            type_args,
+            args,
+            ..
+        } => {
+            if type_args.is_empty() {
                 collect_insts_expr(
-                    mbase, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                    callee, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
+            } else {
+                collect_insts_gen_call(
+                    callee, type_args, src, generics, gmethods, t, seen, monos, env, cur_owner,
+                    locals,
+                );
+            }
+            for a in args {
+                collect_insts_expr(
+                    a, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
                 );
             }
         }
@@ -3304,6 +3357,13 @@ fn collect_lambdas_stmt<'a>(
                 collect_lambdas_stmt(d, src, structs, emits, inline);
             }
         }
+        // A statement-scope mixin declaration (MX-T1). Its body is NOT walked
+        // for lambdas/local-fns: mixin expansion is MX-T3, and a lambda inside a
+        // mixin body is a GATED shape there (`has_lambda_or_localfn`, mixins.md
+        // §6). This matches the pre-MX-T1 world exactly — a local mixin was a
+        // `Stmt::LocalFunction`, which this walker also never descended into
+        // (it fell to the wildcard). Intentional no-op for behavior preservation.
+        Stmt::MixinDecl { .. } => {}
         _ => {}
     }
     // FV-T6a: after the statement's own (local-init) lambda handling and nested
@@ -3397,6 +3457,10 @@ fn for_each_stmt_expr<'a>(stmt: &'a Stmt, f: &mut dyn FnMut(&'a Expr)) {
             for_each_stmt_expr(body, f);
         }
         Stmt::Defer { body, .. } => for_each_stmt_expr(body, f),
+        // A statement-scope mixin (MX-T1): its body's expressions are NOT fed to
+        // `f`. Matches the pre-MX-T1 local mixin (`Stmt::LocalFunction`), which
+        // this driver also skipped. Mixin-body walking is MX-T3. Intentional.
+        Stmt::MixinDecl { .. } => {}
         _ => {}
     }
 }
@@ -3434,6 +3498,18 @@ fn collect_lambdas_expr<'a>(
             collect_lambdas_in_body(body, src, structs, inline);
         }
         Expr::Call { callee, args, .. } => {
+            collect_lambdas_expr(callee, src, structs, inline);
+            for a in args {
+                collect_lambdas_expr(a, src, structs, inline);
+            }
+        }
+        // A mixin call (MX-T1) mirrors the old `Call`/`Generic` it replaced:
+        // walk the callee and every arg so an inline lambda in a mixin-call arg
+        // position (`Foo!(x => …)`) is still collected — behavior-preserving.
+        // `type_args` are TYPES, never expressions (like `Generic.args`), so
+        // they carry no lambda. (A lambda *inside a mixin body* is a separate,
+        // GATED concern handled in MX-T3 — mixins.md §6.)
+        Expr::MixinCall { callee, args, .. } => {
             collect_lambdas_expr(callee, src, structs, inline);
             for a in args {
                 collect_lambdas_expr(a, src, structs, inline);
@@ -3572,6 +3648,12 @@ fn collect_local_fns_stmt<'a>(
         | Stmt::For { body, .. }
         | Stmt::ForEach { body, .. }
         | Stmt::Defer { body, .. } => collect_local_fns_stmt(body, src, structs, emits),
+        // A statement-scope mixin (MX-T1). Its body is NOT collected for local
+        // functions: mixin expansion is MX-T3, where a local-fn inside a mixin
+        // body is a GATED shape (`has_lambda_or_localfn`, mixins.md §6). The
+        // pre-MX-T1 local mixin was a `Stmt::LocalFunction` this walker also
+        // never recursed into (it fell to the wildcard). Intentional no-op.
+        Stmt::MixinDecl { .. } => {}
         _ => {}
     }
 }
@@ -5505,7 +5587,15 @@ impl<'a> Lowerer<'a> {
                         .insert(name.text(src).to_string(), (sym, ret, ptys));
                 }
             }
-            // local-function, mixin — not in the kernel yet. Skipped (no IR
+            // A statement-scope mixin declaration (MX-T1). It emits NO IR — a
+            // mixin is spliced at its call sites, not lowered as a function.
+            // Mixin EXPANSION (splicing) is MX-T3; until then `Stmt::MixinDecl`
+            // is an intentional no-op. This matches the pre-MX-T1 verifiable
+            // behavior closely enough that `Mixins.bf` stays verify-clean: the
+            // declaration produces nothing, and each `Name!(args)` call site
+            // lowers via the `Expr::MixinCall` arm to the old verifiable path.
+            Stmt::MixinDecl { .. } => {}
+            // local-function — not in the kernel yet. Skipped (no IR
             // emitted), never panicking.
             _ => {}
         }
@@ -5635,6 +5725,12 @@ impl<'a> Lowerer<'a> {
                 bound.insert(name.text(src).to_string());
                 self.caps_stmt(body, src, bound, seen, caps);
             }
+            // A statement-scope mixin (MX-T1). Capture analysis (for a lambda
+            // closing over caller locals) does NOT descend into a mixin body:
+            // a lambda inside a mixin body is GATED in MX-T3 (mixins.md §6), and
+            // the pre-MX-T1 local mixin (`Stmt::LocalFunction`) was likewise not
+            // descended into here. Intentional no-op for behavior preservation.
+            Stmt::MixinDecl { .. } => {}
             _ => {}
         }
     }
@@ -5683,6 +5779,14 @@ impl<'a> Lowerer<'a> {
             Expr::Call { callee, args, .. }
             | Expr::Index {
                 base: callee, args, ..
+            }
+            // A mixin call (MX-T1) mirrors the old `Call` it replaced for
+            // capture analysis: walk callee + args so a lambda closing over a
+            // caller local used in a `Foo!(localVar)` arg still records the
+            // capture. `type_args` are types, not captured values. (MX-T3 may
+            // refine this when mixin bodies become first-class.)
+            | Expr::MixinCall {
+                callee, args, ..
             } => {
                 self.caps_expr(callee, src, bound, seen, caps);
                 for a in args {
@@ -5984,6 +6088,41 @@ impl<'a> Lowerer<'a> {
                 } else {
                     (undef(IrType::I64), IrType::I64)
                 }
+            }
+            // A mixin call `Name!(args)` / `scope::Name!(args)` /
+            // `Name!<T>(args)` (MX-T1). Mixin EXPANSION is MX-T3; here we only
+            // introduce the shape and IGNORE the mixin-ness, lowering to EXACTLY
+            // the verifiable path the pre-MX-T1 parse took. Before MX-T1 a
+            // `Name!(args)` was an `Expr::Call { callee, args }` and a
+            // `Name!<T>(args)` was a `Call { callee: Generic { base, args: T },
+            // args }` (the `!`/`::` were dropped). We reconstruct that exact old
+            // shape and delegate to the `Expr::Call` lowering, so the emitted IR
+            // is byte-identical to before — keeping `Mixins.bf`/`VarArgs.bf`
+            // verify-clean (R7). The `scope_qualifier` (`::`) was discarded by
+            // the old parser, so it is discarded here too. (MX-T3 replaces this
+            // arm with real `expand_mixin` before the unresolved-default.)
+            Expr::MixinCall {
+                span,
+                callee,
+                type_args,
+                args,
+                ..
+            } => {
+                let synthetic_callee: Expr = if type_args.is_empty() {
+                    (**callee).clone()
+                } else {
+                    Expr::Generic {
+                        span: *span,
+                        base: callee.clone(),
+                        args: type_args.clone(),
+                    }
+                };
+                let synthetic = Expr::Call {
+                    span: *span,
+                    callee: Box::new(synthetic_callee),
+                    args: args.clone(),
+                };
+                self.expr(&synthetic, src)
             }
             // Heap allocation / free.
             Expr::Prefix {

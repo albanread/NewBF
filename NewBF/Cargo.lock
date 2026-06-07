@@ -346,6 +346,7 @@ dependencies = [
  "inkwell",
  "llvm-sys",
  "newbf-ir",
+ "newbf-runtime",
 ]
 
 [[package]]

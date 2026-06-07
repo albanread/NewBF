@@ -537,32 +537,53 @@ impl<'a> Parser<'a> {
                         operand: Box::new(e),
                     };
                 }
-                // `name!(args)` — Beef mixin/macro invocation. Modeled as
-                // a Call for now (the `!` is lost at this phase). `name!::(…)`
-                // carries a `::` scope qualifier on the mixin.
+                // `name!(args)` — Beef mixin invocation, now an explicit
+                // `Expr::MixinCall` (mixins.md §3.1) so sema can see the `!`.
+                // `name!::(…)` carries a `::` scope qualifier on the mixin.
                 TokenKind::Bang
                     if matches!(self.nth_kind(1), TokenKind::LParen | TokenKind::ColonColon) =>
                 {
                     self.bump(); // !
-                    let _ = self.eat(TokenKind::ColonColon); // optional `::`
+                    let scope_qualifier = self.eat(TokenKind::ColonColon); // optional `::`
                     self.expect(TokenKind::LParen, "`(` for mixin call");
                     let args = self.arg_list(TokenKind::RParen);
                     self.expect(TokenKind::RParen, "`)` to close mixin call");
-                    e = Expr::Call {
+                    e = Expr::MixinCall {
                         span: self.finish(lo),
                         callee: Box::new(e),
+                        scope_qualifier,
+                        type_args: Vec::new(),
                         args,
                     };
                 }
-                // `name!<T>(args)` — forced generic mixin call (`Get!<int>()`).
-                // The `!` disambiguates, so the `<…>` is unambiguously a
-                // generic-arg list; the following `(` becomes the call.
+                // `name!<T>(args)` — generic mixin call (`Get!<int>()`). The `!`
+                // disambiguates, so the `<…>` is unambiguously a generic-arg
+                // list; the following `(args)` is the mixin's call args. This is
+                // the FOURTH emit site (mixins.md §3.1): it now produces an
+                // `Expr::MixinCall` with `type_args` populated (and consumes the
+                // `(args)` itself) so a generic mixin call routes to the same
+                // variant — instead of the old `Expr::Generic` that left the
+                // trailing `(args)` to a separate `Expr::Call` wrap.
                 TokenKind::Bang if matches!(self.nth_kind(1), TokenKind::Lt) => {
                     self.bump(); // !
-                    let args = self.type_args();
-                    e = Expr::Generic {
+                    let type_args = self.type_args();
+                    // The mixin's call args. A generic mixin call always has a
+                    // `(args)`; guard the `(` so a stray `name!<T>` (none in the
+                    // corpus) still yields a `MixinCall` rather than a spurious
+                    // diagnostic — behavior-preserving against the old `Generic`.
+                    let args = if self.at(TokenKind::LParen) {
+                        self.bump(); // (
+                        let args = self.arg_list(TokenKind::RParen);
+                        self.expect(TokenKind::RParen, "`)` to close generic mixin call");
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    e = Expr::MixinCall {
                         span: self.finish(lo),
-                        base: Box::new(e),
+                        callee: Box::new(e),
+                        scope_qualifier: false,
+                        type_args,
                         args,
                     };
                 }
@@ -614,6 +635,10 @@ impl<'a> Parser<'a> {
         match e {
             Expr::Generic { .. }
             | Expr::Call { .. }
+            // A mixin call mirrors the old `Call`/`Generic` it replaced: an
+            // initializer may follow unconditionally (none in the corpus, but
+            // behavior-preserving against the pre-MX-T1 shapes).
+            | Expr::MixinCall { .. }
             | Expr::Index { .. }
             | Expr::DotIdent { .. }
             | Expr::Prefix { .. } => true,
@@ -1381,9 +1406,8 @@ impl<'a> Parser<'a> {
                     self.expect(TokenKind::Semicolon, "mixin body");
                     Stmt::Empty(self.cur().span)
                 };
-                Stmt::LocalFunction {
+                Stmt::MixinDecl {
                     span: self.finish(lo),
-                    return_ty: Type::Var(name),
                     name,
                     generic_params,
                     params,
@@ -3134,17 +3158,14 @@ impl<'a> Parser<'a> {
             };
             let _ = self.where_clauses();
             let body = self.method_body();
-            return Member::Method {
+            return Member::Mixin {
                 span: self.finish(lo),
                 attributes,
                 modifiers,
-                return_ty: Type::Error(name),
                 name,
                 generic_params,
                 params,
-                constraints: Vec::new(),
                 body,
-                explicit_iface: None,
             };
         }
 
@@ -4104,5 +4125,138 @@ mod tests {
         let attr = &td.attributes[0];
         assert_eq!(attr.name.span().text(src), "AlwaysInclude");
         assert!(attr.args.is_empty(), "AlwaysInclude takes no args");
+    }
+
+    /// MX-T1: a mixin invocation `Foo!(x)` parses to `Expr::MixinCall`
+    /// (callee `Foo`, no `::`, no type args, one arg `x`) — NOT a plain
+    /// `Expr::Call` (the `!` is preserved as the mixin-ness).
+    #[test]
+    fn mixin_call_basic_parses_to_mixin_call() {
+        let src = "Foo!(x)";
+        let (e, diags) = parse_expr(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match e {
+            Expr::MixinCall {
+                callee,
+                scope_qualifier,
+                type_args,
+                args,
+                ..
+            } => {
+                assert!(
+                    matches!(&*callee, Expr::Ident(s) if s.text(src) == "Foo"),
+                    "callee must be the ident `Foo`, got {callee:?}"
+                );
+                assert!(!scope_qualifier, "no `::` in `Foo!(x)`");
+                assert!(type_args.is_empty(), "no type args in `Foo!(x)`");
+                assert_eq!(args.len(), 1, "exactly one arg");
+                assert!(
+                    matches!(&args[0], Expr::Ident(s) if s.text(src) == "x"),
+                    "the single arg must be `x`, got {:?}",
+                    args[0]
+                );
+            }
+            other => panic!("expected Expr::MixinCall, got {other:?}"),
+        }
+    }
+
+    /// MX-T1 (the FOURTH emit site): a generic mixin call `Foo!<T>(x)` parses to
+    /// `Expr::MixinCall` with `type_args` populated (and the `(x)` consumed into
+    /// `args`) — NOT the old `Expr::Generic`-wrapped form.
+    #[test]
+    fn generic_mixin_call_populates_type_args() {
+        let src = "Foo!<T>(x)";
+        let (e, diags) = parse_expr(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match e {
+            Expr::MixinCall {
+                callee,
+                type_args,
+                args,
+                ..
+            } => {
+                assert!(
+                    matches!(&*callee, Expr::Ident(s) if s.text(src) == "Foo"),
+                    "callee must be the ident `Foo`, got {callee:?}"
+                );
+                assert_eq!(type_args.len(), 1, "one type arg `T`");
+                assert_eq!(
+                    type_args[0].span().text(src),
+                    "T",
+                    "the type arg must be `T`"
+                );
+                assert_eq!(args.len(), 1, "the `(x)` must be captured as one arg");
+                assert!(
+                    matches!(&args[0], Expr::Ident(s) if s.text(src) == "x"),
+                    "the single arg must be `x`, got {:?}",
+                    args[0]
+                );
+            }
+            other => panic!("expected Expr::MixinCall with type_args, got {other:?}"),
+        }
+    }
+
+    /// MX-T1: the `Name!::(args)` scope-qualified form sets `scope_qualifier`.
+    #[test]
+    fn scope_qualified_mixin_call_sets_flag() {
+        let src = "Foo!::(x)";
+        let (e, diags) = parse_expr(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match e {
+            Expr::MixinCall {
+                scope_qualifier,
+                args,
+                ..
+            } => {
+                assert!(scope_qualifier, "`::` must set scope_qualifier");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected Expr::MixinCall, got {other:?}"),
+        }
+    }
+
+    /// MX-T1: a member `mixin` declaration parses to `Member::Mixin` (no longer a
+    /// `Member::Method` with an `Error` return type).
+    #[test]
+    fn member_mixin_parses_to_member_mixin() {
+        let src = "class C { static mixin M(int a, int b) { (a << 8) | b } }";
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected a type declaration, got {:?}", unit.items[0]);
+        };
+        match &td.members[0] {
+            Member::Mixin { name, params, .. } => {
+                assert_eq!(name.text(src), "M", "the mixin's name");
+                assert_eq!(params.len(), 2, "two params");
+            }
+            other => panic!("expected Member::Mixin, got {other:?}"),
+        }
+    }
+
+    /// MX-T1: a local (statement-scope) `mixin` declaration parses to
+    /// `Stmt::MixinDecl` (no longer a `Stmt::LocalFunction`).
+    #[test]
+    fn local_mixin_parses_to_stmt_mixin_decl() {
+        let src = "class C { void F() { mixin Append(String s) { s.Append(\"B\"); } } }";
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected a type declaration, got {:?}", unit.items[0]);
+        };
+        let Member::Method {
+            body: MethodBody::Block(Stmt::Block { stmts, .. }),
+            ..
+        } = &td.members[0]
+        else {
+            panic!("expected a method with a block body, got {:?}", td.members[0]);
+        };
+        match &stmts[0] {
+            Stmt::MixinDecl { name, params, .. } => {
+                assert_eq!(name.text(src), "Append", "the local mixin's name");
+                assert_eq!(params.len(), 1, "one param");
+            }
+            other => panic!("expected Stmt::MixinDecl, got {other:?}"),
+        }
     }
 }

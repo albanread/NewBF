@@ -265,6 +265,22 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// A mixin invocation `Name!(args)`, `scope::Name!(args)`, or
+    /// `Name!<T>(args)` (mixins.md §3.1). Distinct from [`Expr::Call`] so sema
+    /// can recognise the mixin-ness (the `!`) and carry the generic
+    /// `type_args` of the `Name!<T>(…)` form. `callee` stays an `Expr` so a
+    /// qualified `Outer.Inner!(…)` survives; `scope_qualifier` records the
+    /// `::` of the `Name!::(…)` form. Sema ignores it until MX-T3 (expansion);
+    /// MX-T1 only introduces the shape (behavior-preserving).
+    MixinCall {
+        span: Span,
+        callee: Box<Expr>,
+        /// `true` for the `Name!::(…)` scope-qualified form.
+        scope_qualifier: bool,
+        /// The `<T, …>` of `Name!<T>(…)`; empty for the plain `Name!(…)` form.
+        type_args: Vec<Type>,
+        args: Vec<Expr>,
+    },
     /// `base[args...]`
     Index {
         span: Span,
@@ -391,6 +407,7 @@ impl Expr {
             | Expr::Assign { span, .. }
             | Expr::Ternary { span, .. }
             | Expr::Call { span, .. }
+            | Expr::MixinCall { span, .. }
             | Expr::Index { span, .. }
             | Expr::Member { span, .. }
             | Expr::Prefix { span, .. }
@@ -494,6 +511,17 @@ pub enum Stmt {
         params: Vec<Param>,
         body: Box<Stmt>,
     },
+    /// A `mixin Name(params) body` declared at statement scope (mixins.md
+    /// §3.1). Distinct from [`Stmt::LocalFunction`] (which a local mixin used
+    /// to masquerade as) so sema can recognise and — until MX-T3 — ignore it.
+    /// `body` is the block (or `=> expr` wrapped as a `Stmt::Expr`) form.
+    MixinDecl {
+        span: Span,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        params: Vec<Param>,
+        body: Box<Stmt>,
+    },
     /// recovery placeholder for a malformed statement
     Error(Span),
 }
@@ -533,7 +561,8 @@ impl Stmt {
             | Stmt::Continue { span, .. }
             | Stmt::Defer { span, .. }
             | Stmt::Switch { span, .. }
-            | Stmt::LocalFunction { span, .. } => *span,
+            | Stmt::LocalFunction { span, .. }
+            | Stmt::MixinDecl { span, .. } => *span,
         }
     }
 }
@@ -892,6 +921,20 @@ pub enum Member {
         payload: Vec<Param>,
         value: Option<Expr>,
     },
+    /// `[mods] mixin Name<G…>(params) body` — a mixin declared as a type
+    /// member (mixins.md §3.1). Distinct from [`Member::Method`] (which a
+    /// member mixin used to masquerade as, with `return_ty: Type::Error`) so
+    /// sema can recognise and — until MX-T3 — ignore it. `body` is the block
+    /// or `=> expr` form.
+    Mixin {
+        span: Span,
+        attributes: Vec<Attribute>,
+        modifiers: Vec<(Modifier, Span)>,
+        name: Span,
+        generic_params: Vec<GenericParam>,
+        params: Vec<Param>,
+        body: MethodBody,
+    },
     /// A nested type declaration.
     Nested(TypeDecl),
     /// `typealias Name [<G…>] = Type;`
@@ -912,6 +955,7 @@ impl Member {
         match self {
             Member::Field { span, .. }
             | Member::Method { span, .. }
+            | Member::Mixin { span, .. }
             | Member::Constructor { span, .. }
             | Member::Destructor { span, .. }
             | Member::Property { span, .. }

@@ -194,3 +194,128 @@ fn llvm_lowering_verifies_on_real_beef() {
         files.len()
     );
 }
+
+/// MX-T1 R7 ratchet (mixins.md §7): `feature-suite/src/Mixins.bf` densely uses
+/// mixin syntax. After MX-T1 the parser emits the new `Expr::MixinCall` /
+/// `Stmt::MixinDecl` / `Member::Mixin` variants instead of masquerading them as
+/// calls / local-fns / methods, yet sema must still IGNORE them so the file
+/// lowers to a *verifiable* LLVM module exactly as before (mixin EXPANSION is
+/// MX-T3). This pins both halves: (1) the parser actually produces the new
+/// variants on this file (so the rewire is exercised), and (2) the module still
+/// verifies clean (the load-bearing behavior-preservation gate).
+#[test]
+fn mixins_bf_parses_to_mixin_variants_and_still_verifies() {
+    use newbf_parser::{Expr, Member, Stmt};
+
+    let path = root().join("feature-suite/src/Mixins.bf");
+    let src = std::fs::read_to_string(&path).expect("Mixins.bf present in the verify corpus");
+    let (unit, pdiags) = parse_file(&src, FileId(0));
+    assert!(pdiags.is_empty(), "Mixins.bf must parse clean: {pdiags:?}");
+
+    // The parser must have routed the mixin syntax to the new variants.
+    let mut saw_member_mixin = false;
+    let mut saw_stmt_mixin = false;
+    let mut saw_mixin_call = false;
+
+    fn walk_stmt(s: &Stmt, st: &mut bool, sc: &mut bool) {
+        if let Stmt::MixinDecl { .. } = s {
+            *st = true;
+        }
+        // A shallow walk is enough: the corpus has mixin calls at statement and
+        // nested-statement level, and `MixinDecl` at block level.
+        match s {
+            Stmt::Block { stmts, .. } => stmts.iter().for_each(|x| walk_stmt(x, st, sc)),
+            Stmt::Expr { expr, .. } => walk_expr(expr, sc),
+            Stmt::Local { init: Some(e), .. } | Stmt::Return { value: Some(e), .. } => {
+                walk_expr(e, sc)
+            }
+            Stmt::If { then, els, .. } => {
+                walk_stmt(then, st, sc);
+                if let Some(e) = els {
+                    walk_stmt(e, st, sc);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::Defer { body, .. }
+            | Stmt::MixinDecl { body, .. }
+            | Stmt::LocalFunction { body, .. } => walk_stmt(body, st, sc),
+            _ => {}
+        }
+    }
+    fn walk_expr(e: &Expr, sc: &mut bool) {
+        match e {
+            Expr::MixinCall { args, .. } => {
+                *sc = true;
+                args.iter().for_each(|a| walk_expr(a, sc));
+            }
+            Expr::Call { callee, args, .. } => {
+                walk_expr(callee, sc);
+                args.iter().for_each(|a| walk_expr(a, sc));
+            }
+            Expr::Binary { lhs, rhs, .. } | Expr::Assign { target: lhs, value: rhs, .. } => {
+                walk_expr(lhs, sc);
+                walk_expr(rhs, sc);
+            }
+            Expr::Member { base, .. } => walk_expr(base, sc),
+            Expr::Paren { inner, .. } => walk_expr(inner, sc),
+            _ => {}
+        }
+    }
+
+    fn walk_members(members: &[Member], mm: &mut bool, st: &mut bool, sc: &mut bool) {
+        for m in members {
+            match m {
+                Member::Mixin { .. } => *mm = true,
+                Member::Method {
+                    body: newbf_parser::MethodBody::Block(s),
+                    ..
+                } => walk_stmt(s, st, sc),
+                Member::Nested(td) => walk_members(&td.members, mm, st, sc),
+                _ => {}
+            }
+        }
+    }
+    fn walk_items(items: &[newbf_parser::Item], mm: &mut bool, st: &mut bool, sc: &mut bool) {
+        for it in items {
+            match it {
+                newbf_parser::Item::Namespace {
+                    body: Some(b), ..
+                } => walk_items(b, mm, st, sc),
+                newbf_parser::Item::Type(td) => walk_members(&td.members, mm, st, sc),
+                _ => {}
+            }
+        }
+    }
+    walk_items(
+        &unit.items,
+        &mut saw_member_mixin,
+        &mut saw_stmt_mixin,
+        &mut saw_mixin_call,
+    );
+
+    assert!(
+        saw_member_mixin,
+        "MX-T1: Mixins.bf must parse member mixins to Member::Mixin"
+    );
+    assert!(
+        saw_stmt_mixin,
+        "MX-T1: Mixins.bf must parse the local `mixin AppendAndNullify` to Stmt::MixinDecl"
+    );
+    assert!(
+        saw_mixin_call,
+        "MX-T1: Mixins.bf must parse `Name!(args)` to Expr::MixinCall"
+    );
+
+    // The R7 load-bearing half: the module must still verify clean.
+    let srcs = [SourceFile {
+        file: FileId(0),
+        src: &src,
+        unit: &unit,
+    }];
+    let program = analyze(&srcs);
+    let module = lower_program(&srcs, &program);
+    newbf_llvm::verify_module(&module).expect("MX-T1 R7: Mixins.bf must still verify clean");
+}
