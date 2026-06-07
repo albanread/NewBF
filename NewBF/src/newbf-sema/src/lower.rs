@@ -2021,6 +2021,37 @@ fn collect_insts_expr<'a>(
                 );
             }
         }
+        // TA-7 collection recursion (§6 monomorphization, R4 collector/lowering
+        // lockstep): a target-typed dot-form ARGUMENT body can name a generic use
+        // referenced nowhere else (e.g. `M(.{ items = new List<float>() })` or a
+        // `.( Identity<int>(3) )` — though the latter's `.(args)` is a
+        // `Call(DotIdent)` already walked by the arm above). Because TA-7's
+        // `lower_generic_call` (and the other call sites) will LOWER those
+        // sub-expressions when it back-fills the pending arg, the collector MUST
+        // walk them too, or the mono is never emitted (a dangling symbol → a
+        // verify/link error). The collector is independent of the two-phase split,
+        // so we just add the missing structural arms:
+        //   - `.{ … }` (`Initializer`): walk the base AND every entry expression.
+        //   - `(a, b)` (`Tuple`): walk every element.
+        // (`.Case` is a bare `DotIdent` with no sub-exprs; `.(args)`/`.Case(args)`
+        // are `Call(DotIdent)`, already covered above.)
+        Expr::Initializer { base, entries, .. } => {
+            collect_insts_expr(
+                base, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+            );
+            for entry in entries {
+                collect_insts_expr(
+                    entry, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for elem in elems {
+                collect_insts_expr(
+                    elem, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -5348,6 +5379,17 @@ impl<'a> Lowerer<'a> {
                 {
                     return r;
                 }
+                // TA-4 fork (§3.7, mirrors the TA-3 `lower_method_call` fork): a
+                // bare-name / free-fn / local-fn / fn-value call whose callee is an
+                // `Ident` and that has a target-typed dot-form arg (`.(…)` / `.{ }`
+                // / `.Case[(…)]`) diverts to the pending-aware lowerer. The hot path
+                // (no pending args, or a non-`Ident` callee) runs the eager
+                // `arg_vals` loop below verbatim — byte-identical to pre-TA-4.
+                if let Expr::Ident(s) = &**callee
+                    && args.iter().any(|a| arg_is_pending(a, src))
+                {
+                    return self.lower_ident_call_pending(s.text(src), args, src);
+                }
                 let arg_vals: Vec<(Value, IrType)> =
                     args.iter().map(|a| self.arg_value(a, src)).collect();
                 if let Expr::Ident(s) = &**callee {
@@ -5952,8 +5994,23 @@ impl<'a> Lowerer<'a> {
             ),
         );
         for (i, a) in args.iter().enumerate() {
-            let (v, t) = self.expr(a, src);
-            let want = ptys.get(i).copied().unwrap_or(t);
+            let want = ptys.get(i).copied();
+            // TA-8 (§3.8 #6): back-fill a PENDING payload arg against the case's
+            // declared payload type, so `Enum.Case(.(1,2))` / `.Case(.(1,2))` with
+            // a value-struct payload constructs the inner `.(…)` against `ptys[i]`
+            // instead of lowering it to `undef` via the plain `self.expr` path. A
+            // concrete payload arg, or a pending one with no declared payload slot,
+            // takes the eager `self.expr` path verbatim — byte-identical to pre-TA-8.
+            let (v, t) = match want {
+                Some(pty) if arg_is_pending(a, src) => self
+                    .lower_arg_targeted(pty, a, src)
+                    // A pending payload that can't target-type to its declared
+                    // payload type recovers with `undef(pty)` (the payload type,
+                    // not a silent `undef(I64)` mis-coerced into the field), §3.4.
+                    .unwrap_or_else(|| (undef(pty), pty)),
+                _ => self.expr(a, src),
+            };
+            let want = want.unwrap_or(t);
             let cv = self.coerce(v, t, want);
             let fa = self.fb.field_addr(slot.clone(), id, (1 + i) as u32);
             self.fb.store(fa, cv);
@@ -7751,18 +7808,32 @@ impl<'a> Lowerer<'a> {
         if let Some((body_ptr, _)) = &recv {
             call_args.push(body_ptr.clone());
         }
-        let arg_vals: Vec<(Value, IrType)> =
-            args.iter().map(|a| self.arg_value(a, src)).collect();
-        if let Some(elem) = sig.variadic {
-            // `params T[]`: pack overflow args into a fresh `T[]` (formal params
-            // exclude the leading `this`).
-            let formal = &sig.params[leading..];
-            let packed = self.pack_variadic_args(formal, elem, arg_vals);
-            call_args.extend(packed);
+        // TA-7 fork (§3.7/§3.8 #3, mirrors the TA-3/TA-4 forks): a generic-method
+        // call resolves its monomorph by the EXPLICIT type-args (the mangled key),
+        // not the value args — so the `sig` is already chosen here, no overload
+        // picking. With a pending dot-form value arg, back-fill it against the
+        // pre-built `gen_method_sigs` param type, UN-OFFSET past any leading `this`
+        // (`formal = &sig.params[leading..]`: `leading = 1` for an instance call's
+        // already-prepended receiver, `0` for a static one). The hot path (no
+        // pending args) runs the eager `arg_vals` loop below verbatim.
+        if args.iter().any(|a| arg_is_pending(a, src)) {
+            let (partial, _shapes) = self.lower_args_phase1(args, src);
+            let formal: Vec<IrType> = sig.params[leading..].to_vec();
+            call_args.extend(self.finish_args(&formal, sig.variadic, partial, args, src));
         } else {
-            for (i, (v, ty)) in arg_vals.into_iter().enumerate() {
-                let pt = sig.params.get(leading + i).copied().unwrap_or(ty);
-                call_args.push(self.coerce(v, ty, pt));
+            let arg_vals: Vec<(Value, IrType)> =
+                args.iter().map(|a| self.arg_value(a, src)).collect();
+            if let Some(elem) = sig.variadic {
+                // `params T[]`: pack overflow args into a fresh `T[]` (formal params
+                // exclude the leading `this`).
+                let formal = &sig.params[leading..];
+                let packed = self.pack_variadic_args(formal, elem, arg_vals);
+                call_args.extend(packed);
+            } else {
+                for (i, (v, ty)) in arg_vals.into_iter().enumerate() {
+                    let pt = sig.params.get(leading + i).copied().unwrap_or(ty);
+                    call_args.push(self.coerce(v, ty, pt));
+                }
             }
         }
         // Hard assert (doc §5.4 / §7): the assembled operand count must exactly
@@ -8126,6 +8197,114 @@ impl<'a> Lowerer<'a> {
         }
         // Unresolved — concrete args were already evaluated for their effects in
         // Phase 1 (matching the eager path's "args already evaluated" behavior).
+        (undef(IrType::I64), IrType::I64)
+    }
+
+    /// The `has_pending` fork of the bare-name / free-fn / local-fn / fn-value
+    /// call path (TA-4, §3.8 #2): a call `name(args)` (callee an `Ident`) with at
+    /// least one target-typed dot-form arg whose `IrType` is the resolved
+    /// signature's param type. Mirrors the eager `Expr::Ident`-callee sub-paths but
+    /// back-fills each pending arg against the known signature:
+    ///
+    /// - **Local (nested) fn** (`local_fns`) and **fn-value/fn-ptr local**
+    ///   (`fn_sigs`): the param types `ptys[i]` are fully known up front, so
+    ///   `finish_args(ptys, …)` lowers each pending slot NOW against `ptys[i]`
+    ///   (these forms are never `params T[]`, so `variadic = None`).
+    /// - **Same-type overload** (`self.methods`): resolve with the shape gate via
+    ///   `pick_overload_partial`, then emit via `finish_args` against the chosen
+    ///   sig's params (these are `this`-less candidates — statics / free fns, so
+    ///   `formal = &sig.params[..]`; variadic-aware).
+    /// - **Unresolved external** (Win32/CRT): there is NO signature to target a
+    ///   pending arg against, so a pending arg to such a call cannot be
+    ///   target-typed — a DIAGNOSED error (§6 "Unresolved external"). With no
+    ///   diagnostic sink in this lowerer we recover cleanly: concrete args were
+    ///   already evaluated for effect in Phase 1; each remaining pending arg is
+    ///   evaluated FOR EFFECT (its sub-expressions' side effects run, exactly as an
+    ///   eager unresolved-external arg would) — never a silent `undef` operand into
+    ///   the call. The sibling-interface-dispatch path (a bare call inside an
+    ///   interface default body) is intentionally NOT taken here: an abstract
+    ///   interface method has no concrete body to target a pending arg against
+    ///   (mirroring `lower_method_call_pending`'s interface-out-of-first-slice
+    ///   stance), so such a call falls through to this external recovery.
+    ///
+    /// Single Phase-1 + single `finish_args` (each runs once), all emission in the
+    /// current block, so the assembled `call_args` dominate the terminal call.
+    fn lower_ident_call_pending(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        src: &str,
+    ) -> (Value, IrType) {
+        // Phase 1 — ONCE. Concrete args lowered in source order into holes; the
+        // sparse `shapes` drive overload resolution (only the overload sub-path
+        // reads them; the local-fn / fn-value sub-paths key on `name` directly).
+        let (partial, shapes) = self.lower_args_phase1(args, src);
+
+        // A local (nested) function in scope → a direct call to its emitted
+        // `$localfn{N}` symbol; pending args back-fill against its known `ptys`.
+        if let Some((sym, ret, ptys)) = self.local_fns.get(name).cloned() {
+            let call_args = self.finish_args(&ptys, None, partial, args, src);
+            return (self.fb.call(sym, call_args, ret), ret);
+        }
+
+        // A function-value local/param (`function R(P) f`): `f(args)` loads the
+        // `$Func` value's `code`/`target` and `call_indirect`s; pending args
+        // back-fill against the fn-value's known `ptys`. `$self` (the env or null)
+        // is always operand 0 (no closure-ness branch — see the eager path).
+        if let Some((ret, ptys)) = self.fn_sigs.get(name).cloned()
+            && let Some((slot, _)) = self.lookup(name)
+        {
+            let fid = self.structs.func_struct;
+            let code = {
+                let a = self.fb.field_addr(slot.clone(), fid, 0);
+                self.fb.load(a, IrType::Ptr)
+            };
+            let target = {
+                let a = self.fb.field_addr(slot, fid, 1);
+                self.fb.load(a, IrType::Ptr)
+            };
+            let mut call_args: Vec<Value> = vec![target];
+            call_args.extend(self.finish_args(&ptys, None, partial, args, src));
+            debug_assert_eq!(
+                call_args.len(),
+                ptys.len() + 1,
+                "function-value pending-call arity drift for `{name}`: {} args vs {} params + $self",
+                call_args.len(),
+                ptys.len()
+            );
+            return (self.fb.call_indirect(code, call_args, ret), ret);
+        }
+
+        // Same-type overload (statics / free fns — `this`-less candidates). Resolve
+        // with the shape gate, then emit via `finish_args` against the chosen sig's
+        // params (no `this` to slice off; variadic-aware).
+        let structs: &StructTable = self.structs;
+        let resolved = self
+            .methods
+            .get(name)
+            .and_then(|cands| pick_overload_partial(cands, &shapes, false, structs))
+            .cloned();
+        if let Some(sig) = resolved {
+            let formal: Vec<IrType> = sig.params.clone();
+            let call_args = self.finish_args(&formal, sig.variadic, partial, args, src);
+            let r = self.fb.call(sig.full_name, call_args, sig.ret);
+            return (r, sig.ret);
+        }
+
+        // Unresolved external — no signature to target a pending arg against
+        // (§6). Concrete args already ran for effect in Phase 1; evaluate each
+        // remaining pending arg FOR EFFECT (no target type ⇒ `lower_arg_targeted`
+        // would decline anyway), so its side effects still happen, then default the
+        // result to i64. This is the clean recovery for a pending-arg-to-external
+        // call — never a silent `undef` operand.
+        for (a, slot) in args.iter().zip(&partial) {
+            if slot.is_none() {
+                // A pending dot-form with no resolved param type: evaluate it for
+                // its side effects (it can't be target-typed, so the result is
+                // discarded — not passed as an operand).
+                let _ = self.expr(a, src);
+            }
+        }
         (undef(IrType::I64), IrType::I64)
     }
 
