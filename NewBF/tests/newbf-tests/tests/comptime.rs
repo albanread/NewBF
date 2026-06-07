@@ -9,7 +9,7 @@
 //! literals in the surrounding program is the next increment — this nails the
 //! evaluation half end-to-end on real source first.
 
-use newbf_comptime::{eval_const_i64, fold_comptime};
+use newbf_comptime::{eval_const_i64, fold_comptime, run_emission};
 use newbf_lexer::FileId;
 use newbf_llvm::OrcJit;
 use newbf_parser::parse_file;
@@ -150,4 +150,136 @@ fn comptime_call_with_const_arg_folds() {
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
     assert_eq!(main(), 120);
+}
+
+// ── CB-T4: comptime member EMISSION (the fixpoint loop) ───────────────────────
+
+/// The §1 marquee source: a `[Comptime, EmitGenerator]` emits a `Sum()` method
+/// that reads pre-existing fields. The emitted member resolves + is callable and
+/// reads the original fields → 42 (the only path to that value).
+const EMIT_MEMBER_SRC: &str = r#"
+    class Vec2 {
+        public int32 mX;
+        public int32 mY;
+        public this(int32 x, int32 y) { this.mX = x; this.mY = y; }
+
+        [Comptime, EmitGenerator]
+        public static void Generate() {
+            Compiler.EmitTypeBody("public int32 Sum() { return this.mX + this.mY; }");
+        }
+    }
+    class Program {
+        public static int32 Main() {
+            Vec2 v = new Vec2(30, 12);
+            int32 r = v.Sum();
+            delete v;
+            return r;
+        }
+    }
+"#;
+
+/// Drive emission over a one-file program and return the final module.
+fn emit_module(src: &str) -> newbf_ir::Module {
+    let (unit, pdiags) = parse_file(src, FileId(0));
+    assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
+    let files = [SourceFile {
+        file: FileId(0),
+        src,
+        unit: &unit,
+    }];
+    let (module, _outcome) = run_emission(&files).expect("comptime emission succeeds");
+    module
+}
+
+/// **The CB-T4 marquee, full frontend.** Emission feeds back into resolution: the
+/// generator emits `Sum()` (reading pre-existing `mX`/`mY`), the compiler
+/// re-resolves `Vec2` via the spliced `extension`, and `Main` calls the emitted
+/// method → 42.
+#[test]
+fn comptime_emit_member_returns_42() {
+    let module = emit_module(EMIT_MEMBER_SRC);
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links clean");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 42, "emitted member reads pre-existing fields → 42");
+}
+
+/// **The strip + link-clean assertion (R6).** After emission the final module
+/// must contain the generated symbol but NEITHER the `[EmitGenerator]` generator
+/// NOR the `__newbf_ct_emit` extern — because the app/run JIT and the AOT link do
+/// NOT register the shim, so a survivor fails `lookup`/link. Assert both the IR
+/// shape (the `dump-ir` golden: generated present, generator + shim absent) AND
+/// that the module JIT-links **and** AOT-emits cleanly.
+#[test]
+fn comptime_emit_strips_generator_and_shim_links_clean() {
+    let module = emit_module(EMIT_MEMBER_SRC);
+
+    // dump-ir golden: the generated `Sum` is present.
+    assert!(
+        module.funcs.iter().any(|f| f.name == "Vec2.Sum"),
+        "generated member `Vec2.Sum` must be present in the final IR (have: {:?})",
+        module.funcs.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    // The generator is absent (stripped).
+    assert!(
+        !module.funcs.iter().any(|f| f.name.contains("Generate")),
+        "the [EmitGenerator] generator must be ABSENT from the final IR"
+    );
+    // The `__newbf_ct_emit` shim extern is absent (stripped).
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+        "the __newbf_ct_emit extern must be ABSENT from the final IR"
+    );
+    // No leftover emit jobs.
+    assert!(module.emit_jobs.is_empty(), "emit_jobs consumed");
+
+    // JIT-links clean (RTDyld eager-links the whole module on lookup — a
+    // surviving `__newbf_ct_emit` extern would fail here with "Symbols not
+    // found").
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links with no unresolved symbols");
+    assert!(
+        jit.lookup("Program.Main").is_some(),
+        "Program.Main resolves in the JIT-linked module"
+    );
+
+    // AOT-emits clean: object emission of a module with a dangling extern would
+    // still emit (undefined externs only fail at LINK), so additionally assert
+    // the IR holds no `__newbf_ct_emit` declaration (checked above) AND the
+    // object emits without error (the codegen path the AOT pipeline runs).
+    let obj = newbf_llvm::emit_object_to_memory(&module)
+        .expect("final module AOT-emits an object with no codegen error");
+    assert!(!obj.is_empty(), "AOT object is non-empty");
+}
+
+/// **Dead-emitted-member link regression (R6).** A generator emits a member that
+/// is NEVER called; the generator still ran (so the shim existed during
+/// emission), but the stripped final module must still JIT-link and run.
+#[test]
+fn comptime_emit_dead_member_still_links() {
+    let src = r#"
+        class Widget {
+            public int32 mZ;
+            public this(int32 z) { this.mZ = z; }
+            [Comptime, EmitGenerator]
+            public static void Generate() {
+                Compiler.EmitTypeBody("public int32 Unused() { return this.mZ + 99; }");
+            }
+        }
+        class Program {
+            public static int32 Main() {
+                Widget w = new Widget(123);
+                delete w;
+                return 7;
+            }
+        }
+    "#;
+    let module = emit_module(src);
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+        "shim stripped even though the emitted member is never called"
+    );
+    let jit = OrcJit::from_ir(&module).expect("dead-emitted-member module JIT-links clean");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(main(), 7);
 }

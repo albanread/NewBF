@@ -26,7 +26,7 @@
 use newbf_lexer::FileId;
 use newbf_llvm::{GuardMode, OrcJit};
 use newbf_parser::parse_file;
-use newbf_sema::{SourceFile, analyze, lower_program};
+use newbf_sema::SourceFile;
 
 /// Exit code the parent reads for "ran clean but the ledger still had live
 /// allocations" (a leak). Distinct from a fault/abort and from a clean 0.
@@ -102,10 +102,10 @@ fn compile_to_main(src: &str) -> extern "C" fn() -> i32 {
         src,
         unit: &unit,
     }];
-    let program = analyze(&files);
-    let module = lower_program(&files, &program);
+    // CB-T4: `run_emission` analyzes + lowers internally (a no-op fast path for
+    // generator-free programs, which the guard corpus all are).
     let (module, _emit) =
-        newbf_comptime::run_emission(module).expect("comptime emission succeeds");
+        newbf_comptime::run_emission(&files).expect("comptime emission succeeds");
     // Leak the JIT so the JIT'd code memory stays mapped for the whole process
     // lifetime (we never tear it down — the process exits right after the run).
     let jit = Box::leak(Box::new(

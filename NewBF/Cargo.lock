@@ -301,7 +301,10 @@ name = "newbf-comptime"
 version = "0.0.1"
 dependencies = [
  "newbf-ir",
+ "newbf-lexer",
  "newbf-llvm",
+ "newbf-parser",
+ "newbf-sema",
 ]
 
 [[package]]

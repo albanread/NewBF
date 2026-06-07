@@ -296,12 +296,12 @@ fn dump_ir(input: &str) {
         })
         .collect();
 
-    let program = newbf_sema::analyze(&files);
-    let module = newbf_sema::lower_program(&files, &program);
-    // Drive comptime member emission to a fixpoint (CB-T2: a no-op when the
-    // module records no emit generators — every program today). Runs before
-    // value folding: emission changes the program's *shape*, folding its values.
-    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+    // Drive comptime member emission to a fixpoint (CB-T4). `run_emission`
+    // analyzes + lowers internally each round, splices emitted `extension`s, and
+    // strips the emitter/shim before returning (a no-op fast path when the
+    // program records no emit generators). Runs before value folding: emission
+    // changes the program's *shape*, folding its values.
+    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dump-ir: comptime emission failed: {e}");
@@ -365,12 +365,10 @@ fn dump_llvm(input: &str) {
         })
         .collect();
 
-    let program = newbf_sema::analyze(&files);
-    let module = newbf_sema::lower_program(&files, &program);
-    // Drive comptime member emission to a fixpoint (CB-T2: a no-op when the
-    // module records no emit generators — every program today). Runs before
-    // value folding: emission changes the program's *shape*, folding its values.
-    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+    // Drive comptime member emission to a fixpoint (CB-T4): analyze + lower +
+    // splice emitted `extension`s + strip the emitter/shim, internally (a no-op
+    // fast path when no emit generators are recorded). Runs before value folding.
+    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dump-llvm: comptime emission failed: {e}");
@@ -434,14 +432,17 @@ fn compile(input: &str, output: Option<&str>) {
         })
         .collect();
 
+    // `analyze` here feeds Win32 import discovery below (which keys off the
+    // user's source, unaffected by emission). Emission re-analyzes + re-lowers
+    // internally.
     let program = newbf_sema::analyze(&files);
-    let module = newbf_sema::lower_program(&files, &program);
 
-    // Drive comptime member emission to a fixpoint before codegen (CB-T2: a
-    // no-op when the module records no emit generators — every program today).
+    // Drive comptime member emission to a fixpoint before codegen (CB-T4):
+    // analyze + lower + splice emitted `extension`s + strip the emitter/shim,
+    // internally (a no-op fast path when no emit generators are recorded).
     // Emission changes the program's *shape* (new members); it must run before
     // value folding, which collapses values.
-    let (mut module, _emit) = match newbf_comptime::run_emission(module) {
+    let (mut module, _emit) = match newbf_comptime::run_emission(&files) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("compile: comptime emission failed: {e}");

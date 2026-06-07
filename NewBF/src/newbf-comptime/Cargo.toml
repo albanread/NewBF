@@ -10,6 +10,13 @@ description = "NewBF: compile-time execution engine (JIT-based; cf. Beef's CeMac
 # IR→LLVM→ORC pipeline as application code and calls it during compilation.
 newbf-ir.workspace = true
 newbf-llvm.workspace = true
+# CB-T4: the emission fixpoint loop re-parses + re-analyzes + re-lowers each
+# round, so it depends on the front end. The direction `comptime → sema` is
+# legal (sema has no comptime dep — its newbf-llvm edge is a dev-dep only), so
+# there is no cycle.
+newbf-sema.workspace = true
+newbf-parser.workspace = true
+newbf-lexer.workspace = true
 
 [lints]
 workspace = true

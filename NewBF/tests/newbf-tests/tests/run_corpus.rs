@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use newbf_lexer::FileId;
 use newbf_llvm::{GuardMode, OrcJit};
 use newbf_parser::parse_file;
-use newbf_sema::{SourceFile, analyze, lower_program};
+use newbf_sema::SourceFile;
 
 fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../beef-tests/run-corpus")
@@ -38,13 +38,14 @@ fn run(src: &str) -> i32 {
         src,
         unit: &unit,
     }];
-    let program = analyze(&files);
-    let module = lower_program(&files, &program);
-    // Drive comptime member emission to a fixpoint (CB-T2: a no-op fast path for
-    // every current corpus program — none records an emit generator, so the
-    // module passes through verbatim and behavior is unchanged).
+    // Drive comptime member emission to a fixpoint (CB-T4). `run_emission`
+    // analyzes + lowers internally each round, splicing emitted `extension`s and
+    // re-lowering until no new member is emitted, then strips the emitter/shim so
+    // the final module JIT-links clean. For the generator-free programs (the
+    // entire current corpus) this is the no-op fast path: it lowers once and
+    // returns verbatim, so behavior is unchanged.
     let (module, _emit) =
-        newbf_comptime::run_emission(module).expect("comptime emission succeeds");
+        newbf_comptime::run_emission(&files).expect("comptime emission succeeds");
     let jit = OrcJit::from_ir(&module).expect("jit builds");
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     // SAFETY: corpus entries are `static int32 Main()` — a nullary `i32` fn.
