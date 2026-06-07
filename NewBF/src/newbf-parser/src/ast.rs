@@ -304,6 +304,14 @@ pub enum Expr {
         span: Span,
         ty: Type,
     },
+    /// `typeof(Type)` — the runtime `Type` metadata for a type. The parsed
+    /// type is retained (unlike `alignof`/`strideof`, which still discard it)
+    /// so reflection lowering (RF-T4) can resolve it to the type's `Type`
+    /// global. Mirrors [`Expr::SizeOf`].
+    TypeOf {
+        span: Span,
+        ty: Type,
+    },
     /// `.Variant` — leading-dot enum-case shorthand (the type is inferred
     /// from context).
     DotIdent {
@@ -389,6 +397,7 @@ impl Expr {
             | Expr::Generic { span, .. }
             | Expr::Cast { span, .. }
             | Expr::SizeOf { span, .. }
+            | Expr::TypeOf { span, .. }
             | Expr::DotIdent { span, .. }
             | Expr::Tuple { span, .. }
             | Expr::Initializer { span, .. }

@@ -1120,9 +1120,10 @@ impl<'a> Parser<'a> {
             }
             // `sizeof`/`typeof`/`alignof`/`strideof` take a *type* argument,
             // which can use type-only syntax an expression can't (`char8*`,
-            // `int[]`, `List<T>`). `sizeof` keeps its type (lowered to a
-            // compile-time byte size); the others still drop it (placeholder
-            // primary; recovered later).
+            // `int[]`, `List<T>`). `sizeof` and `typeof` keep their type
+            // (`sizeof` lowers to a compile-time byte size; `typeof` retains
+            // it for reflection — RF-T4); `alignof`/`strideof` still drop it
+            // (placeholder primary; recovered later).
             Keyword::SizeOf => {
                 self.bump();
                 if self.eat(TokenKind::LParen) {
@@ -1133,7 +1134,17 @@ impl<'a> Parser<'a> {
                     Expr::Ident(span)
                 }
             }
-            Keyword::AlignOf | Keyword::StrideOf | Keyword::TypeOf => {
+            Keyword::TypeOf => {
+                self.bump();
+                if self.eat(TokenKind::LParen) {
+                    let ty = self.ty();
+                    self.expect(TokenKind::RParen, "`)` after type argument");
+                    Expr::TypeOf { span, ty }
+                } else {
+                    Expr::Ident(span)
+                }
+            }
+            Keyword::AlignOf | Keyword::StrideOf => {
                 self.bump();
                 if self.eat(TokenKind::LParen) {
                     let _ty = self.ty();
@@ -4012,4 +4023,86 @@ pub fn parse_file_with_trivia(src: &str, file: FileId) -> (CompUnit, Vec<Token>,
     let mut p = Parser::new_with_trivia(src, file);
     let unit = p.comp_unit();
     (unit, p.trivia, p.diagnostics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `typeof(T)` must RETAIN its type argument as `Expr::TypeOf { ty }`
+    /// (RF-T0). Before RF-T0 the parser ate the keyword and discarded the
+    /// type, yielding a bare `Expr::Ident`; reflection (RF-T4) lowers the
+    /// retained type to the type's `Type` global, so the type must survive.
+    #[test]
+    fn typeof_retains_its_type() {
+        let src = "typeof(Dog)";
+        let (e, diags) = parse_expr(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match e {
+            Expr::TypeOf { ty, .. } => {
+                assert_eq!(
+                    ty.span().text(src),
+                    "Dog",
+                    "typeof must preserve the parsed type, not discard it"
+                );
+            }
+            other => panic!("expected Expr::TypeOf, got {other:?}"),
+        }
+    }
+
+    /// `alignof`/`strideof` still DROP their type (out of RF-T0 scope) — they
+    /// must remain bare-`Ident` placeholders, unchanged by the typeof re-point.
+    #[test]
+    fn alignof_strideof_still_discard_their_type() {
+        for src in ["alignof(Dog)", "strideof(Dog)"] {
+            let (e, diags) = parse_expr(src, FileId(0));
+            assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+            assert!(
+                matches!(e, Expr::Ident(_)),
+                "{src} should stay a bare Ident placeholder, got {e:?}"
+            );
+        }
+    }
+
+    /// `[Reflect(.Fields)]` must retain the enum-flag identifier text so RF-T3's
+    /// policy code can read it. Attributes already capture their args generically
+    /// (`Attribute.args: Vec<Expr>`); a leading-dot flag parses as
+    /// `Expr::DotIdent { name }`, so this confirms `.Fields` survives retrievably.
+    #[test]
+    fn reflect_attribute_captures_enum_flag_text() {
+        let src = "[Reflect(.Fields)] class Marked { public int32 mX; }";
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected a type declaration, got {:?}", unit.items[0]);
+        };
+        let attr = &td.attributes[0];
+        assert_eq!(attr.name.span().text(src), "Reflect");
+        assert_eq!(attr.args.len(), 1, "expected one attribute arg (.Fields)");
+        match &attr.args[0] {
+            Expr::DotIdent { name, .. } => {
+                assert_eq!(
+                    name.text(src),
+                    "Fields",
+                    "the `.Fields` enum-flag identifier must be retrievable"
+                );
+            }
+            other => panic!("expected Expr::DotIdent for `.Fields`, got {other:?}"),
+        }
+    }
+
+    /// `[AlwaysInclude]` (a flagless reflect-policy marker) is retained as an
+    /// arg-less attribute whose name is retrievable for RF-T3.
+    #[test]
+    fn always_include_attribute_is_retained() {
+        let src = "[AlwaysInclude] class Marked { public int32 mX; }";
+        let (unit, diags) = parse_file(src, FileId(0));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let Item::Type(td) = &unit.items[0] else {
+            panic!("expected a type declaration, got {:?}", unit.items[0]);
+        };
+        let attr = &td.attributes[0];
+        assert_eq!(attr.name.span().text(src), "AlwaysInclude");
+        assert!(attr.args.is_empty(), "AlwaysInclude takes no args");
+    }
 }

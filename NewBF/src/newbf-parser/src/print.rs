@@ -195,6 +195,11 @@ impl Printer<'_> {
                 self.line(d + 1, "ty:");
                 self.ty(ty, d + 2);
             }
+            Expr::TypeOf { ty, .. } => {
+                self.line(d, "TypeOf");
+                self.line(d + 1, "ty:");
+                self.ty(ty, d + 2);
+            }
             Expr::DotIdent { name, .. } => {
                 self.line(d, &format!("DotIdent .{}", self.txt(*name)));
             }

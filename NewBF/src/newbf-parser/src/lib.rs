@@ -127,6 +127,7 @@ mod tests {
                 format!("(cast {} {})", sxt(src, ty), sx(src, operand))
             }
             Expr::SizeOf { ty, .. } => format!("(sizeof {})", sxt(src, ty)),
+            Expr::TypeOf { ty, .. } => format!("(typeof {})", sxt(src, ty)),
             Expr::DotIdent { name, .. } => format!(".{}", name.text(src)),
             Expr::Tuple { elems, .. } => {
                 let mut s = String::from("(tuple");
@@ -513,10 +514,13 @@ mod tests {
         assert_eq!(ok("new Foo(1)"), "(new (call Foo 1))");
         assert_eq!(ok("delete x"), "(delete x)");
         assert_eq!(ok("ref x"), "(ref x)");
-        // `sizeof` keeps its type argument; `typeof`/`alignof`/`strideof` still
-        // drop it (placeholder primary).
+        // `sizeof` and `typeof` keep their type argument (RF-T0 retains
+        // typeof's type for reflection); `alignof`/`strideof` still drop it
+        // (placeholder primary).
         assert_eq!(ok("sizeof(int)"), "(sizeof int)");
-        assert_eq!(ok("typeof(T)"), "typeof");
+        assert_eq!(ok("typeof(T)"), "(typeof T)");
+        assert_eq!(ok("alignof(T)"), "alignof");
+        assert_eq!(ok("strideof(T)"), "strideof");
         assert_eq!(ok("sizeof(char8*)"), "(sizeof (* char8))");
         // default/nameof still parse their `(…)` as a call (expression arg)
         assert_eq!(ok("default(T)"), "(call default T)");
