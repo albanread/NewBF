@@ -18,9 +18,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use newbf_ir::{
-    BinOp as IrBin, BlockId, CastKind, CmpPred, Const, EmitJob, FieldDef, FieldMeta, Function,
-    FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam, ReflectPolicy,
-    StructDef, StructId, TypeMeta, Value, VtableDef,
+    AllocSite, BinOp as IrBin, BlockId, CastKind, CmpPred, Const, EmitJob, FieldDef, FieldMeta,
+    Function, FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam,
+    ReflectPolicy, StructDef, StructId, TypeMeta, Value, VtableDef,
 };
 use newbf_lexer::{FileId, Span};
 use newbf_parser::{
@@ -5065,6 +5065,9 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             file: FileId(10_000u32 + i as u32),
             src: prelude[i].1,
             unit,
+            // Corlib prelude units carry a synthetic name (their allocations are
+            // library code, not user `new`s; named-leak reporting ignores them).
+            name: prelude[i].0,
         })
         .collect();
     for f in files {
@@ -5072,6 +5075,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             file: f.file,
             src: f.src,
             unit: f.unit,
+            name: f.name,
         });
     }
 
@@ -5118,7 +5122,7 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         });
     }
     for f in &all {
-        lower_items(&f.unit.items, "", f.src, &structs, &mut m);
+        lower_items(&f.unit.items, "", f.src, f.name, &structs, &mut m);
     }
     // Emit each collected lambda as a free function `$lambdaN() -> R { body }`.
     // An expression body (`=> e`) returns `e`; a block body lowers as-is.
@@ -5138,7 +5142,9 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         // body gets an empty `caps` list and simply ignores `$self` (the uniform
         // call passes a `null` target). This is the one callee ABI behind the
         // single uniform calling convention (`code(target, args…)`).
-        if let Some(func) = emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs) {
+        if let Some(func) =
+            emit_closure(name, *ret, params, &caps, &mb, lsrc, &structs, &mut m.alloc_sites)
+        {
             m.add_function(func);
         }
     }
@@ -5170,7 +5176,16 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             .get(name)
             .cloned()
             .unwrap_or_default();
-        if let Some(func) = emit_closure(name, ret, &param_pairs, &caps, &mb, lsrc, &structs) {
+        if let Some(func) = emit_closure(
+            name,
+            ret,
+            &param_pairs,
+            &caps,
+            &mb,
+            lsrc,
+            &structs,
+            &mut m.alloc_sites,
+        ) {
             m.add_function(func);
         }
     }
@@ -5194,6 +5209,8 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
             None,
             None,
             None, // CB-T3: not an emit generator (generic-method monomorph).
+            "",   // MS-T7: local fns are collected across files; name unknown.
+            &mut m.alloc_sites,
         ) {
             m.add_function(func);
         }
@@ -5210,7 +5227,9 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         // `Result<T, E>`'s.
         if let Some(&(decl, decl_src)) = generics.get(&(name.clone(), env.len())) {
             let prefix = structs.prefixes[id.0 as usize].clone();
-            lower_type_at(decl, Some(*id), &prefix, env, decl_src, &structs, &mut m);
+            // MS-T7: a type monomorph's source file is the template's file; we
+            // don't thread the per-mono file name here, so name sites `""`.
+            lower_type_at(decl, Some(*id), &prefix, env, decl_src, "", &structs, &mut m);
         }
     }
     // Emit each generic-*method* monomorph: re-find its decl via `(owner, name)`
@@ -5297,6 +5316,8 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
                 mono.owner,
                 ret_fn_sig_of_ty(return_ty, mdecl_src, &structs, &mono.env),
                 None, // CB-T3: not an emit generator (generic-method monomorph).
+                "",   // MS-T7: generic-method monomorphs are file-agnostic.
+                &mut m.alloc_sites,
             ) {
                 m.add_function(func);
             }
@@ -5353,13 +5374,20 @@ fn emit_method_ref_thunk(thunk: &MethodRefThunk) -> Function {
     fb.finish()
 }
 
-fn lower_items(items: &[Item], prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
+fn lower_items(
+    items: &[Item],
+    prefix: &str,
+    src: &str,
+    file_name: &str,
+    structs: &StructTable,
+    m: &mut Module,
+) {
     for item in items {
         match item {
             Item::Namespace {
                 body: Some(body), ..
-            } => lower_items(body, prefix, src, structs, m),
-            Item::Type(td) => lower_type(td, prefix, src, structs, m),
+            } => lower_items(body, prefix, src, file_name, structs, m),
+            Item::Type(td) => lower_type(td, prefix, src, file_name, structs, m),
             _ => {} // using / delegate / type-alias / file-scoped ns / error
         }
     }
@@ -5696,7 +5724,26 @@ fn type_codes(tys: &[IrType]) -> String {
     s
 }
 
-fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: &mut Module) {
+/// MS-T7: the **1-based** source line of a span's start within `src` (counting
+/// `\n`s before `span.lo`). Used to label a heap-allocation site `<function> @
+/// file:line`. Returns `1` when the span lies outside `src` (e.g. a span from a
+/// different file than the body's `src`, defensively clamped).
+fn line_of(src: &str, span: Span) -> u32 {
+    let lo = span.lo as usize;
+    if lo > src.len() {
+        return 1;
+    }
+    1 + src.as_bytes()[..lo].iter().filter(|&&b| b == b'\n').count() as u32
+}
+
+fn lower_type(
+    td: &TypeDecl,
+    prefix: &str,
+    src: &str,
+    file_name: &str,
+    structs: &StructTable,
+    m: &mut Module,
+) {
     // A generic *template* is never lowered directly — only its monomorphs
     // (driven from `structs.monos` in `lower_program`) are.
     if !td.generic_params.is_empty() {
@@ -5716,18 +5763,20 @@ fn lower_type(td: &TypeDecl, prefix: &str, src: &str, structs: &StructTable, m: 
     // symbol. A bare sibling call inside a default body routes to interface
     // dispatch on `this`, handled in the bare-call path.)
     let owner_id = structs.by_name.get(td.name.text(src)).copied();
-    lower_type_at(td, owner_id, &new_prefix, &[], src, structs, m);
+    lower_type_at(td, owner_id, &new_prefix, &[], src, file_name, structs, m);
 }
 
 /// Lower `td`'s methods/ctors/dtor at `owner_id` under `prefix`, resolving
 /// generic type-parameters through `env`. Ordinary types pass `env = &[]` and
 /// their own id; monomorphs pass the instantiation's id/prefix/env.
+#[allow(clippy::too_many_arguments)] // per-type lowering entry: threaded context
 fn lower_type_at(
     td: &TypeDecl,
     owner_id: Option<StructId>,
     prefix: &str,
     env: TyEnv,
     src: &str,
+    file_name: &str,
     structs: &StructTable,
     m: &mut Module,
 ) {
@@ -5855,6 +5904,8 @@ fn lower_type_at(
                     owner_id,
                     ret_fn_sig_of_ty(return_ty, src, structs, env),
                     emit_owner,
+                    file_name,
+                    &mut m.alloc_sites,
                 ) {
                     m.add_function(func);
                 }
@@ -5881,6 +5932,8 @@ fn lower_type_at(
                         owner_id,
                         None,
                         None, // CB-T3: a constructor is never an emit generator.
+                        file_name,
+                        &mut m.alloc_sites,
                     ) {
                         m.add_function(func);
                     }
@@ -5904,12 +5957,16 @@ fn lower_type_at(
                         owner_id,
                         None,
                         None, // CB-T3: a destructor is never an emit generator.
+                        file_name,
+                        &mut m.alloc_sites,
                     ) {
                         m.add_function(func);
                     }
                 }
             }
-            Member::Nested(nested) => lower_type(nested, new_prefix, src, structs, m),
+            Member::Nested(nested) => {
+                lower_type(nested, new_prefix, src, file_name, structs, m)
+            }
             Member::Property {
                 ty,
                 name,
@@ -5964,6 +6021,8 @@ fn lower_type_at(
                             owner_id,
                             None,
                             None, // CB-T3: a property accessor is never an emit generator.
+                            file_name,
+                            &mut m.alloc_sites,
                         ) {
                             m.add_function(func);
                         }
@@ -6009,6 +6068,8 @@ fn lower_type_at(
                             owner_id,
                             None,
                             None, // CB-T3: a property accessor is never an emit generator.
+                            file_name,
+                            &mut m.alloc_sites,
                         ) {
                             m.add_function(func);
                         }
@@ -6072,6 +6133,10 @@ fn lower_method(
     // calls are then rewritten to `__newbf_ct_emit(<owner_id as i32>, text.Ptr,
     // text.Len)`. `None` for every ordinary method/ctor/dtor (no rewrite).
     emit_owner: Option<StructId>,
+    // MS-T7: the source file name (for the alloc-site table) and the module's
+    // site table (mutably borrowed so each `new` records a module-global site).
+    file_name: &str,
+    alloc_sites: &mut Vec<AllocSite>,
 ) -> Option<Function> {
     // Body-less members (interface/abstract/extern) produce no IR yet.
     let body_stmt = match body {
@@ -6100,7 +6165,16 @@ fn lower_method(
     }));
 
     let fb = FunctionBuilder::new(full_name, ir_params, ret);
-    let mut lw = Lowerer::new(fb, ret, methods, structs, env, cur_type);
+    let mut lw = Lowerer::new(
+        fb,
+        ret,
+        methods,
+        structs,
+        env,
+        cur_type,
+        file_name,
+        alloc_sites,
+    );
     lw.ret_fn_sig = ret_fn_sig;
     lw.emit_owner = emit_owner;
 
@@ -6212,6 +6286,10 @@ fn emit_closure(
     body: &MethodBody,
     src: &str,
     structs: &StructTable,
+    // MS-T7: the module's site table — a closure body may itself contain a user
+    // `new` whose site must be recorded. The lambda's own enclosing "function"
+    // name is its `$lambdaN` symbol; the file name is unknown here (`""`).
+    alloc_sites: &mut Vec<AllocSite>,
 ) -> Option<Function> {
     let body_stmt = match body {
         MethodBody::None => return None,
@@ -6227,7 +6305,10 @@ fn emit_closure(
     }));
     let fb = FunctionBuilder::new(name.to_string(), ir_params, ret);
     let empty: HashMap<String, Vec<MethodSig>> = HashMap::new();
-    let mut lw = Lowerer::new(fb, ret, &empty, structs, &[], None);
+    // MS-T7: closure bodies have no user source file name; their `new`s (if any)
+    // are named `<$lambdaN> @ :line` — best-effort, and the line is `0` because we
+    // pass no per-alloc span from inside a closure body's `new` lowering yet.
+    let mut lw = Lowerer::new(fb, ret, &empty, structs, &[], None, "", alloc_sites);
 
     // Captures: bind each name to its env address `$self[i]`. The env (the
     // `target`) now holds ONLY captures — slot 0 is the first capture, not a
@@ -6361,6 +6442,15 @@ struct Lowerer<'a> {
     /// never desyncs the stack. Its length is the recursion depth the guard
     /// bounds by `MIXIN_MAX_DEPTH`. Reset empty per method in `Lowerer::new`.
     mixin_stack: Vec<MixinFrame>,
+    /// MS-T7: the source file name of the body being lowered, for the
+    /// heap-allocation site table (`<function> @ file:line`). `""` when unknown
+    /// (compiler-synthesized bodies). The function name comes from `self.fb`.
+    file_name: String,
+    /// MS-T7: the module's heap-allocation site table. `heap_alloc` records one
+    /// [`AllocSite`] per `new`/array/closure allocation and passes its INDEX as
+    /// the `site_id` (the third `newbf_alloc` arg). Borrowed mutably from the
+    /// [`Module`] under construction so each site gets a module-global, stable id.
+    alloc_sites: &'a mut Vec<AllocSite>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -6371,6 +6461,11 @@ impl<'a> Lowerer<'a> {
         structs: &'a StructTable,
         env: TyEnv<'a>,
         cur_type: Option<StructId>,
+        // MS-T7: the source file name (for the alloc-site table; `""` if unknown)
+        // and the module's site table (mutably borrowed so `heap_alloc` records
+        // each site with a module-global, stable `site_id`).
+        file_name: &str,
+        alloc_sites: &'a mut Vec<AllocSite>,
     ) -> Self {
         Self {
             fb,
@@ -6395,6 +6490,8 @@ impl<'a> Lowerer<'a> {
             // expansion pushes/truncates this; it must start empty so no frame
             // leaks across methods (mixins.md §4 "reset empty in `Lowerer::new`").
             mixin_stack: Vec::new(),
+            file_name: file_name.to_string(),
+            alloc_sites,
         }
     }
 
@@ -7437,10 +7534,14 @@ impl<'a> Lowerer<'a> {
                 // is stored at index `i`. `emit_closure` reads them back at
                 // `$self[i]`.
                 let words = caps.len() as i128;
+                // MS-T7: the closure env is a compiler-synthesized allocation
+                // (no user `new`), so it carries no named site (`site_id = 0`) —
+                // it is excluded from named-leak reporting (memory-safety.md §6).
                 let env = self.heap_alloc(
                     Value::int(words * 8, IrType::I64),
                     AllocKind::Raw,
                     IrType::Ptr,
+                    None,
                 );
                 for (i, (_n, slot, ty)) in caps.iter().enumerate() {
                     let dst = self.fb.elem_addr(
@@ -9601,8 +9702,18 @@ impl<'a> Lowerer<'a> {
     /// the base). The constant guard-metadata args are set per `kind`:
     ///
     /// * `type_id = StructId.0` for `Object`, `-1` for `Array`/`Raw`;
-    /// * `site_id = 0` (named sites are MS-T7).
-    fn heap_alloc(&mut self, size: Value, kind: AllocKind, ret_ty: IrType) -> Value {
+    /// * `site_id` = the index of this allocation's [`AllocSite`] in
+    ///   [`Module::alloc_sites`] (MS-T7). When `span` is `Some`, a site naming
+    ///   `<enclosing function> @ <file>:<line>` is recorded and its index passed;
+    ///   when `None` (a synthesized allocation with no user source location) the
+    ///   placeholder `site_id = 0` is passed and no site is recorded.
+    fn heap_alloc(
+        &mut self,
+        size: Value,
+        kind: AllocKind,
+        ret_ty: IrType,
+        site: Option<(Span, &str)>,
+    ) -> Value {
         let type_id = match kind {
             AllocKind::Object(id) => id.0 as i32,
             AllocKind::Array { header_bytes } => {
@@ -9615,12 +9726,29 @@ impl<'a> Lowerer<'a> {
             }
             AllocKind::Raw => -1,
         };
+        // MS-T7: record a named site and pass its table index as `site_id`. The
+        // index is module-global (the table is borrowed from the `Module`), so two
+        // allocations in different functions get distinct ids. With no site (a
+        // synthesized alloc) keep the `0` placeholder and record nothing — the
+        // guard still faults/aborts, just without a resolved name.
+        let site_id = match site {
+            Some((sp, src)) => {
+                let id = self.alloc_sites.len() as i32;
+                self.alloc_sites.push(AllocSite {
+                    function: self.fb.name().to_string(),
+                    file: self.file_name.clone(),
+                    line: line_of(src, sp),
+                });
+                id
+            }
+            None => 0,
+        };
         self.fb.call(
             "newbf_alloc",
             vec![
                 size,
                 Value::int(type_id as i128, IrType::I32),
-                Value::int(0, IrType::I32),
+                Value::int(site_id as i128, IrType::I32),
             ],
             ret_ty,
         )
@@ -9630,13 +9758,13 @@ impl<'a> Lowerer<'a> {
     /// `newbf_alloc(8 + count·sizeof(elem))`, store the length in the first 8
     /// bytes, and yield a pointer to the *elements* (8 bytes past the block). So
     /// `a[i]` is an ordinary typed-pointer index and `a.Count` reads `ptr[-1]`.
-    fn alloc_array(&mut self, count: Value, elem: IrType) -> Value {
+    fn alloc_array(&mut self, count: Value, elem: IrType, site: Option<(Span, &str)>) -> Value {
         let esz = self.size_of_ty(elem);
         let bytes = self.fb.bin(IrBin::Mul, count.clone(), esz, IrType::I64);
         let total = self
             .fb
             .bin(IrBin::Add, bytes, Value::int(8, IrType::I64), IrType::I64);
-        let block = self.heap_alloc(total, AllocKind::Array { header_bytes: 8 }, IrType::Ptr);
+        let block = self.heap_alloc(total, AllocKind::Array { header_bytes: 8 }, IrType::Ptr, site);
         self.fb.store(block.clone(), count);
         self.fb
             .elem_addr(block, IrType::U8, Value::int(8, IrType::I64))
@@ -9662,7 +9790,9 @@ impl<'a> Lowerer<'a> {
             }
         }
         let rest: Vec<(Value, IrType)> = it.collect();
-        let arr = self.alloc_array(Value::int(rest.len() as i128, IrType::I64), elem);
+        // MS-T7: a `params T[]` pack is compiler-synthesized (no user `new`), so
+        // it carries no named site.
+        let arr = self.alloc_array(Value::int(rest.len() as i128, IrType::I64), elem, None);
         for (i, (v, t)) in rest.into_iter().enumerate() {
             let cv = self.coerce(v, t, elem);
             let ep = self
@@ -9678,7 +9808,8 @@ impl<'a> Lowerer<'a> {
     fn lower_array_new(&mut self, elem: IrType, len: &Expr, src: &str) -> (Value, IrType) {
         let (lv, lt) = self.expr(len, src);
         let n = self.coerce(lv, lt, IrType::I64);
-        (self.alloc_array(n, elem), IrType::Ptr)
+        // MS-T7: a user-written `new T[n]` — name the site at the length expr.
+        (self.alloc_array(n, elem, Some((len.span(), src))), IrType::Ptr)
     }
 
     /// `new T[](v0, v1, …)` / `new T[N](v0, …)` — an array initializer. The count
@@ -9699,7 +9830,14 @@ impl<'a> Lowerer<'a> {
             }
             None => Value::int(values.len() as i128, IrType::I64),
         };
-        let elems = self.alloc_array(count, elem);
+        // MS-T7: user-written `new T[](…)` / `new T[N](…)` — name the site at the
+        // size expr if present, else the first element value (best-effort source
+        // location for the allocation).
+        let site = size
+            .map(|e| e.span())
+            .or_else(|| values.first().map(|e| e.span()))
+            .map(|sp| (sp, src));
+        let elems = self.alloc_array(count, elem, site);
         for (i, val) in values.iter().enumerate() {
             let (v, vt) = self.expr(val, src);
             let cv = self.coerce(v, vt, elem);
@@ -9832,7 +9970,14 @@ impl<'a> Lowerer<'a> {
         }
         if let Some(id) = self.new_class_id(operand, src) {
             let size = self.fb.size_of(id);
-            let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
+            // MS-T7: a user-written `new T(…)` — name the site at the `new`
+            // operand's span (the enclosing function comes from `self.fb`).
+            let p = self.heap_alloc(
+                size,
+                AllocKind::Object(id),
+                IrType::Ref(id),
+                Some((operand.span(), src)),
+            );
             // Object header (ClassVData*) at offset 0. RF-T2: ALWAYS store
             // `&classvdata_name(id)` — every `StructKind::Ref` now has a
             // ClassVData global (entries empty when vimpls empty), so the header
@@ -9905,7 +10050,9 @@ impl<'a> Lowerer<'a> {
             return cstr;
         };
         let size = self.fb.size_of(id);
-        let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
+        // MS-T7: a target-typed String literal is compiler-synthesized sugar (not
+        // a user `new`), so it carries no named site (memory-safety.md §B1).
+        let p = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id), None);
         // RF-T2: store the ClassVData header (String is a `StructKind::Ref`, so
         // it has a `classvdata_name` global), never null.
         let hdr = self.fb.field_addr(p.clone(), id, 0);
@@ -9935,7 +10082,9 @@ impl<'a> Lowerer<'a> {
         // new String(): newbf_alloc the body, store the ClassVData header
         // (RF-T2: never null — String is a `StructKind::Ref`), run the 0-arg ctor.
         let size = self.fb.size_of(id);
-        let s = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id));
+        // MS-T7: interpolated-string sugar is compiler-synthesized (not a user
+        // `new`), so it carries no named site (memory-safety.md §B1).
+        let s = self.heap_alloc(size, AllocKind::Object(id), IrType::Ref(id), None);
         let hdr = self.fb.field_addr(s.clone(), id, 0);
         let header = self
             .fb
@@ -12391,6 +12540,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
         let id = *t
@@ -12435,6 +12585,7 @@ mod tests {
             file: FileId(0),
             src: wrapper,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
         // Find the `function`-typed field's AST node.
@@ -12488,6 +12639,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
@@ -12555,6 +12707,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
@@ -12619,6 +12772,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
         let id = |n: &str| *t.by_name.get(n).unwrap_or_else(|| panic!("{n} must register"));
@@ -12735,6 +12889,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
         let igreet = *t.by_name.get("IGreet").expect("IGreet registers");
@@ -12804,6 +12959,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
         let id = |n: &str| *t.by_name.get(n).unwrap_or_else(|| panic!("{n} must register"));
@@ -13256,6 +13412,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
 
@@ -13376,6 +13533,7 @@ mod tests {
             file: FileId(0),
             src: &src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
 
@@ -13433,6 +13591,7 @@ mod tests {
             file: FileId(0),
             src: &src,
             unit: &unit,
+            name: "",
         }];
         let t = StructTable::build(&files);
 
@@ -13603,6 +13762,7 @@ mod tests {
             file: FileId(0),
             src: dsrc,
             unit: &dunit,
+            name: "",
         }];
         let dt = StructTable::build(&dfiles);
         let dbl = &dt.mixins.get("Double").expect("Double collected")[0];
@@ -13696,6 +13856,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
@@ -13794,7 +13955,7 @@ mod tests {
         let src = "class Program { public static int32 Main() { return 0; } }";
         let (unit, pd) = parse_file(src, FileId(0));
         assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
-        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
 
@@ -13853,7 +14014,7 @@ mod tests {
         let src = "class Program { public static int32 Main() { return 0; } }";
         let (unit, pd) = parse_file(src, FileId(0));
         assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
-        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
 
@@ -13908,7 +14069,7 @@ mod tests {
         let src = "class Program { public static int32 Main() { return 0; } }";
         let (unit, pd) = parse_file(src, FileId(0));
         assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
-        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
 
@@ -13973,7 +14134,7 @@ mod tests {
         );
         let (unit, pd) = parse_file(&src, FileId(0));
         assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
-        let files = [SourceFile { file: FileId(0), src: &src, unit: &unit }];
+        let files = [SourceFile { file: FileId(0), src: &src, unit: &unit, name: "" }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
 
@@ -14082,7 +14243,7 @@ mod tests {
         "#;
         let (unit, pd) = parse_file(src, FileId(0));
         assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
-        let files = [SourceFile { file: FileId(0), src, unit: &unit }];
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
         let program = crate::analyze(&files);
         let module = lower_program(&files, &program);
 

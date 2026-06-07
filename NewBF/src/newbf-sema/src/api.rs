@@ -117,6 +117,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }])
     }
 

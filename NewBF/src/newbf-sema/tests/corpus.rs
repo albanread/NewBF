@@ -62,6 +62,7 @@ fn sema_does_not_panic_on_real_beef() {
             file: FileId(0),
             src: &src,
             unit: &unit,
+            name: "",
         }]);
 
         total_types += program.graph.types.len();
@@ -128,6 +129,7 @@ fn lowering_does_not_panic_on_real_beef() {
             file: FileId(0),
             src: &src,
             unit: &unit,
+            name: "",
         }];
         let program = analyze(&srcs);
         let module = lower_program(&srcs, &program);
@@ -162,6 +164,7 @@ fn llvm_lowering_verifies_on_real_beef() {
             file: FileId(0),
             src: &src,
             unit: &unit,
+            name: "",
         }];
         let program = analyze(&srcs);
         let module = lower_program(&srcs, &program);
@@ -314,6 +317,7 @@ fn mixins_bf_parses_to_mixin_variants_and_still_verifies() {
         file: FileId(0),
         src: &src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&srcs);
     let module = lower_program(&srcs, &program);
@@ -327,6 +331,7 @@ fn verify_src(src: &str) -> Result<(), String> {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&srcs);
     let module = lower_program(&srcs, &program);

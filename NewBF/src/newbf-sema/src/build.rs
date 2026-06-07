@@ -17,6 +17,10 @@ pub struct SourceFile<'a> {
     pub file: FileId,
     pub src: &'a str,
     pub unit: &'a CompUnit,
+    /// The source file's path / logical name (MS-T7). Used only as
+    /// metadata for the heap-allocation site table (`<function> @ file:line`);
+    /// `""` is fine for callers that don't have a path (e.g. in-memory tests).
+    pub name: &'a str,
 }
 
 /// Accumulates the def graph across files. The global namespace is id 0.

@@ -30,13 +30,16 @@ fn expected(src: &str) -> Option<i32> {
 }
 
 /// Parse → analyze → lower → JIT → call `Program.Main`, returning its `i32`.
-fn run(src: &str) -> i32 {
+/// `name` is the source file's name, threaded into the MS-T7 alloc-site table
+/// (metadata only — it does not affect the returned value).
+fn run_named(src: &str, name: &str) -> i32 {
     let (unit, pdiags) = parse_file(src, FileId(0));
     assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
     let files = [SourceFile {
         file: FileId(0),
         src,
         unit: &unit,
+        name,
     }];
     // Drive comptime member emission to a fixpoint (CB-T4). `run_emission`
     // analyzes + lowers internally each round, splicing emitted `extension`s and
@@ -99,7 +102,7 @@ fn run_corpus_programs_produce_expected_values() {
         let src = std::fs::read_to_string(path).unwrap();
         let name = path.file_name().unwrap().to_string_lossy();
         let exp = expected(&src).unwrap_or_else(|| panic!("{name}: missing `// expect: N`"));
-        let got = run(&src);
+        let got = run_named(&src, &name);
         assert_eq!(
             got, exp,
             "{name}: Program.Main returned {got}, expected {exp}"

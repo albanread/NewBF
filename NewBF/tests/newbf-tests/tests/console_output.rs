@@ -43,6 +43,7 @@ fn run_main(src: &str) {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let module = lower_program(&files, &program);

@@ -235,6 +235,7 @@ fn dump_defs(input: &str) {
             file: newbf_lexer::FileId(i as u32),
             src,
             unit,
+            name: paths[i].to_str().unwrap_or(""),
         })
         .collect();
 
@@ -293,6 +294,7 @@ fn dump_ir(input: &str) {
             file: newbf_lexer::FileId(i as u32),
             src,
             unit,
+            name: paths[i].to_str().unwrap_or(""),
         })
         .collect();
 
@@ -372,6 +374,7 @@ fn dump_llvm(input: &str) {
             file: newbf_lexer::FileId(i as u32),
             src,
             unit,
+            name: paths[i].to_str().unwrap_or(""),
         })
         .collect();
 
@@ -448,6 +451,7 @@ fn compile(input: &str, output: Option<&str>) {
             file: newbf_lexer::FileId(i as u32),
             src,
             unit,
+            name: paths[i].to_str().unwrap_or(""),
         })
         .collect();
 

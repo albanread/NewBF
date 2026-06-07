@@ -23,6 +23,7 @@ class Win32 {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
 

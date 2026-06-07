@@ -61,7 +61,7 @@ fn main() {
         }
     };
 
-    let main = compile_to_main(&src);
+    let main = compile_to_main(&src, &path);
 
     match mode.as_str() {
         "run" => {
@@ -94,13 +94,19 @@ fn main() {
 
 /// Parse → analyze → lower → comptime-emit → JIT, returning a callable
 /// `Program.Main` (a nullary `i32` fn). Mirrors `run_corpus.rs::run`.
-fn compile_to_main(src: &str) -> extern "C" fn() -> i32 {
+///
+/// `path` is threaded through as the source file's name so the MS-T7 alloc-site
+/// table names `<function> @ <path>:<line>` in a fault / leak report; it is also
+/// registered with the runtime guard (`register_alloc_sites`) so the guard's
+/// abort/leak dump can resolve a `site_id` to that text.
+fn compile_to_main(src: &str, path: &str) -> extern "C" fn() -> i32 {
     let (unit, pdiags) = parse_file(src, FileId(0));
     assert!(pdiags.is_empty(), "parse diagnostics: {pdiags:?}");
     let files = [SourceFile {
         file: FileId(0),
         src,
         unit: &unit,
+        name: path,
     }];
     // CB-T4: `run_emission` analyzes + lowers internally (a no-op fast path for
     // generator-free programs, which the guard corpus all are).
@@ -111,6 +117,11 @@ fn compile_to_main(src: &str) -> extern "C" fn() -> i32 {
     let jit = Box::leak(Box::new(
         OrcJit::from_ir(&module).expect("jit builds"),
     ));
+    // MS-T7: register the module's alloc-site table with the runtime guard so a
+    // UAF/double-free abort or a leak report names `<function> @ file:line`. The
+    // table global is emitted only in debug (Stomp) builds; `lookup` returns
+    // `None` when absent, in which case registration is skipped (release).
+    newbf_llvm::register_alloc_sites_from_jit(jit, &module);
     let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
     // SAFETY: guard-corpus entries are `static int32 Main()` — nullary `i32`.
     unsafe { std::mem::transmute::<u64, extern "C" fn() -> i32>(addr) }

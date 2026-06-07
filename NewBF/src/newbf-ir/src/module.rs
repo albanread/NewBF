@@ -138,6 +138,25 @@ pub struct EmitJob {
     pub symbol: String,
 }
 
+/// One heap-allocation **site** — the source location of a `new`/array/closure
+/// allocation (memory-safety.md MS-T7 / §A7). Recorded by sema into
+/// [`Module::alloc_sites`]; its **index** is the `site_id` (the third
+/// `newbf_alloc` arg) the allocation carries. The backend emits the table as the
+/// `__newbf_alloc_sites` global (+ `__newbf_alloc_sites_count`); the runtime guard
+/// registers that table at startup and resolves `site_id → "<function> @
+/// file:line"` for a UAF / double-free / leak report. Owned data only (no
+/// lifetimes), so [`IrType`] stays `Copy` and the table lives on the [`Module`]
+/// — mirroring [`Module::comptime`] / [`Module::emit_jobs`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AllocSite {
+    /// The enclosing function's mangled name, e.g. `"Program.Main"`.
+    pub function: String,
+    /// The source file the `new` is in (path or logical name); empty if unknown.
+    pub file: String,
+    /// 1-based source line of the allocating expression.
+    pub line: u32,
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Module {
     pub name: String,
@@ -163,6 +182,16 @@ pub struct Module {
     /// owned data (no lifetimes, no cross-round `StructId`) so [`IrType`] stays
     /// `Copy`.
     pub emit_jobs: Vec<EmitJob>,
+    /// Heap-allocation site table (memory-safety.md MS-T7 / §A7), one
+    /// [`AllocSite`] per `new`/array/closure allocation. The table **index** is
+    /// the `site_id` that allocation passes as the third `newbf_alloc` arg; the
+    /// backend emits it as `__newbf_alloc_sites` (+ `_count`) and the runtime
+    /// guard registers it to resolve `site_id → "<function> @ file:line"` in a
+    /// fault / leak report. **Default empty** — the first slice (and any
+    /// allocation-free program) pays nothing; site_id `0` is the first real entry
+    /// when present. Mirrors [`Module::comptime`] / [`Module::emit_jobs`] (owned
+    /// data, no lifetimes, so [`IrType`] stays `Copy`). Release omits the table.
+    pub alloc_sites: Vec<AllocSite>,
 }
 
 impl Module {
@@ -176,6 +205,7 @@ impl Module {
             comptime: Vec::new(),
             type_meta: Vec::new(),
             emit_jobs: Vec::new(),
+            alloc_sites: Vec::new(),
         }
     }
 

@@ -35,6 +35,35 @@ pub use mapsym::symbolicate;
 // code's `newbf_alloc`/`newbf_free` resolve via the MS-T0 absolute-symbol
 // seam, so the host only needs the *lifecycle* — set the mode, reset, report).
 pub use newbf_runtime::{
-    GuardMode, LeakReport, install_crash_handler, live_count, report_leaks, reset as guard_reset,
-    set_guard_mode,
+    AllocSiteRaw, GuardMode, LeakReport, format_site, install_crash_handler, live_count,
+    register_alloc_sites, report_leaks, reset as guard_reset, set_guard_mode,
 };
+
+/// MS-T7: register a JIT'd module's `__newbf_alloc_sites` table with the runtime
+/// guard so a UAF / double-free / leak report names `<function> @ file:line`
+/// (memory-safety.md §A7). Looks up the emitted table global by name in `jit`
+/// and registers its address + `ir.alloc_sites.len()` entries. A no-op (clears
+/// the table) when the table global is absent — release builds omit it, and an
+/// allocation-free debug program still emits an empty table that resolves to a
+/// clean `None`. The host MUST keep `jit` alive for as long as any report may
+/// run (the table strings live in the JIT'd module's constant memory).
+///
+/// This is the JIT side of the registration seam; the AOT side calls the C-ABI
+/// `newbf_register_alloc_sites` from the entry stub (MS-T3b).
+pub fn register_alloc_sites_from_jit(jit: &OrcJit, ir: &newbf_ir::Module) {
+    match jit.lookup("__newbf_alloc_sites") {
+        Some(addr) => {
+            // SAFETY: `addr` is the emitted `[N x %struct.AllocSite]` global with
+            // exactly `ir.alloc_sites.len()` entries (the backend emits both from
+            // the same `ir.alloc_sites`); its `char8*` strings are private
+            // constants living for the JIT's lifetime, which the caller keeps
+            // mapped per this function's contract.
+            unsafe {
+                register_alloc_sites(addr as *const AllocSiteRaw, ir.alloc_sites.len());
+            }
+        }
+        // No table (release / no emission): clear any stale registration so a
+        // resolve falls back to the bare address.
+        None => unsafe { register_alloc_sites(core::ptr::null(), 0) },
+    }
+}

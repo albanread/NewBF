@@ -23,6 +23,7 @@ fn eval_comptime(src: &str, name: &str) -> i64 {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let module = lower_program(&files, &program);
@@ -89,6 +90,7 @@ fn comptime_call_folds_into_caller() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);
@@ -135,6 +137,7 @@ fn comptime_call_with_const_arg_folds() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);
@@ -175,6 +178,7 @@ fn comptime_i32_arg_folds_width_correct_and_verify_clean() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);
@@ -221,6 +225,7 @@ fn comptime_nested_calls_fold_inner_first() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);
@@ -278,6 +283,7 @@ fn emit_module(src: &str) -> newbf_ir::Module {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let (module, _outcome) = run_emission(&files).expect("comptime emission succeeds");
     module
@@ -413,6 +419,7 @@ fn comptime_emit_malformed_aborts_with_analyze_diagnostic() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     // Emission returns Ok (no crash, no hang, no Err) but with diagnostics — the
     // driver/harness surfaces those as a failure.

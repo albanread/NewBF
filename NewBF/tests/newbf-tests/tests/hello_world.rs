@@ -48,6 +48,7 @@ fn compiles_a_hello_world_that_prints() {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);

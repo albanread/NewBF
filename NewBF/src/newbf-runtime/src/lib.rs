@@ -42,6 +42,7 @@ pub use crash_dump::{
     update_guard_metrics,
 };
 
+pub use guard::sites::{format_site, register_alloc_sites, AllocSiteRaw};
 pub use guard::{GuardMode, LeakReport, live_count, report_leaks, reset, set_guard_mode};
 
 // ──────────────────────────────────────────────────────────────────── //
@@ -140,15 +141,46 @@ pub extern "C" fn newbf_guard_report_leaks() -> u64 {
     } else {
         let _ = writeln!(stderr, "newbf guard: {} leak(s)", leaks.len());
         for l in &leaks {
-            let _ = writeln!(
-                stderr,
-                "  leak: ptr={:#018x} size={} type_id={} site_id={}",
-                l.ptr, l.size, l.type_id, l.site_id
-            );
+            // MS-T7: name the leaking allocation's site when it resolves against
+            // the registered table; otherwise show the bare site_id + address.
+            match format_site(l.site_id) {
+                Some(name) => {
+                    let _ = writeln!(
+                        stderr,
+                        "  leak: {name} (ptr={:#018x} size={} type_id={})",
+                        l.ptr, l.size, l.type_id
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        stderr,
+                        "  leak: ptr={:#018x} size={} type_id={} site_id={}",
+                        l.ptr, l.size, l.type_id, l.site_id
+                    );
+                }
+            }
         }
     }
     let _ = stderr.flush();
     leaks.len() as u64
+}
+
+/// Register the module's `__newbf_alloc_sites` table (base pointer + entry
+/// count) so a UAF / double-free / leak report names `<function> @ file:line`
+/// (memory-safety.md §A7, MS-T7). The C-ABI seam: a host calls this once after
+/// the module is JIT'd / loaded with the table's address (JIT hosts resolve it
+/// via the same `lookup`; AOT can call this from the entry stub — MS-T3b). A
+/// null `ptr` / `count == 0` clears the table.
+///
+/// # Safety
+/// C-ABI export. `ptr` must point to `count` valid `{ char8* function, char8*
+/// file, i32 line }` entries (the emitted `%struct.AllocSite` layout) that stay
+/// valid for as long as any report may run. See [`register_alloc_sites`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn newbf_register_alloc_sites(ptr: *const AllocSiteRaw, count: i64) {
+    let count = if count < 0 { 0 } else { count as usize };
+    // SAFETY: forwarded per this export's contract.
+    unsafe { register_alloc_sites(ptr, count) };
 }
 
 /// Enter a comptime evaluation scope: allocations until the matching

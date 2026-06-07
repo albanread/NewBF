@@ -77,6 +77,12 @@ impl FunctionBuilder {
         BlockId(0)
     }
 
+    /// The function's (mangled) name. Used by sema to label heap-allocation
+    /// sites (MS-T7: `<function> @ file:line`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn param(&self, i: u32) -> Value {
         Value::Param(i)
     }

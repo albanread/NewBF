@@ -107,6 +107,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }])
     }
 
@@ -190,11 +191,13 @@ namespace Demo {
                 file: FileId(0),
                 src: src1,
                 unit: &u1,
+                name: "",
             },
             SourceFile {
                 file: FileId(1),
                 src: src2,
                 unit: &u2,
+                name: "",
             },
         ]);
         let ns_n: Vec<_> = p
@@ -415,6 +418,7 @@ typealias Id = int;
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         let program = analyze(&files);
         let module = lower_program(&files, &program);

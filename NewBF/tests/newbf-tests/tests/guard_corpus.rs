@@ -50,16 +50,25 @@ fn guard_corpus_dir() -> PathBuf {
 /// `CARGO_BIN_EXE_guard_runner` for this crate's own binary, so we drive the
 /// freshly-built runner without hard-coding a target path.
 fn run_child(mode: &str, file: &str) -> i32 {
+    run_child_captured(mode, file).0
+}
+
+/// As [`run_child`], but also captures the child's stderr (where the guard's
+/// double-free abort + the leak report write the MS-T7 named site). Returns
+/// `(exit_code, stderr)`.
+fn run_child_captured(mode: &str, file: &str) -> (i32, String) {
     let runner = env!("CARGO_BIN_EXE_guard_runner");
     let path = guard_corpus_dir().join(file);
-    let status = Command::new(runner)
+    let out = Command::new(runner)
         .arg(mode)
         .arg(&path)
-        .status()
+        .output()
         .unwrap_or_else(|e| panic!("spawn {runner} {mode} {}: {e}", path.display()));
-    status
+    let code = out
+        .status
         .code()
-        .unwrap_or_else(|| panic!("{file}: child terminated without an exit code: {status:?}"))
+        .unwrap_or_else(|| panic!("{file}: child terminated without an exit code: {:?}", out.status));
+    (code, String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// `uaf_after_delete.bf` — read a field after `delete`. The quarantined page
@@ -91,6 +100,43 @@ fn double_free_aborts_via_guard() {
     // Make absolutely sure we did not silently succeed or merely fault.
     assert_ne!(code, 0, "double_free must not exit cleanly");
     assert_ne!(code, ACCESS_VIOLATION, "double_free is an abort, not a fault");
+}
+
+/// **MS-T7 PROOF** — the double-free abort report NAMES the offending `new`'s
+/// site as `<function> @ file:line`, not just an address. `double_free.bf` does
+/// `Node p = new Node();` on line 12 inside `Program.Main`, so the guard's abort
+/// message (written to the child's stderr) must contain `Program.Main`, the
+/// source file name, and `:12`. This is the site-table → registration →
+/// resolution round-trip working end-to-end (sema records the site, the backend
+/// emits `__newbf_alloc_sites`, the runner registers it, the guard resolves the
+/// tombstoned alloc's `site_id`).
+#[test]
+fn double_free_report_names_the_alloc_site() {
+    let (code, stderr) = run_child_captured("run", "double_free.bf");
+    assert_eq!(
+        code, GUARD_ABORT,
+        "double_free: expected guard abort, got {code} ({:#010x}); stderr:\n{stderr}",
+        code as u32
+    );
+    assert!(
+        stderr.contains("double free"),
+        "expected a double-free abort line; stderr:\n{stderr}"
+    );
+    // The named site: function, file, and the `new`'s line (12).
+    assert!(
+        stderr.contains("Program.Main"),
+        "MS-T7: abort report must name the enclosing function `Program.Main`; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("double_free.bf:12"),
+        "MS-T7: abort report must name the offending `new`'s file:line \
+         (double_free.bf:12); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Program.Main @ ") && stderr.contains(":12"),
+        "MS-T7: abort report must read `<function> @ file:line`; stderr:\n{stderr}"
+    );
 }
 
 /// `no_leak_balanced.bf` — balanced `new`/`delete`. The child exits cleanly AND

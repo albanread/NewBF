@@ -50,6 +50,7 @@ fn fixture_report() -> String {
         file: FileId(0),
         src: FIXTURE,
         unit: &unit,
+        name: "",
     }];
     let program = analyze(&files);
     let mut module = lower_program(&files, &program);

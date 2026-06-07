@@ -36,6 +36,7 @@ fn double_free_diags(name: &str) -> Vec<Diagnostic> {
         file: FileId(0),
         src: &src,
         unit: &unit,
+        name: "",
     }]);
     program
         .diagnostics
@@ -53,6 +54,7 @@ fn leak_diags(name: &str) -> Vec<Diagnostic> {
         file: FileId(0),
         src: &src,
         unit: &unit,
+        name: "",
     }]);
     program
         .diagnostics
@@ -157,6 +159,7 @@ fn double_free_diags_src(src: &str) -> Vec<Diagnostic> {
         file: FileId(0),
         src,
         unit: &unit,
+        name: "",
     }]);
     program
         .diagnostics

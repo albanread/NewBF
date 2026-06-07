@@ -27,8 +27,8 @@ pub use inst::{
     BinOp, BlockId, Callee, CastKind, CmpPred, Const, InstData, InstId, InstKind, Terminator, Value,
 };
 pub use module::{
-    EmitJob, FieldDef, FieldMeta, GlobalDef, MethodMeta, Module, ReflectPolicy, StructDef,
-    TypeMeta, VtableDef,
+    AllocSite, EmitJob, FieldDef, FieldMeta, GlobalDef, MethodMeta, Module, ReflectPolicy,
+    StructDef, TypeMeta, VtableDef,
 };
 pub use print::{format_ir, format_reflection};
 pub use ty::{IrType, StructId};

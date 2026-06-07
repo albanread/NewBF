@@ -78,6 +78,7 @@ pub fn emit_module<'ctx>(ctx: &'ctx Context, ir: &IrModule) -> LlvmModule<'ctx> 
     cg.declare_all(ir);
     cg.emit_classvdata(ir);
     cg.emit_metadata(ir);
+    cg.emit_alloc_sites(ir);
     cg.emit_globals(ir);
     for f in &ir.funcs {
         if !f.is_extern {
@@ -595,6 +596,70 @@ impl<'ctx> Codegen<'ctx, '_> {
             .build_return(Some(&unknown.as_pointer_value()))
             .unwrap();
     }
+
+    /// MS-T7: emit the heap-allocation **site table** (`Module::alloc_sites`)
+    /// the runtime guard registers to resolve a `site_id` to `"<function> @
+    /// file:line"` in a UAF / double-free / leak report (memory-safety.md §A7).
+    ///
+    /// Emits two globals whose layout MUST match `newbf_runtime::guard`'s reader
+    /// (`AllocSiteRaw`):
+    ///   * `@__newbf_alloc_sites` — a constant `[N x %struct.AllocSite]`, where
+    ///     `%struct.AllocSite = { ptr function, ptr file, i32 line }`. The `i`-th
+    ///     entry is the site whose `site_id` is `i` (the third `newbf_alloc` arg).
+    ///   * `@__newbf_alloc_sites_count` — a constant `i32` = `N`.
+    /// The function/file strings are private NUL-terminated `char8*` constants
+    /// (`emit_cstr`), exactly like the reflection name strings.
+    ///
+    /// **Release omits the table** (memory-safety.md §A7): gated on
+    /// `debug_assertions`, so a release build of the compiler emits nothing
+    /// (zero bloat). The IR the allocations carry is byte-identical either way —
+    /// only the (debug-only) lookup table differs; an unresolvable `site_id` in
+    /// release just falls back to the bare address in any report.
+    ///
+    /// An allocation-free program (`alloc_sites` empty) emits a `[0 x ...]` table
+    /// + count `0` so the registration symbols always resolve (the host's
+    /// `lookup("__newbf_alloc_sites")` is a clean `None`/empty either way).
+    #[cfg(debug_assertions)]
+    fn emit_alloc_sites(&self, ir: &IrModule) {
+        let i32_ty = self.ctx.i32_type();
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+
+        // %struct.AllocSite = { function(char8*), file(char8*), line(i32) }.
+        // Field order + types are the runtime `AllocSiteRaw` reader contract.
+        let site_ty = self.ctx.opaque_struct_type("struct.AllocSite");
+        site_ty.set_body(&[ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false);
+
+        let mut entries = Vec::with_capacity(ir.alloc_sites.len());
+        for s in &ir.alloc_sites {
+            let func_ptr = self.emit_cstr(&s.function);
+            let file_ptr = self.emit_cstr(&s.file);
+            entries.push(site_ty.const_named_struct(&[
+                func_ptr.into(),
+                file_ptr.into(),
+                i32_ty.const_int(u64::from(s.line), false).into(),
+            ]));
+        }
+
+        let count = entries.len() as u32;
+        let table_arr = site_ty.const_array(&entries);
+        let table = self
+            .module
+            .add_global(table_arr.get_type(), None, "__newbf_alloc_sites");
+        table.set_initializer(&table_arr);
+        table.set_constant(true);
+
+        let count_g = self
+            .module
+            .add_global(i32_ty, None, "__newbf_alloc_sites_count");
+        count_g.set_initializer(&i32_ty.const_int(u64::from(count), false));
+        count_g.set_constant(true);
+    }
+
+    /// Release build: omit the site table entirely (memory-safety.md §A7 — "release
+    /// omits the table"). A no-op; an unresolvable `site_id` in a report falls back
+    /// to the bare address.
+    #[cfg(not(debug_assertions))]
+    fn emit_alloc_sites(&self, _ir: &IrModule) {}
 
     /// Emit each `static` field as a mutable, zero-initialized module global.
     /// Only scalar globals (int/float/bool/ptr/ref) are emitted; an aggregate
@@ -1761,6 +1826,65 @@ mod tests {
         assert!(
             !ir2.contains("@.fieldinfo"),
             "an unmarked-only module emits no FieldInfo array global (strip):\n{ir2}"
+        );
+    }
+
+    /// MS-T7: `Module::alloc_sites` lowers to the `__newbf_alloc_sites` table the
+    /// runtime guard registers — `%struct.AllocSite = { ptr function, ptr file,
+    /// i32 line }`, a constant array of those, plus an `i32` count. The runtime's
+    /// `AllocSiteRaw` reader pins this exact field order/types (memory-safety.md
+    /// §A7). The strings + line of each site appear in the emitted IR. (This test
+    /// only runs in debug — release omits the table, gated by `debug_assertions`.)
+    #[cfg(debug_assertions)]
+    #[test]
+    fn emit_alloc_sites_table_with_function_file_line() {
+        use newbf_ir::AllocSite;
+
+        let mut m = IrModule::new("t");
+        m.alloc_sites.push(AllocSite {
+            function: "Program.Main".into(),
+            file: "uaf.bf".into(),
+            line: 4,
+        });
+        m.alloc_sites.push(AllocSite {
+            function: "Node.$ctor0".into(),
+            file: "node.bf".into(),
+            line: 17,
+        });
+        let ir = lower_to_string(&m);
+        assert!(
+            ir.contains("%struct.AllocSite = type { ptr, ptr, i32 }"),
+            "the AllocSite reader layout must be {{ ptr, ptr, i32 }}:\n{ir}"
+        );
+        assert!(
+            ir.contains("@__newbf_alloc_sites = constant [2 x %struct.AllocSite]"),
+            "the site table must be a 2-entry constant array:\n{ir}"
+        );
+        assert!(
+            ir.contains("@__newbf_alloc_sites_count = constant i32 2"),
+            "the count global must equal the number of sites:\n{ir}"
+        );
+        // The site strings + lines are present (emitted as private cstr globals).
+        for needle in ["Program.Main", "uaf.bf", "i32 4", "Node.$ctor0", "node.bf", "i32 17"] {
+            assert!(ir.contains(needle), "site data {needle:?} missing:\n{ir}");
+        }
+    }
+
+    /// MS-T7: an allocation-free module still emits an EMPTY table + count 0 (so
+    /// the host's `lookup("__newbf_alloc_sites")` resolves to a clean, empty
+    /// registration rather than failing). Debug-only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn emit_alloc_sites_empty_table_when_no_sites() {
+        let m = IrModule::new("t");
+        let ir = lower_to_string(&m);
+        assert!(
+            ir.contains("@__newbf_alloc_sites = constant [0 x %struct.AllocSite]"),
+            "an allocation-free module emits a [0 x ...] table:\n{ir}"
+        );
+        assert!(
+            ir.contains("@__newbf_alloc_sites_count = constant i32 0"),
+            "count 0 for an allocation-free module:\n{ir}"
         );
     }
 }

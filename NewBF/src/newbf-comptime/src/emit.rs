@@ -292,6 +292,7 @@ fn run_emission_inner(
                 file: f.file,
                 src: f.src,
                 unit: f.unit,
+                name: f.name,
             })
             .collect();
         for (i, (src, unit)) in generated.iter().enumerate() {
@@ -299,6 +300,8 @@ fn run_emission_inner(
                 file: FileId(GENERATED_FILE_BASE + i as u32),
                 src: src.as_str(),
                 unit,
+                // Comptime-generated source has no user file name.
+                name: "<generated>",
             });
         }
         let program = analyze(&files);
@@ -594,6 +597,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         run_emission(&files).expect("emission succeeds")
     }
@@ -805,6 +809,7 @@ mod tests {
             file: FileId(0),
             src,
             unit: &unit,
+            name: "",
         }];
         run_emission_inner(&files, &config, run_gens).expect("inner emission returns Ok")
     }

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use crate::crash_dump::{note_free, note_memory_guard_installed, update_guard_metrics};
 
 pub mod ledger;
+pub mod sites;
 pub mod stomp;
 pub mod vm;
 
@@ -176,6 +177,14 @@ impl<V: vm::Vm> Guard<V> {
         self.ledger.clear();
         self.publish();
     }
+
+    /// MS-T7: the `site_id` recorded at the original `new` for the ledger entry
+    /// keyed by `ptr` (live OR tombstoned — entries are never removed), so the
+    /// double-free abort can name the offending allocation site. `None` for a
+    /// wild free (pointer never allocated).
+    pub(crate) fn alloc_site_of(&self, ptr: usize) -> Option<u32> {
+        self.ledger.get(ptr).map(|m| m.site_id)
+    }
 }
 
 // `OnceLock<Mutex<Guard>>` — lazily built on first guarded use.
@@ -219,13 +228,20 @@ fn stomp_free(ptr: *mut u8) {
     if ptr.is_null() {
         return; // free(NULL) is a no-op.
     }
-    let result = {
+    let (result, site_id) = {
         let mut g = guard().lock().unwrap();
-        g.check_free(ptr as usize, 0)
+        // MS-T7: on a double-free the offending pointer still has its (now
+        // tombstoned) ledger entry recording the original `new`'s `site_id`. Read
+        // it under the lock (the entry is never removed) so the abort message can
+        // name `<function> @ file:line` of that `new`. `None` for a wild free
+        // (no entry) — the address is the only available locator.
+        let site_id = g.alloc_site_of(ptr as usize);
+        let result = g.check_free(ptr as usize, 0);
+        (result, site_id)
         // lock released here (scope end) before any abort.
     };
     if let Err(kind) = result {
-        abort_on_bad_free(ptr as usize, kind);
+        abort_on_bad_free(ptr as usize, kind, site_id);
     }
 }
 
@@ -235,19 +251,27 @@ fn stomp_free(ptr: *mut u8) {
 /// the SEH filter / panic hook is not involved; this is a deliberate,
 /// diagnosed termination, not a fault.
 #[cold]
-fn abort_on_bad_free(ptr: usize, kind: FreeError) -> ! {
+fn abort_on_bad_free(ptr: usize, kind: FreeError, site_id: Option<u32>) -> ! {
     use std::io::Write as _;
     let msg = match kind {
         FreeError::DoubleFree => "double free",
         FreeError::WildFree => "wild free (pointer never allocated)",
     };
+    // MS-T7: name the offending allocation site (`<function> @ file:line`) when
+    // its `site_id` resolves against the registered table; otherwise fall back to
+    // the bare address (the address is always available; the name needs both a
+    // recorded site and a registered table — debug only).
+    let named = site_id.and_then(sites::format_site);
     // Best-effort stderr line; the crash-dump atomics already carry the heap
     // state and last-free address for a fuller picture.
     let mut stderr = std::io::stderr();
-    let _ = writeln!(
-        stderr,
-        "newbf guard: {msg} of {ptr:#018x} -> abort"
-    );
+    let _ = match &named {
+        Some(name) => writeln!(
+            stderr,
+            "newbf guard: {msg} of {ptr:#018x} (allocated at {name}) -> abort"
+        ),
+        None => writeln!(stderr, "newbf guard: {msg} of {ptr:#018x} -> abort"),
+    };
     let _ = stderr.flush();
     std::process::abort();
 }
