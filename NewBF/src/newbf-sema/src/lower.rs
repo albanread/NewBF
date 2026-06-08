@@ -5881,6 +5881,27 @@ fn lower_type_at(
                             IrType::Void,
                         );
                     }
+                    // CR-T0: the sibling diagnostic marker the relaxed
+                    // `try_lower_emit_type_body` emits for a `Compiler.EmitTypeBody`
+                    // arg that is neither a string literal nor a `Ref(String)`
+                    // (R4 — diagnostic, never a silent decline into the stub). Same
+                    // `void(i32, char8*, i32)` C ABI as the emit shim; declared here
+                    // so the IR is self-describing, stripped alongside the emit shim
+                    // by `newbf-comptime`'s `strip_emitter_and_shim`. No corpus
+                    // program hits the error path, so this declaration is inert for
+                    // every current program (only ever present in a generator-owning
+                    // module, and there only as an unused extern).
+                    if !m.funcs.iter().any(|f| f.name == "__newbf_ct_emit_error") {
+                        m.declare_extern(
+                            "__newbf_ct_emit_error",
+                            vec![
+                                IrParam { name: None, ty: IrType::I32 },
+                                IrParam { name: None, ty: IrType::Ptr },
+                                IrParam { name: None, ty: IrType::I32 },
+                            ],
+                            IrType::Void,
+                        );
+                    }
                     // The owner-id literal sema injects into the rewritten call is
                     // the owner's current dense `StructId` (resolved back to the
                     // qual-name via CB-T4's per-round `name → id` map). A generator
@@ -9849,28 +9870,53 @@ impl<'a> Lowerer<'a> {
         (elems, IrType::Ptr)
     }
 
-    /// CB-T3: inside a `[Comptime, EmitGenerator]` body, rewrite a
+    /// CB-T3 / CR-T0: inside a `[Comptime, EmitGenerator]` body, rewrite a
     /// `Compiler.EmitTypeBody(text)` call into the host emit shim
     /// `__newbf_ct_emit(<owner-id literal>, text.Ptr, text.Len)`
-    /// (comptime-breadth §3.3) so that when CB-T4 JIT-runs the generator, the
-    /// emitted text lands in `EMIT_SINK` keyed by the owner.
+    /// (comptime-breadth §3.3 / comptime-reflection §3.2) so that when CB-T4
+    /// JIT-runs the generator, the emitted text lands in `EMIT_SINK` keyed by the
+    /// owner.
     ///
     /// Returns `None` (no rewrite — the call lowers normally) unless **all** of:
     ///   * `self.emit_owner` is `Some(owner_id)` (we're in an emit generator);
     ///   * the receiver `base` is exactly `Compiler` and `name == "EmitTypeBody"`;
-    ///   * there is exactly one argument that is a **string literal** (the v1
-    ///     surface — comptime-breadth §1.1 / §8). A non-literal text argument
-    ///     declines (falls through to the harmless `Compiler.EmitTypeBody` stub).
+    ///   * there is exactly one argument.
     ///
-    /// The emitted call's signature is EXACTLY `void __newbf_ct_emit(i32, ptr,
-    /// i32)` — matching `newbf_comptime::__newbf_ct_emit(i32 owner_type_id,
+    /// Once we are committed (an emit generator calling `Compiler.EmitTypeBody`
+    /// with one arg), the **text argument** is accepted in exactly two shapes —
+    /// and **anything else is a loud diagnostic, never a silent decline** (R4):
+    ///   * a **string literal** (CB-T3's v1 fast path) — decided from the AST
+    ///     *before* any emission, so the literal lowering is byte-identical to
+    ///     before (behavior-preserving);
+    ///   * a runtime **`Ref(String)`** value (CR-T0) — lowered **exactly once**,
+    ///     then its byte pointer (`Ptr()` → `char8*`) and length (`Length()` →
+    ///     `int` = i64, narrowed to i32 via [`Self::coerce`]) are read **through
+    ///     the methods table** (the `append_to_string` pattern, never a raw
+    ///     `field_addr`: `String` is a class whose field 0 is the `%ClassVData`
+    ///     header, so a direct char-pointer field read would be off-by-one).
+    ///
+    /// **Why a diagnostic and not `return None` for the non-literal/non-`String`
+    /// case (R4).** The caller (`Expr::Call` → `Expr::Member`) falls through on
+    /// `None` to `lower_method_call`, which **re-lowers** the arg — so (a) a
+    /// side-effecting arg already lowered here would be emitted *twice* (a leaked
+    /// `new String` copy), and (b) a non-`String` arg would resolve against the
+    /// empty `[Comptime] Compiler.EmitTypeBody(String)` stub and the emission
+    /// would be **silently dropped**. So once we have lowered the arg we **never**
+    /// `return None`: a `Ref(String)` is consumed; anything else emits the
+    /// recognizable `void __newbf_ct_emit_error(i32 owner, char8* msg, i32 len)`
+    /// marker (a sibling of the emit shim — see `newbf-comptime`'s sandbox
+    /// binding, which surfaces it into `EmitOutcome.diagnostics`) and recovers.
+    /// `lower_program` has no diagnostic sink (comptime-breadth invariant), so the
+    /// marker — not a `Diagnostic` push — is how the seam stays loud.
+    ///
+    /// The emitted (success) call's signature is EXACTLY `void __newbf_ct_emit(i32,
+    /// ptr, i32)` — matching `newbf_comptime::__newbf_ct_emit(i32 owner_type_id,
     /// *const u8 ptr, i32 len)`. The owner-id literal is the owner's dense
-    /// `StructId` (the per-round id CB-T4 resolves back to the qual-name).
-    /// `text.Ptr` is the string literal's `char8*` (a `Const::Str`, the same
-    /// construct ordinary string literals lower to); `text.Len` is its decoded
-    /// byte length as an `i32`. The LLVM backend `get_or_declare`s
-    /// `__newbf_ct_emit` from the call's argument types, so no explicit extern
-    /// declaration is required for the IR/LLVM to be well-formed.
+    /// `StructId` (the per-round id CB-T4 resolves back to the qual-name). For a
+    /// literal, `text.Ptr` is the string literal's `char8*` (a `Const::Str`, the
+    /// same construct ordinary string literals lower to) and `text.Len` is its
+    /// decoded byte length as an `i32`. The LLVM backend `get_or_declare`s the
+    /// shim from the call's argument types, so the IR/LLVM is well-formed.
     fn try_lower_emit_type_body(
         &mut self,
         base: &Expr,
@@ -9887,14 +9933,118 @@ impl<'a> Lowerer<'a> {
         if b.text(src) != "Compiler" {
             return None;
         }
-        // v1: exactly one string-literal text argument.
-        let [Expr::Str(s)] = args else { return None };
-        let text = decode_string_literal(s.text(src));
-        let len = text.len() as i128;
-        let ptr = Value::str(text);
-        // void __newbf_ct_emit(i32 owner, char8* ptr, i32 len)
+        // Exactly one text argument; otherwise decline EARLY (before any
+        // emission) — an arity mismatch is the ordinary unresolved-call path's
+        // job, not ours, and declining here is safe precisely because nothing
+        // has been lowered yet.
+        let [arg] = args else { return None };
+
+        // Fast path (back-compat): a string LITERAL stays a static `.rodata`
+        // `Const::Str` + a compile-time `text.len()` constant. The branch is
+        // decided from the AST *before* any emission, so no double-evaluation is
+        // possible and this lowering is byte-identical to CB-T3 (behavior-
+        // preserving — the entire run-corpus literal path is untouched).
+        if let Expr::Str(s) = arg {
+            let text = decode_string_literal(s.text(src));
+            let len = text.len() as i128;
+            let ptr = Value::str(text);
+            // void __newbf_ct_emit(i32 owner, char8* ptr, i32 len)
+            self.fb.call(
+                "__newbf_ct_emit",
+                vec![
+                    Value::int(owner_id.0 as i128, IrType::I32),
+                    ptr,
+                    Value::int(len, IrType::I32),
+                ],
+                IrType::Void,
+            );
+            // `EmitTypeBody` is `void`; an expression-statement use discards this.
+            return Some((Value::int(0, IrType::I32), IrType::Void));
+        }
+
+        // CR-T0: any expression that lowers to `Ref(String)`. Lower it EXACTLY
+        // ONCE — `Ptr()`/`Length()` are then emitted as direct `fb.call`s on the
+        // already-lowered `Value`, never by re-passing the `Expr` through
+        // `lower_method_call` (which would re-lower the receiver → the double-eval
+        // hazard R4 flags).
+        let (sval, sty) = self.expr(arg, src);
+        let string_id = self.structs.by_name.get("String").copied();
+
+        if let Some(string_id) = string_id
+            && sty == IrType::Ref(string_id)
+        {
+            // Read `text.Ptr()` (→ `char8*`) and `text.Length()` (→ `int` = i64)
+            // through the methods table (the `append_to_string` pattern at
+            // `lower.rs:10134`), NOT `field_addr` — `String` is a class whose
+            // field 0 is the `%ClassVData` header, so reading `mPtr`/`mLength` by
+            // index is off-by-one and layout-fragile. Both are instance methods
+            // with only the leading `this` (`params.len() == 1`, no explicit
+            // params), matching the `String.bf` `Ptr()`/`Length()` signatures.
+            let ptr_sig = self.structs.methods[string_id.0 as usize]
+                .get("Ptr")
+                .and_then(|cands| {
+                    cands
+                        .iter()
+                        .find(|m| m.is_instance && m.params.len() == 1)
+                })
+                .cloned();
+            let len_sig = self.structs.methods[string_id.0 as usize]
+                .get("Length")
+                .and_then(|cands| {
+                    cands
+                        .iter()
+                        .find(|m| m.is_instance && m.params.len() == 1)
+                })
+                .cloned();
+
+            // Corlib is linked whenever a `Ref(String)` reaches here, so both
+            // sigs are present. If a future change ever removes one, fall back to
+            // the SAME loud diagnostic (below) rather than panic — never a silent
+            // miscompile.
+            if let (Some(ptr_sig), Some(len_sig)) = (ptr_sig, len_sig) {
+                let ptr = self
+                    .fb
+                    .call(ptr_sig.full_name, vec![sval.clone()], ptr_sig.ret);
+                let len64 = self.fb.call(len_sig.full_name, vec![sval], len_sig.ret);
+                // The shim wants `i32`; `Length()` is `int` (i64). Narrow via
+                // `coerce` (its int→int arm picks `CastKind::Trunc` by width) —
+                // there is no `fb.trunc`.
+                let len = self.coerce(len64, len_sig.ret, IrType::I32);
+                self.fb.call(
+                    "__newbf_ct_emit",
+                    vec![Value::int(owner_id.0 as i128, IrType::I32), ptr, len],
+                    IrType::Void,
+                );
+                return Some((Value::int(0, IrType::I32), IrType::Void));
+            }
+        }
+
+        // Neither a string literal nor a `Ref(String)`: a real user error. The
+        // arg has already been lowered ONCE (above) — we MUST NOT `return None`
+        // (that re-lowers it in the fall-through → double-emit) and MUST NOT let
+        // it resolve against the empty `Compiler.EmitTypeBody(String)` stub (the
+        // emission would vanish). Emit the loud `__newbf_ct_emit_error` marker
+        // carrying the diagnostic text, then recover with the `void` result.
+        self.emit_ct_emit_error(
+            owner_id,
+            "Compiler.EmitTypeBody expects a string literal or a String",
+        );
+        Some((Value::int(0, IrType::I32), IrType::Void))
+    }
+
+    /// CR-T0: emit the `void __newbf_ct_emit_error(i32 owner, char8* msg, i32
+    /// len)` diagnostic marker — a sibling of `__newbf_ct_emit` carrying a
+    /// human-readable message. `lower_program` has no diagnostic sink
+    /// (comptime-breadth invariant), so a bad `Compiler.EmitTypeBody` argument is
+    /// surfaced this way: the marker is recognizable in the lowered IR (a sema
+    /// unit test asserts it, and that no `EmitTypeBody` call remains), and the
+    /// `newbf-comptime` sandbox binds it so that if the generator actually runs
+    /// the message reaches `EmitOutcome.diagnostics`. Never silent, never a panic.
+    fn emit_ct_emit_error(&mut self, owner_id: StructId, msg: &str) {
+        let len = msg.len() as i128;
+        let ptr = Value::str(msg.to_string());
         self.fb.call(
-            "__newbf_ct_emit",
+            "__newbf_ct_emit_error",
             vec![
                 Value::int(owner_id.0 as i128, IrType::I32),
                 ptr,
@@ -9902,8 +10052,6 @@ impl<'a> Lowerer<'a> {
             ],
             IrType::Void,
         );
-        // `EmitTypeBody` is `void`; an expression-statement use discards this.
-        Some((Value::int(0, IrType::I32), IrType::Void))
     }
 
     /// `a.Count` / `a.Length` for a heap-array local → load the length header
@@ -14258,6 +14406,264 @@ mod tests {
         assert!(
             !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
             "no emit shim should be declared without an [EmitGenerator]"
+        );
+    }
+
+    /// Locate the lowered generator function `Owner.Generate` in a module built
+    /// from `src` (parse → analyze → lower). Shared by the CR-T0 tests.
+    #[cfg(test)]
+    fn lower_generator_fn<'m>(
+        module: &'m newbf_ir::Module,
+        gen_name: &str,
+    ) -> &'m newbf_ir::Function {
+        module
+            .funcs
+            .iter()
+            .find(|f| f.name == gen_name)
+            .unwrap_or_else(|| panic!("the generator function `{gen_name}` is lowered"))
+    }
+
+    /// CR-T0: a `[Comptime, EmitGenerator]` generator whose
+    /// `Compiler.EmitTypeBody(...)` argument is a **runtime `String`** (NOT a
+    /// string literal) lowers to `call __newbf_ct_emit(i32, ptr, i32)` — the
+    /// runtime path fired — with NO residual `Compiler.EmitTypeBody` call and NO
+    /// diagnostic marker. The shim is fed `Ptr()`/`Length()` reads (via the
+    /// methods table) on the lowered `String` value, length narrowed to i32.
+    #[test]
+    fn cr_t0_runtime_string_arg_rewrites_to_ct_emit() {
+        let src = r#"
+            class Vec2 {
+                public int x;
+
+                [Comptime, EmitGenerator]
+                public static void Generate() {
+                    String s = new String("public int Z() { return 0; }");
+                    Compiler.EmitTypeBody(s);
+                    delete s;
+                }
+            }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        let gen_fn = lower_generator_fn(&module, "Vec2.Generate");
+
+        let mut saw_ct_emit = false;
+        for inst in &gen_fn.insts {
+            if let InstKind::Call { callee, args } = &inst.kind {
+                // The runtime path must NOT leave an `EmitTypeBody` call behind…
+                assert!(
+                    !callee.name.contains("EmitTypeBody"),
+                    "no `Compiler.EmitTypeBody` call may remain after the runtime rewrite (saw `{}`)",
+                    callee.name
+                );
+                // …and must NOT emit the diagnostic marker (a `String` is valid).
+                assert_ne!(
+                    callee.name, "__newbf_ct_emit_error",
+                    "a runtime String is a VALID arg — no diagnostic marker may be emitted"
+                );
+                if callee.name == "__newbf_ct_emit" {
+                    saw_ct_emit = true;
+                    // void __newbf_ct_emit(i32 owner, char8* ptr, i32 len)
+                    assert_eq!(inst.ty, IrType::Void, "the shim returns void");
+                    assert_eq!(args.len(), 3, "shim takes (owner_id, ptr, len)");
+                    // arg0: the owner id as an i32 literal (Vec2's StructId).
+                    assert!(
+                        matches!(args[0], Value::Const(Const::Int(_, IrType::I32))),
+                        "arg0 must be an i32 owner-id literal, got {:?}",
+                        args[0]
+                    );
+                    // arg1: a RUNTIME pointer value (the `Ptr()` call result), NOT
+                    // a static `Const::Str` like the literal path emits — this is
+                    // the proof the runtime path (not the literal fast-path) ran.
+                    assert!(
+                        !matches!(&args[1], Value::Const(Const::Str(_))),
+                        "arg1 must be a runtime Ptr() result on the runtime path, \
+                         not a static string constant, got {:?}",
+                        args[1]
+                    );
+                    // arg2: the length as an i32 — a runtime `coerce`d value, not a
+                    // compile-time `Const::Int` length (the literal path's shape).
+                    assert!(
+                        !matches!(args[2], Value::Const(Const::Int(_, _))),
+                        "arg2 must be a runtime (coerced) i32 length on the runtime \
+                         path, not a const length, got {:?}",
+                        args[2]
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_ct_emit,
+            "the runtime-String generator body must contain a `call __newbf_ct_emit(i32, ptr, i32)`"
+        );
+
+        // The runtime path reads the String's bytes/length via the methods table
+        // (NOT field_addr): a `String.Ptr` and a `String.Length` call must be
+        // present, feeding the shim.
+        let calls: Vec<&str> = gen_fn
+            .insts
+            .iter()
+            .filter_map(|i| match &i.kind {
+                InstKind::Call { callee, .. } => Some(callee.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls.iter().any(|c| c.ends_with(".Ptr") || c.ends_with("String.Ptr")),
+            "the runtime path must read the buffer via a `String.Ptr` method call, calls: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.ends_with(".Length") || c.ends_with("String.Length")),
+            "the runtime path must read the length via a `String.Length` method call, calls: {calls:?}"
+        );
+    }
+
+    /// CR-T0 / R4 (single-evaluation): a **side-effecting** `String`-builder
+    /// argument to `Compiler.EmitTypeBody` is lowered EXACTLY ONCE. We feed
+    /// `new String("...")` — whose allocation is a single, identifiable site — and
+    /// assert the generator body allocates the String exactly once (no duplicate
+    /// `newbf_alloc`/`new` from a double-lower). A double-lower would re-emit the
+    /// allocation in the fall-through path, leaking one copy.
+    #[test]
+    fn cr_t0_runtime_string_arg_is_evaluated_once() {
+        let src = r#"
+            class Vec2 {
+                public int x;
+
+                [Comptime, EmitGenerator]
+                public static void Generate() {
+                    Compiler.EmitTypeBody(new String("public int Z() { return 0; }"));
+                }
+            }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        let gen_fn = lower_generator_fn(&module, "Vec2.Generate");
+
+        // The String object body is allocated through `newbf_alloc` (MS ledger).
+        // EXACTLY ONE allocation ⇒ the arg was lowered once (no double-eval).
+        let alloc_calls = gen_fn
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(&i.kind, InstKind::Call { callee, .. } if callee.name == "newbf_alloc")
+            })
+            .count();
+        assert_eq!(
+            alloc_calls, 1,
+            "the side-effecting `new String` arg must be evaluated EXACTLY ONCE \
+             (a double-lower would emit two `newbf_alloc`s — one leaked); got {alloc_calls}"
+        );
+
+        // And exactly one shim call consumes it (not two).
+        let ct_emit_calls = gen_fn
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(&i.kind, InstKind::Call { callee, .. } if callee.name == "__newbf_ct_emit")
+            })
+            .count();
+        assert_eq!(
+            ct_emit_calls, 1,
+            "exactly one `__newbf_ct_emit` call must consume the single evaluation, got {ct_emit_calls}"
+        );
+        // No residual `EmitTypeBody`, no diagnostic marker (the arg is valid).
+        for inst in &gen_fn.insts {
+            if let InstKind::Call { callee, .. } = &inst.kind {
+                assert!(!callee.name.contains("EmitTypeBody"));
+                assert_ne!(callee.name, "__newbf_ct_emit_error");
+            }
+        }
+    }
+
+    /// CR-T0 / R4 (diagnostic-not-silent-decline): a `Compiler.EmitTypeBody`
+    /// argument that is neither a string literal nor a `String` (here an `int32`)
+    /// in a generator must produce a LOUD diagnostic — the `__newbf_ct_emit_error`
+    /// marker — NOT a silent decline into the empty `EmitTypeBody(String)` stub,
+    /// and NOT a panic. There must be NO residual `Compiler.EmitTypeBody` call and
+    /// NO `__newbf_ct_emit` (the real shim) call (the bad arg never reaches it).
+    #[test]
+    fn cr_t0_non_string_arg_emits_diagnostic_marker() {
+        let src = r#"
+            class Vec2 {
+                public int x;
+
+                [Comptime, EmitGenerator]
+                public static void Generate() {
+                    int32 n = 7;
+                    Compiler.EmitTypeBody(n);
+                }
+            }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
+        let program = crate::analyze(&files);
+        // Lowering a non-String, non-literal arg must NOT panic.
+        let module = lower_program(&files, &program);
+
+        let gen_fn = lower_generator_fn(&module, "Vec2.Generate");
+
+        let mut saw_error_marker = false;
+        for inst in &gen_fn.insts {
+            if let InstKind::Call { callee, args } = &inst.kind {
+                // The bad arg must NOT fall through to the `EmitTypeBody` stub…
+                assert!(
+                    !callee.name.contains("EmitTypeBody"),
+                    "a bad arg must be diagnosed, NOT declined into the `EmitTypeBody` \
+                     stub (saw `{}`)",
+                    callee.name
+                );
+                // …and must NOT reach the real emit shim (no emission happens).
+                assert_ne!(
+                    callee.name, "__newbf_ct_emit",
+                    "a non-String arg must NOT emit via the real shim"
+                );
+                if callee.name == "__newbf_ct_emit_error" {
+                    saw_error_marker = true;
+                    // void __newbf_ct_emit_error(i32 owner, char8* msg, i32 len)
+                    assert_eq!(inst.ty, IrType::Void);
+                    assert_eq!(args.len(), 3, "marker takes (owner_id, msg, len)");
+                    assert!(
+                        matches!(args[0], Value::Const(Const::Int(_, IrType::I32))),
+                        "marker arg0 must be the i32 owner-id literal, got {:?}",
+                        args[0]
+                    );
+                    // The message is a static string constant.
+                    assert!(
+                        matches!(&args[1], Value::Const(Const::Str(s)) if s.contains("EmitTypeBody")),
+                        "marker arg1 must be the diagnostic text, got {:?}",
+                        args[1]
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_error_marker,
+            "a non-String, non-literal `EmitTypeBody` arg must emit the loud \
+             `__newbf_ct_emit_error` diagnostic marker (R4 — never a silent decline)"
+        );
+
+        // The marker extern is declared with the same C ABI as the emit shim.
+        let marker = module
+            .funcs
+            .iter()
+            .find(|f| f.name == "__newbf_ct_emit_error")
+            .expect("__newbf_ct_emit_error extern declared on the module");
+        assert!(marker.is_extern, "__newbf_ct_emit_error is a body-less extern");
+        assert_eq!(marker.ret, IrType::Void);
+        assert_eq!(
+            marker.params.iter().map(|p| p.ty).collect::<Vec<_>>(),
+            vec![IrType::I32, IrType::Ptr, IrType::I32],
+            "marker signature must be void(i32, ptr, i32)"
         );
     }
 }

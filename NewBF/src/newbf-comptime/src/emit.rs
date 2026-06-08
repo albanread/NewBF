@@ -97,6 +97,13 @@ thread_local! {
     /// on the calling thread, in-process; the loop snapshots + clears this around
     /// each JIT call.
     static EMIT_SINK: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
+
+    /// The host-side sink the CR-T0 diagnostic marker drains into. Each entry is
+    /// the diagnostic message a generator's `__newbf_ct_emit_error` call carried
+    /// (a `Compiler.EmitTypeBody` arg that was neither a string literal nor a
+    /// `String`). Surfaced into `EmitOutcome.diagnostics` after each round. Empty
+    /// on every well-formed generator, so the common path pays nothing.
+    static EMIT_ERROR_SINK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The compile-time emit runtime shim — the **single** new host symbol the
@@ -143,6 +150,43 @@ pub extern "C" fn __newbf_ct_emit(owner_type_id: i32, ptr: *const u8, len: i32) 
 /// generator wrapper runs, to collect that round's emissions.
 fn drain_emit_sink() -> Vec<(i32, String)> {
     EMIT_SINK.with(|b| std::mem::take(&mut *b.borrow_mut()))
+}
+
+/// CR-T0: the compile-time **diagnostic** marker shim — a sibling of
+/// `__newbf_ct_emit`. Sema's relaxed `try_lower_emit_type_body` emits a
+/// `__newbf_ct_emit_error(owner_id, msg.Ptr, msg.Len)` call for a
+/// `Compiler.EmitTypeBody` argument that is neither a string literal nor a
+/// `String` (R4 — a loud diagnostic, never a silent decline into the empty
+/// `EmitTypeBody(String)` stub). It copies the message bytes out and pushes them
+/// into [`EMIT_ERROR_SINK`], so an actually-run malformed generator surfaces a
+/// diagnostic into `EmitOutcome.diagnostics` rather than miscompiling silently.
+///
+/// `#[unsafe(no_mangle)]` so the symbol name is exactly `__newbf_ct_emit_error`;
+/// bound by address via `add_absolute_symbol` (same as `__newbf_ct_emit`).
+///
+/// # Safety
+/// Same `(ptr, len)` contract as `__newbf_ct_emit`: `ptr` points to `len` valid
+/// bytes for the call, or `len <= 0` (treated as empty). The bytes are copied out
+/// before the borrow of `EMIT_ERROR_SINK` is taken, so no raw pointer outlives the
+/// call.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[unsafe(no_mangle)]
+pub extern "C" fn __newbf_ct_emit_error(_owner_type_id: i32, ptr: *const u8, len: i32) {
+    let msg = if ptr.is_null() || len <= 0 {
+        String::new()
+    } else {
+        // SAFETY: by the shim contract `ptr` points to `len` valid bytes for the
+        // duration of this call. Copy out immediately (lossy UTF-8).
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    EMIT_ERROR_SINK.with(|b| b.borrow_mut().push(msg));
+}
+
+/// Snapshot-and-clear the diagnostic-marker sink. Drained alongside the emit sink
+/// after each JIT'd generator wrapper runs.
+fn drain_emit_error_sink() -> Vec<String> {
+    EMIT_ERROR_SINK.with(|b| std::mem::take(&mut *b.borrow_mut()))
 }
 
 /// The result of an emission run: how many fixpoint rounds executed and any
@@ -498,10 +542,20 @@ fn run_generators(module: &IrModule) -> Result<Vec<(i32, String)>, String> {
 
     let jit = OrcJit::from_ir(&sandbox)
         .map_err(|e| format!("comptime: emission sandbox JIT build failed: {e}"))?;
-    // Bind the host shim by address BEFORE the lookup (the absolute definition
+    // Bind the host shims by address BEFORE the lookup (the absolute definition
     // wins over the process-search generator → no duplicate-definition error).
     jit.add_absolute_symbol("__newbf_ct_emit", __newbf_ct_emit as *const () as usize)
         .map_err(|e| format!("comptime: binding __newbf_ct_emit failed: {e}"))?;
+    // CR-T0: bind the diagnostic marker too, so a generator that hits the
+    // `Compiler.EmitTypeBody` bad-arg path (a `__newbf_ct_emit_error` call) resolves
+    // and surfaces a diagnostic rather than failing to JIT-link. Sema declares the
+    // extern in every generator-owning module (uncalled on the literal/`String`
+    // paths), so the symbol must resolve even when the marker is never invoked.
+    jit.add_absolute_symbol(
+        "__newbf_ct_emit_error",
+        __newbf_ct_emit_error as *const () as usize,
+    )
+    .map_err(|e| format!("comptime: binding __newbf_ct_emit_error failed: {e}"))?;
     let addr = jit.lookup("$ct_emit_run").ok_or_else(|| {
         "comptime: emission wrapper `$ct_emit_run` did not resolve in the sandbox JIT".to_string()
     })?;
@@ -512,29 +566,48 @@ fn run_generators(module: &IrModule) -> Result<Vec<(i32, String)>, String> {
     let run: extern "C" fn() = unsafe { std::mem::transmute(addr) };
     run();
 
+    // CR-T0: a malformed `Compiler.EmitTypeBody` argument pushed a diagnostic into
+    // the error sink. Surface it as an emission error (loud — never a silent
+    // miscompile). The text sink is drained too so no residue leaks to the next
+    // round/thread.
+    let errors = drain_emit_error_sink();
+    if !errors.is_empty() {
+        let _ = drain_emit_sink();
+        return Err(format!("comptime: {}", errors.join("; ")));
+    }
+
     Ok(drain_emit_sink())
 }
 
-/// Strip the emitter generators + the `__newbf_ct_emit` extern from the final
-/// module (comptime-breadth §5.4 / R6 — load-bearing for the app/run JIT and AOT
-/// link, neither of which registers the shim).
+/// The host emit shims sema may emit inside a `[Comptime, EmitGenerator]` body:
+/// the text shim (`__newbf_ct_emit`) and the CR-T0 diagnostic marker
+/// (`__newbf_ct_emit_error`, emitted for a `Compiler.EmitTypeBody` arg that is
+/// neither a string literal nor a `String`). Both are stripped from the final
+/// module identically.
+const EMIT_SHIM_SYMBOLS: [&str; 2] = ["__newbf_ct_emit", "__newbf_ct_emit_error"];
+
+/// Strip the emitter generators + the emit-shim externs from the final module
+/// (comptime-breadth §5.4 / R6 — load-bearing for the app/run JIT and AOT link,
+/// neither of which registers the shims).
 ///
-/// Droppable = any function that **transitively references `__newbf_ct_emit`**
-/// (i.e. the generators and anything that calls into them, computed by a reverse
-/// reachability sweep) **and** is a `module.comptime` symbol — plus the
-/// `__newbf_ct_emit` extern declaration itself. The emitted members (ordinary
-/// reparsed source, *not* comptime, *not* referencing the shim) are kept. This
-/// agrees with `fold_comptime`'s `reachable_from_ordinary` view: both treat
-/// `module.comptime` members reaching `__newbf_ct_emit` as droppable, so neither
-/// keeps a function the other needs.
+/// Droppable = any function that **transitively references an emit shim**
+/// (`__newbf_ct_emit` or the CR-T0 `__newbf_ct_emit_error` marker — the
+/// generators and anything that calls into them, computed by a reverse
+/// reachability sweep) **and** is a `module.comptime` symbol — plus the shim
+/// extern declarations themselves. The emitted members (ordinary reparsed source,
+/// *not* comptime, *not* referencing a shim) are kept. This agrees with
+/// `fold_comptime`'s `reachable_from_ordinary` view: both treat `module.comptime`
+/// members reaching a shim as droppable, so neither keeps a function the other
+/// needs.
 fn strip_emitter_and_shim(mut module: IrModule) -> IrModule {
     let comptime: HashSet<&str> = module.comptime.iter().map(String::as_str).collect();
 
-    // Functions that reference `__newbf_ct_emit` directly.
+    // Functions that reference an emit shim directly.
     let mut references_shim: HashSet<String> = HashSet::new();
     for f in &module.funcs {
         if f.insts.iter().any(|i| {
-            matches!(&i.kind, InstKind::Call { callee, .. } if callee.name == "__newbf_ct_emit")
+            matches!(&i.kind, InstKind::Call { callee, .. }
+                if EMIT_SHIM_SYMBOLS.contains(&callee.name.as_str()))
         }) {
             references_shim.insert(f.name.clone());
         }
@@ -561,10 +634,10 @@ fn strip_emitter_and_shim(mut module: IrModule) -> IrModule {
         }
     }
 
-    // Drop: the `__newbf_ct_emit` extern itself, plus every comptime function
-    // that (transitively) references the shim — i.e. the emitter generators.
+    // Drop: the emit-shim externs themselves, plus every comptime function that
+    // (transitively) references a shim — i.e. the emitter generators.
     module.funcs.retain(|f| {
-        if f.name == "__newbf_ct_emit" {
+        if EMIT_SHIM_SYMBOLS.contains(&f.name.as_str()) {
             return false;
         }
         !(comptime.contains(f.name.as_str()) && references_shim.contains(&f.name))
