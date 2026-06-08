@@ -661,6 +661,28 @@ mod tests {
     use newbf_parser::parse_file;
     use newbf_sema::SourceFile;
 
+    /// Read a NUL-terminated C string at `p` (a `char8*` returned from JIT'd
+    /// reflection code) into an owned `String`. Used by the CR-T1 companion test
+    /// to compare a reflected field name read out of the sandbox-shaped module.
+    ///
+    /// # Safety
+    /// `p` must point at a NUL-terminated byte run in still-mapped memory (it does:
+    /// the field-name `char8*` is a `.rodata` cstr the JIT'd module owns while
+    /// `jit` is alive). A null `p` reads as the empty string.
+    unsafe fn cstr_to_string(p: *const u8) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        // SAFETY: by the contract `p` points at a NUL-terminated run; walk to the
+        // terminator, then copy the bytes out (lossy UTF-8) before returning.
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
     /// Parse one `.bf` source and drive emission over it, returning the final
     /// module (the same shape the driver/harness use).
     fn emit_over(src: &str) -> (IrModule, EmitOutcome) {
@@ -754,6 +776,276 @@ mod tests {
         let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
         let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
         assert_eq!(main(), 42, "emitted member reads pre-existing fields → 42");
+    }
+
+    /// **CR-T1 — the sandbox-reflection HARD gate (the integration half).** Drive
+    /// `run_emission` over a `[Comptime, EmitGenerator]` generator that *reflects*
+    /// inside the `$ct_emit_run` sandbox:
+    ///   1. reads `typeof(Pair).GetFieldCount()` — a reflection-metadata read in
+    ///      the sandbox JIT (the `%struct.Type` global the sandbox clone's
+    ///      `emit_metadata` built, CR §3.1); AND
+    ///   2. **binds a `FieldInfo` local** for `GetField(0).GetName()` (the R5
+    ///      value-struct-by-value path — `GetField` returns `FieldInfo` BY VALUE,
+    ///      so it cannot be chained; a local is bound, then `.GetName()` is read);
+    ///   3. uses CR-T0's runtime-`String` `Compiler.EmitTypeBody(...)` path to emit
+    ///      a member whose returned constant is DERIVED from both reflection reads
+    ///      (the field count + whether the first field's reflected name is "mA").
+    ///
+    /// `Main → 42` is computable only if the sandbox saw `GetFieldCount() == 2`
+    /// AND the bound-`FieldInfo`-local's `GetName()` returned "mA" (`2 + 40`). The
+    /// assertions also pin the strip: the corlib `Type`/`FieldInfo` reflection
+    /// methods SURVIVE (they are non-comptime corlib code), while the generator +
+    /// `__newbf_ct_emit` are GONE. Per CR §3.1 the metadata is already in the
+    /// sandbox clone, so this works out-of-the-box — this test is the pin that
+    /// proves it (and would fail loudly if a future change gated `emit_metadata`).
+    #[test]
+    fn sandbox_generator_reflects_field_count_and_bound_fieldinfo_name() {
+        let src = r#"
+            [Reflect(.Fields)]
+            class Pair {
+                public int32 mA;
+                public int32 mB;
+
+                [Comptime, EmitGenerator]
+                public static void Generate() {
+                    // (1) Reflection-metadata read in the sandbox: the field count.
+                    int32 n = typeof(Pair).GetFieldCount();        // 2
+                    // (2) The R5 struct-by-value path: GetField returns a FieldInfo
+                    //     BY VALUE, so bind a LOCAL before reading .GetName() —
+                    //     never chain off the value-struct rvalue.
+                    FieldInfo gf = typeof(Pair).GetField(0);
+                    int32 bonus = Internal.StrEq(gf.GetName(), "mA") ? 40 : 0;
+                    // (3) Emit a member whose constant is derived from BOTH reads,
+                    //     via CR-T0's runtime-String EmitTypeBody path (NOT a literal).
+                    //     Widen to `int` so `Append(int)` (decimal render) is the
+                    //     unambiguous overload, not `Append(char8)` (a char code).
+                    int total = n + bonus;                          // 2 + 40 = 42
+                    String s = new String("public int32 Probe() { return ");
+                    s.Append(total);                                // "42"
+                    s.Append("; }");
+                    Compiler.EmitTypeBody(s);
+                    delete s;                                       // exactly once
+                }
+            }
+            class Program {
+                public static int32 Main() {
+                    Pair p = new Pair();
+                    int32 r = p.Probe();                            // the emitted member
+                    delete p;
+                    return r;
+                }
+            }
+        "#;
+        let (module, outcome) = emit_over(src);
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "the reflecting generator converges cleanly: {:?}",
+            outcome.diagnostics
+        );
+        assert!(outcome.rounds >= 1, "at least one emission round ran");
+
+        // The strip kept the corlib reflection API the generator pulled in (it is
+        // ordinary corlib code, NOT module.comptime) and dropped the generator +
+        // shim (comptime, reaches __newbf_ct_emit).
+        assert!(
+            module.funcs.iter().any(|f| f.name.contains("Type.GetField"))
+                && module.funcs.iter().any(|f| f.name.contains("Type.GetFieldCount")),
+            "corlib `Type.GetField`/`GetFieldCount` survive the strip"
+        );
+        assert!(
+            module.funcs.iter().any(|f| f.name.contains("FieldInfo.GetName")),
+            "corlib `FieldInfo.GetName` survives the strip"
+        );
+        assert!(
+            !module.funcs.iter().any(|f| f.name.contains("Generate")),
+            "the [EmitGenerator] must be stripped"
+        );
+        assert!(
+            !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+            "the __newbf_ct_emit shim must be stripped"
+        );
+        assert!(
+            module.emit_jobs.is_empty(),
+            "emit jobs are consumed by the strip"
+        );
+
+        // The final module JIT-links clean (no unresolved __newbf_ct_emit) and the
+        // emitted member returns 42 — provable only if the sandbox reflected the
+        // field count AND the bound-FieldInfo-local's name.
+        let jit = OrcJit::from_ir(&module).expect("final module JIT-links clean");
+        let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+        let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(
+            main(),
+            42,
+            "emitted Probe() returns GetFieldCount(2) + name-matches-\"mA\"(40) = 42"
+        );
+    }
+
+    /// **CR-T1 — the companion `from_ir` sandbox-shaped unit test (R5 pin).** Where
+    /// the integration test above drives the *whole* `run_emission` pipeline, this
+    /// isolates the one thing the app-JIT `reflect_field_*.bf` tests don't: a
+    /// **value-struct `FieldInfo` return executed inside a `$ct_emit_run`-shaped
+    /// wrapper**, in a hand-built `from_ir` module that mirrors the sandbox clone.
+    ///
+    /// The module carries exactly what `emit_module` builds for every module
+    /// (including the sandbox clone): the `%struct.Type` / `%struct.FieldInfo`
+    /// aggregates + a per-type `Type` global + the in-module `__newbf_type_by_id`
+    /// accessor (all from `emit_metadata`, driven by the `TypeMeta` we register).
+    /// On top of it:
+    ///   * `get_field0(i32 id) -> FieldInfo` looks up the `Type*` via
+    ///     `__newbf_type_by_id(id)`, reads `mFields`, and returns `mFields[0]` BY
+    ///     VALUE — the struct-by-value reflection return (mirrors `Type.GetField`);
+    ///   * `$ct_emit_run()` (the sandbox wrapper name) calls `get_field0`, **binds
+    ///     the returned `FieldInfo` into a local alloca** (the R5 bound-local
+    ///     pattern), and stores its `mName` into a host-visible global so the test
+    ///     can read it back.
+    ///
+    /// Asserts: (i) `__newbf_type_by_id` + the `Point.$type` global resolve in the
+    /// JIT'd sandbox-shaped module; (ii) running `$ct_emit_run` produces the
+    /// reflected first-field name "mX" — i.e. the value-struct `FieldInfo` return
+    /// is present AND callable inside the wrapper, not just in the app JIT.
+    #[test]
+    fn from_ir_sandbox_shaped_value_struct_fieldinfo_return_in_ct_emit_run() {
+        use newbf_ir::{FieldDef, FieldMeta, ReflectPolicy, StructDef, TypeMeta, VtableDef};
+
+        let mut m = IrModule::new("sandbox_shaped");
+
+        // The corlib value-struct ABIs, byte-identical to what `emit_metadata`
+        // emits (`%struct.Type` { 5×i32, 3×ptr }, `%struct.FieldInfo` { ptr, i32,
+        // i32 }). We index `mFields` (Type field 6) through a `FieldInfo*`.
+        let type_id_struct = m.add_struct(StructDef {
+            name: "Type".into(),
+            fields: vec![
+                FieldDef { name: "mSize".into(), ty: IrType::I32 },
+                FieldDef { name: "mTypeId".into(), ty: IrType::I32 },
+                FieldDef { name: "mFlags".into(), ty: IrType::I32 },
+                FieldDef { name: "mFieldCount".into(), ty: IrType::I32 },
+                FieldDef { name: "mMethodCount".into(), ty: IrType::I32 },
+                FieldDef { name: "mName".into(), ty: IrType::Ptr },
+                FieldDef { name: "mFields".into(), ty: IrType::Ptr },
+                FieldDef { name: "mMethods".into(), ty: IrType::Ptr },
+            ],
+        });
+        let fieldinfo_struct = m.add_struct(StructDef {
+            name: "FieldInfo".into(),
+            fields: vec![
+                FieldDef { name: "mName".into(), ty: IrType::Ptr },
+                FieldDef { name: "mOffset".into(), ty: IrType::I32 },
+                FieldDef { name: "mTypeId".into(), ty: IrType::I32 },
+            ],
+        });
+
+        // A `[Reflect(.Fields)]`-shaped class `Point { $header, mX, mY }` with a
+        // dense type-id of 0, so `emit_metadata` emits a non-null FieldInfo array
+        // (first entry's name = "mX") and a `Point.$type` global at table index 0.
+        let point = m.add_struct(StructDef {
+            name: "Point".into(),
+            fields: vec![
+                FieldDef { name: "$header".into(), ty: IrType::Ptr },
+                FieldDef { name: "mX".into(), ty: IrType::I32 },
+                FieldDef { name: "mY".into(), ty: IrType::I32 },
+            ],
+        });
+        // ClassVData global so `type_global_name`'s prefix (→ `Point.$type`) is
+        // recoverable by `emit_metadata`.
+        m.add_vtable(VtableDef { name: "Point.$cvdata".into(), entries: vec![], type_id: 0 });
+        m.add_type_meta(TypeMeta::new(
+            0,
+            point,
+            "Point".into(),
+            ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            true,
+            vec![
+                FieldMeta { name: "mX".into(), ty: IrType::I32, field_index: 1 },
+                FieldMeta { name: "mY".into(), ty: IrType::I32, field_index: 2 },
+            ],
+            vec![],
+        ));
+
+        // The in-module reflection accessor is DEFINED by `emit_metadata`; declare
+        // it as an extern so our `get_field0` can call it by name (the metadata
+        // pass fills in the body — exactly the sandbox clone's situation).
+        m.declare_extern(
+            "__newbf_type_by_id",
+            vec![Param { name: None, ty: IrType::I32 }],
+            IrType::Ptr,
+        );
+
+        // A host-visible global the wrapper writes the reflected `mName` into, so
+        // the test reads the result back out of the JIT'd module.
+        m.add_global(newbf_ir::GlobalDef { name: "g_name".into(), ty: IrType::Ptr });
+
+        // `FieldInfo get_field0(i32 id)`: the value-struct reflection return.
+        // t = __newbf_type_by_id(id); fields = t.mFields; return fields[0]; (by value)
+        {
+            let mut f = FunctionBuilder::new(
+                "get_field0",
+                vec![Param { name: Some("id".into()), ty: IrType::I32 }],
+                IrType::Struct(fieldinfo_struct),
+            );
+            let t = f.call("__newbf_type_by_id", vec![f.param(0)], IrType::Ptr);
+            // mFields is Type field index 6 (a `FieldInfo*`).
+            let fields_pp = f.field_addr(t, type_id_struct, 6);
+            let fields = f.load(fields_pp, IrType::Ptr);
+            // fields[0] — element 0 of the `[k x %FieldInfo]` array, by value.
+            let e0 = f.elem_addr(fields, IrType::Struct(fieldinfo_struct), Value::int(0, IrType::I64));
+            let fi = f.load(e0, IrType::Struct(fieldinfo_struct));
+            f.ret(Some(fi));
+            m.add_function(f.finish());
+        }
+
+        // `void $ct_emit_run()`: the sandbox wrapper. Calls get_field0, BINDS the
+        // returned FieldInfo into a local alloca (R5: never chain off the rvalue),
+        // reads `.mName` from the bound local, and stores it into `g_name`.
+        {
+            let mut w = FunctionBuilder::new("$ct_emit_run", vec![], IrType::Void);
+            let fi = w.call("get_field0", vec![Value::int(0, IrType::I32)], IrType::Struct(fieldinfo_struct));
+            // Bind the value-struct return into a local (the bound-FieldInfo-local
+            // pattern the design mandates before reading a member).
+            let slot = w.alloca(IrType::Struct(fieldinfo_struct));
+            w.store(slot.clone(), fi);
+            // local.mName  (FieldInfo field 0, a char8*).
+            let name_pp = w.field_addr(slot, fieldinfo_struct, 0);
+            let name = w.load(name_pp, IrType::Ptr);
+            let gp = w.global_addr("g_name");
+            w.store(gp, name);
+            w.ret(None);
+            m.add_function(w.finish());
+        }
+
+        // JIT the sandbox-shaped module exactly as `run_generators` does.
+        let jit = OrcJit::from_ir(&m).expect("sandbox-shaped module JIT-links clean");
+
+        // (i) The reflection accessor + the per-type Type global resolve in the
+        //     sandbox-shaped JIT (CR §3.1 — the metadata IS in the clone).
+        assert!(
+            jit.lookup("__newbf_type_by_id").is_some(),
+            "the in-module __newbf_type_by_id accessor resolves in the sandbox-shaped module"
+        );
+        assert!(
+            jit.lookup("Point.$type").is_some(),
+            "the per-type `Point.$type` %struct.Type global resolves in the sandbox-shaped module"
+        );
+
+        // (ii) Run the `$ct_emit_run` wrapper: the value-struct FieldInfo return is
+        //      present AND callable inside the wrapper. It writes the reflected
+        //      first-field name into `g_name`; read it back and confirm "mX".
+        let run_addr = jit.lookup("$ct_emit_run").expect("$ct_emit_run resolves");
+        let run: extern "C" fn() = unsafe { std::mem::transmute(run_addr) };
+        run();
+
+        let gname_addr = jit.lookup("g_name").expect("g_name global resolves");
+        // SAFETY: `g_name` is a `ptr` global; after `run()` it holds the `char8*`
+        // reflected name (a `.rodata` cstr the JIT'd module owns while `jit` lives).
+        let name_ptr: *const u8 = unsafe { *(gname_addr as *const *const u8) };
+        let got = unsafe { cstr_to_string(name_ptr) };
+        assert_eq!(
+            got, "mX",
+            "the value-struct FieldInfo return read inside $ct_emit_run yields the \
+             reflected first-field name — struct-by-value reflection is present AND \
+             callable in the sandbox-shaped module (R5)"
+        );
     }
 
     /// strip_emitter_and_shim removes a comptime fn that calls `__newbf_ct_emit`
