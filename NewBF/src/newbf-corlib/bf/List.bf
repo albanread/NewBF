@@ -21,6 +21,21 @@ class List<T> {
 	public int Count() { return this.mCount; }
 	public T Get(int i) { return this.mItems[i]; }
 
+	// A by-value cursor over this list's buffer: GetEnumerator copies the buffer
+	// pointer + count into a `ListEnumerator<T>` value (declared top-level below,
+	// NOT nested — `index_generic_decls` is member-blind, lower.rs:655-692, so a
+	// nested generic enumerator would never monomorphize). Returned by value, so
+	// the caller copies it into its own slot; no heap allocation. This is the
+	// enumerator `foreach` (IT-T1) will drive; today it's exercised manually by
+	// `enum_manual.bf` to prove the generic-value-struct ABI in isolation (R7).
+	public ListEnumerator<T> GetEnumerator() {
+		ListEnumerator<T> e = ?;
+		e.mItems = this.mItems;
+		e.mCount = this.mCount;
+		e.mIndex = -1;          // -1 before the first MoveNext
+		return e;
+	}
+
 	// A fresh heap `T[]` holding a copy of the elements (length = Count). The
 	// caller owns it. `new T[n]` sizes by `T`'s stride via the monomorph env, so
 	// the array is packed at the element width (4 bytes for `List<int32>`).
@@ -172,6 +187,38 @@ class List<T> {
 		}
 		return acc;
 	}
+}
+
+// A by-value enumerator over a List<T>: an index cursor + a borrowed buffer
+// pointer + the element count. TOP-LEVEL generic (a sibling of List<T>, NOT
+// nested in it) so `index_generic_decls` collects it for monomorphization —
+// that walk is member-blind (lower.rs:655-692), so a nested generic enumerator
+// would never be instantiated and would lower to the `Ptr` fallback.
+//
+// It is a VALUE `struct` (not a class): `GetEnumerator()` returns it by value,
+// the caller copies it into its own slot, and `MoveNext()` mutates `mIndex` in
+// place through `this`. This is the FIRST generic value struct with
+// state-mutating instance methods to run on the executable corlib path (R7);
+// `enum_manual.bf` proves the ABI in isolation (manual MoveNext/Current, no
+// foreach) before IT-T1 layers `foreach` on top. The empty `Dispose` is the
+// scope-cleanup hook IT-T1 will call on every loop-exit edge.
+struct ListEnumerator<T> {
+	T* mItems;
+	int mCount;
+	int mIndex;       // -1 before the first MoveNext
+
+	// Advance the cursor; true while it still points at a valid element. Mutates
+	// `mIndex` through `this` — the state mutation that must persist across calls
+	// (a reloaded copy would lose the increment and loop forever; R6/R7).
+	public bool MoveNext() {
+		this.mIndex = this.mIndex + 1;
+		return this.mIndex < this.mCount;
+	}
+	// The element the cursor currently points at. A read-only property; its
+	// getter lowers to the `get_Current` symbol IT-T1 resolves by name.
+	public T Current { get { return this.mItems[this.mIndex]; } }
+	// Scope-cleanup hook (no-op for this value enumerator — nothing to free).
+	public void Dispose() { }
 }
 
 // Higher-order functions over List<T> — the payoff of lambdas/closures. These
