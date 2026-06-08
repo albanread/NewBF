@@ -19,6 +19,7 @@
 
 mod api;
 mod build;
+mod constraints;
 mod intern;
 mod lower;
 mod model;
@@ -83,6 +84,19 @@ pub fn analyze(files: &[SourceFile<'_>]) -> Program {
     // provably-deleted-then-deleted (or scope-then-deleted) binding, or a binding
     // still `Owned` at a function-body exit edge (a provable leak).
     diagnostics.extend(ownership::check_delete_flow(files, &graph, &builder.interner));
+    // CT-T1 (generic-constraints.md §3.2 / §7): the generic-`where`-clause
+    // enforcement pass runs here, immediately after `check_delete_flow`, with the
+    // same `(files, &DefGraph, &Interner)` signature — the only seam that has the
+    // resolved `DefGraph` (for the `(name, arity)` type index) AND the method-body
+    // ASTs in `files` (for the clauses' constrained entities). For CT-T1 it does
+    // the full body-first classification of every constraint form (supported +
+    // deferred) but emits ZERO diagnostics, so it is strictly behavior-preserving;
+    // CT-T2/CT-T3 add the provable-violation diagnostics on top of the classifier.
+    diagnostics.extend(constraints::check_generic_constraints(
+        files,
+        &graph,
+        &builder.interner,
+    ));
     Program {
         graph,
         interner: builder.interner,
