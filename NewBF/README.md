@@ -23,13 +23,34 @@ reflection, and the phase-report convention.
 
 ## Status
 
-A working compiler: lexer → parser → sema → typed SSA IR → LLVM 22 → **ORC JIT**
-*and* **AOT `.exe`**. Runs real Beef — primitives, full control flow,
-intra-program calls + recursion, value `struct`s, heap `class`es with manual
-`new`/`delete`, constructors/destructors, and instance methods (`obj.Method()`,
-`this`) — checked by a JIT-and-run corpus, with a curated feature corpus that
-verifies clean under the LLVM verifier. See [`docs/journals/`](docs/journals)
-for the running build log and [`../SPRINTS.md`](../SPRINTS.md) for what's next.
+**Wave 1 (complete):** lexer → parser → sema → typed SSA IR → LLVM 22 →
+**ORC JIT** *and* **AOT `.exe`**. Primitives, full control flow, intra-program
+calls + recursion, value `struct`s, heap `class`es with manual `new`/`delete`,
+constructors/destructors, and instance methods (`obj.Method()`, `this`). Checked
+by a JIT-and-run corpus clean under the LLVM verifier.
+
+**Wave 2 (complete):**
+- **Mixins** — mixin control-flow, generic enum instance `switch(this)`,
+  `Result<T, E>` prelude, `Try!` end-to-end
+- **Runtime reflection** — `GetType()` dynamic lookup, `GetField`/`FieldInfo`
+  field metadata, method metadata, `System.Reflection`
+- **Compile-time execution** — fixpoint convergence guards, widened-int
+  const-fold, `comptime` emission breadth
+- **Memory-safety diagnostics** — scope cleanup on all exit edges, provable
+  double-free, provable-leak diagnostic with named fault/leak sites
+- **AOT guard** — runtime staticlib linked into AOT builds; guard bootstrap
+  runs in standalone `.exe`
+
+**Wave 3 (in progress):**
+- Generic constraints — classifier skeleton + ratchet pins
+- Iterator protocol — `ListEnumerator<T>`, `GetEnumerator`/`MoveNext`/`Current`/`Dispose`,
+  fifth `foreach` branch in sema
+- Comptime reflection — `try_lower_emit_type_body` relaxed, struct-by-value
+  reflection sandbox confirmed
+- Custom attributes — `AttrMeta`/`TypeMeta.attributes`, attribute collector
+
+See [`docs/journals/`](docs/journals) for the running build log and
+[`../SPRINTS.md`](../SPRINTS.md) for what's next.
 
 ## Building
 
