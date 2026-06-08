@@ -292,6 +292,41 @@ struct StructTable {
     /// always-on minimum (name+id+size, no fields/methods), since they carry no
     /// user attributes.
     policies: Vec<ReflectPolicy>,
+    /// CA-T1: the per-id RAW custom-attribute data, parallel to `defs`/`policies`
+    /// (one `Vec<AttrDataRaw>` per minted struct id; empty for synthetic ids).
+    /// Each entry records a type's `[MyAttr(args)]` attributes as their simple
+    /// (last-path-segment) name + const-folded primitive/string ctor args
+    /// (custom-attributes.md §3.2 Seam 1/2). The simple-names are UNRESOLVED here
+    /// (the backing attribute class may be declared *after* the annotated type, so
+    /// `by_name` is incomplete at collection time); CA-T3 resolves each name → a
+    /// dense `attr_type_id` and folds it into `TypeMeta.attributes`. Collected at
+    /// the id-minting sites in LOCKSTEP with `policies` (empty at the synthetic
+    /// minters, the collected vec at `register_type_struct` inside the dedup
+    /// guard). Behavior-preserving in CA-T1: COLLECTED but never read by lowering.
+    type_attr_data: Vec<Vec<AttrDataRaw>>,
+}
+
+/// CA-T1: a collected custom-attribute, raw (pre-resolution) — owned data only,
+/// so the `StructTable`'s no-lifetime invariant holds. Records an attribute's
+/// `simple_name` (its last path segment, e.g. `MyAttr` / `Reflect`) and its
+/// const-folded constructor `args` (Int/Bool/Char/Str folded via
+/// [`attr_arg_const`]; non-foldable args are best-effort dropped, §3.2). CA-T3
+/// resolves `simple_name` → the attribute class's dense `attr_type_id` and folds
+/// this into `newbf_ir::AttrMeta`.
+//
+// CA-T3 consumes both fields (resolve `name` + reuse `args`). Until then the
+// raw data is collected but unread by lowering, so the fields are dead in the
+// non-test build; the CA-T1 unit test reads them. Allow dead_code (cited to
+// CA-T3) rather than prematurely `pub`-ing private collection state — mirrors
+// MX-T2's not-yet-consumed `MixinDef` (`:307`).
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+struct AttrDataRaw {
+    /// The attribute's simple (last-path-segment) name, e.g. `MyAttr`, `Reflect`.
+    name: String,
+    /// The const-folded ctor args (Int/Bool/Char → `Const::Int`, Str →
+    /// `Const::Str`); non-foldable args (Float/Null/non-literal) are dropped.
+    args: Vec<Const>,
 }
 
 /// MX-T2: a collected mixin declaration — owned data only (no lifetime), so the
@@ -593,6 +628,15 @@ impl StructTable {
             t.defs.len(),
             "RF-T3: policies must be parallel to defs (lockstep at every id-minting site)"
         );
+        // CA-T1: `type_attr_data` is parallel to `defs`/`policies` (one entry per
+        // minted id — empty at the synthetic minters, the collected vec at
+        // `register_type_struct`). A missed minting site panics here in a debug
+        // build (caught by `cargo test`), the lockstep invariant's detector.
+        debug_assert_eq!(
+            t.type_attr_data.len(),
+            t.defs.len(),
+            "CA-T1: type_attr_data must be parallel to defs (lockstep at every id-minting site)"
+        );
         t
     }
 
@@ -850,6 +894,10 @@ fn register_func_struct(t: &mut StructTable) -> StructId {
     // RF-T3: a synthetic value struct carries no user attributes ⇒ the always-on
     // minimum policy (name+id+size, no field/method tables).
     t.policies.push(ReflectPolicy::TYPE);
+    // CA-T1: lockstep with `policies` — a synthetic struct carries no user
+    // attributes, so push an EMPTY raw-attr list to keep `type_attr_data`
+    // parallel to `defs`.
+    t.type_attr_data.push(Vec::new());
     t.by_name.insert("$Func".into(), id);
     id
 }
@@ -880,6 +928,9 @@ fn register_mono(t: &mut StructTable, mangled: &str, kind: StructKind) -> Struct
     // here (a generic *template*'s attributes are NOT yet propagated to its
     // monomorphs — a v1 simplification), so it gets the always-on minimum policy.
     t.policies.push(ReflectPolicy::TYPE);
+    // CA-T1: lockstep with `policies` — a monomorph carries no propagated
+    // attributes yet (custom-attributes.md §5 deferred), so push an EMPTY list.
+    t.type_attr_data.push(Vec::new());
     t.by_name.insert(mangled.to_string(), id);
     id
 }
@@ -2554,6 +2605,13 @@ fn register_type_struct(td: &TypeDecl, prefix: &str, src: &str, t: &mut StructTa
             // populating `Module::type_meta`.
             t.policies
                 .push(reflect_policy(&td.attributes, src, reflect_default()));
+            // CA-T1: collect this type's RAW custom-attribute data in LOCKSTEP
+            // with `policies` (inside the dedup guard, so a duplicate/prelude
+            // simple-name — which gets no `defs`/`policies` entry — also gets no
+            // `type_attr_data` entry, keeping all three vectors parallel). Raw
+            // (simple-name + const-folded args); names are resolved → dense ids in
+            // CA-T3. Behavior-preserving: collected here, unread until CA-T3.
+            t.type_attr_data.push(collect_attr_data(&td.attributes, src));
             t.by_name.insert(name, id);
         }
     }
@@ -2844,6 +2902,9 @@ fn register_payload_enum_type(td: &TypeDecl, src: &str, t: &mut StructTable) {
             // RF-T3: a payload (tagged-union) enum struct gets the always-on
             // minimum policy (its `[Reflect]` attributes are not yet plumbed).
             t.policies.push(ReflectPolicy::TYPE);
+            // CA-T1: lockstep with `policies` — a payload enum's attributes are
+            // not yet plumbed, so push an EMPTY raw-attr list.
+            t.type_attr_data.push(Vec::new());
             t.by_name.insert(enum_name.clone(), id);
             t.payload_enums.insert(enum_name, id);
             t.enum_cases.insert(id, cases);
@@ -12836,6 +12897,67 @@ fn const_field_init(init: &Expr, fty: IrType, src: &str) -> Option<Const> {
     }
 }
 
+/// CA-T1: const-fold a single custom-attribute constructor argument expression
+/// to a [`Const`] (custom-attributes.md §3.2). Modelled on [`const_field_init`]
+/// but with no target field type (so int/char literals fold to the i64-slot
+/// encoding, §2.4) and an added string-literal arm:
+///   * `Int`/`Char` → `Const::Int(_, IrType::I64)` (the uniform i64 slot);
+///   * `Bool` → `Const::Bool`;
+///   * `Str` → `Const::Str(decode_string_literal(...))`;
+///   * a nested `Unary { op: Neg, operand: Int }` → the negated int (negative
+///     literals arrive as this shape, NOT a flat `Expr::Neg` — `:12826`);
+///   * `Paren` → fold the inner expr.
+/// Everything else (`Float`, `Null`, `typeof(X)`, non-literal exprs) returns
+/// `None` and is DROPPED (v1 stores only Int/Bool/Str; float/non-scalar args are
+/// deferred, §5). **Footgun:** a dropped arg shrinks `argCount` and shifts every
+/// later `GetIntArg(i)` / `GetStrArg(i)` index — v1 demos use only directly
+/// foldable int/bool/string literals so no drop occurs (documented for CA-T5).
+fn attr_arg_const(arg: &Expr, src: &str) -> Option<Const> {
+    match arg {
+        // No target field type: int/char args fold to the uniform i64 slot.
+        Expr::Int(s) => Some(Const::Int(parse_int(s.text(src)), IrType::I64)),
+        Expr::Char(s) => Some(Const::Int(decode_char_literal(s.text(src)), IrType::I64)),
+        Expr::Bool(s) => Some(Const::Bool(s.text(src) == "true")),
+        Expr::Str(s) => Some(Const::Str(decode_string_literal(s.text(src)))),
+        Expr::Paren { inner, .. } => attr_arg_const(inner, src),
+        // Negative literals arrive as `Unary { Neg, Int }` (the nested shape, not
+        // a flat `Expr::Neg`); replicate `const_field_init`'s arm or they're missed.
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand,
+            ..
+        } => match &**operand {
+            Expr::Int(s) => Some(Const::Int(-parse_int(s.text(src)), IrType::I64)),
+            _ => None,
+        },
+        // Float/Null/typeof/non-literal args are deferred (§5) → dropped.
+        _ => None,
+    }
+}
+
+/// CA-T1: collect a declaration's `[MyAttr(args), Reflect]` attributes into the
+/// RAW per-type list (custom-attributes.md §3.2 Seam 2). Each attribute records
+/// its simple (last-path-segment) name (reusing [`attr_simple_name`]) + its
+/// const-folded scalar/string ctor args (via [`attr_arg_const`]; non-foldable
+/// args are best-effort dropped). Built-in markers (`Reflect`, `AlwaysInclude`,
+/// …) are collected here too (raw); CA-T3 skips them at resolution time (they
+/// have no backing class), so collection stays uniform and resolution-free. An
+/// attribute whose name isn't a path (`None`) is skipped. Order is preserved.
+fn collect_attr_data(attrs: &[Attribute], src: &str) -> Vec<AttrDataRaw> {
+    attrs
+        .iter()
+        .filter_map(|a| {
+            let name = attr_simple_name(a, src)?.to_string();
+            let args = a
+                .args
+                .iter()
+                .filter_map(|e| attr_arg_const(e, src))
+                .collect();
+            Some(AttrDataRaw { name, args })
+        })
+        .collect()
+}
+
 fn parse_int(text: &str) -> i128 {
     let cleaned: String = text.chars().filter(|c| *c != '_' && *c != '\'').collect();
     let lower = cleaned.to_ascii_lowercase();
@@ -12888,6 +13010,100 @@ mod tests {
         assert_eq!(t.by_name.get("$Func").copied(), Some(StructId(0)));
         // It is a value struct.
         assert!(matches!(t.kinds[0], StructKind::Value));
+    }
+
+    /// CA-T1: `register_type_struct` collects each type's RAW custom-attribute
+    /// data into `type_attr_data` (parallel to `defs`), recording each attribute's
+    /// simple name + const-folded ctor args. This pins the collection + the int/
+    /// str arg folding (`attr_arg_const`): `[MyAttr(42, "x"), Reflect] class C`
+    /// records `MyAttr` with `[Int(42, I64), Str("x")]` and `Reflect` with no
+    /// args, in order. (Behavior-preserving in CA-T1 — lowering does not read this
+    /// yet; CA-T3 resolves the names → dense ids and folds into `TypeMeta`.)
+    #[test]
+    fn type_attr_data_collects_raw_attributes_with_folded_args() {
+        let src = r#"
+            [MyAttr(42, "x"), Reflect]
+            class C { public int32 mX; }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+            name: "",
+        }];
+        let t = StructTable::build(&files);
+        let id = *t.by_name.get("C").expect("class C must register");
+        // The parallel vector is in lockstep with `defs` (the build-time
+        // `debug_assert` also pins this, but assert it explicitly here).
+        assert_eq!(
+            t.type_attr_data.len(),
+            t.defs.len(),
+            "type_attr_data must be parallel to defs"
+        );
+        let attrs = &t.type_attr_data[id.0 as usize];
+        assert_eq!(attrs.len(), 2, "C has two attributes (MyAttr, Reflect)");
+        // First attribute: MyAttr(42, "x") — an int arg folds to the i64 slot and
+        // a string arg folds to Const::Str (decoded).
+        assert_eq!(attrs[0].name, "MyAttr");
+        assert_eq!(
+            attrs[0].args,
+            vec![Const::Int(42, IrType::I64), Const::Str("x".to_string())],
+            "MyAttr's int/str ctor args fold to Int(42, I64) + Str(\"x\")"
+        );
+        // Second attribute: the built-in `Reflect` marker — collected raw (no
+        // backing class; CA-T3 skips it at resolution), with no args.
+        assert_eq!(attrs[1].name, "Reflect");
+        assert!(attrs[1].args.is_empty(), "Reflect has no ctor args");
+    }
+
+    /// CA-T1: `attr_arg_const` folds the v1 scalar/string arg shapes and drops
+    /// everything else. Pins the Int/Bool/Char/Neg/Str arms + the `None` for
+    /// deferred (Float/typeof/non-literal) args.
+    #[test]
+    fn attr_arg_const_folds_scalars_and_strings() {
+        let p = |s: &'static str| -> Const {
+            // Parse `[A(<arg>)] class _T { }`, then pull the lone attribute arg.
+            let src = format!("[A({s})] class _T {{ }}");
+            // Leak so the parsed unit's spans (borrowing `src`) stay valid for the
+            // duration of this assertion (test-only).
+            let src: &'static str = Box::leak(src.into_boxed_str());
+            let unit = parse_file(src, FileId(0)).0;
+            let td = unit
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Type(td) => Some(td),
+                    _ => None,
+                })
+                .expect("a type decl");
+            let arg = &td.attributes[0].args[0];
+            attr_arg_const(arg, src).expect("arg must fold")
+        };
+        assert_eq!(p("7"), Const::Int(7, IrType::I64));
+        assert_eq!(p("-3"), Const::Int(-3, IrType::I64), "nested Unary{{Neg}}");
+        assert_eq!(p("(5)"), Const::Int(5, IrType::I64), "Paren unwraps");
+        assert_eq!(p("true"), Const::Bool(true));
+        assert_eq!(p("'a'"), Const::Int('a' as i128, IrType::I64));
+        assert_eq!(p("\"hi\""), Const::Str("hi".to_string()));
+
+        // Deferred shapes fold to None (dropped): float + non-literal.
+        let none = |s: &'static str| -> Option<Const> {
+            let src = format!("[A({s})] class _T {{ }}");
+            let src: &'static str = Box::leak(src.into_boxed_str());
+            let unit = parse_file(src, FileId(0)).0;
+            let td = unit
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Type(td) => Some(td),
+                    _ => None,
+                })
+                .unwrap();
+            attr_arg_const(&td.attributes[0].args[0], src)
+        };
+        assert_eq!(none("1.5"), None, "float arg is deferred → None");
+        assert_eq!(none("foo"), None, "non-literal arg → None");
     }
 
     /// FV-T1 / Risk R5 (C-ABI layout regression): registering `$Func` at id 0 and
