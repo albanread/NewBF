@@ -11,46 +11,84 @@ implementations.
 
 ## Status
 
-**~20% complete** toward the full Beef language. The compiler pipeline and the
-core language are well along; the long tail — comptime metaprogramming,
-reflection, and the broad standard library — is mostly ahead.
+**~60% complete** toward the full Beef language. Three waves of work are done
+or nearly done; the remaining tail is generic-constraint enforcement, the broad
+standard library port, delegates + events, FFI breadth, mixed optimization, and
+hot code swapping.
 
-A working compiler. The full pipeline — lexer → parser → semantic analysis →
-typed SSA IR → LLVM 22 → **ORC JIT** *and* **AOT `.exe`** — compiles and runs
-real Beef:
+The full pipeline — lexer → parser → sema → typed SSA IR → LLVM 22 →
+**ORC JIT** *and* **AOT `.exe`** — compiles and runs real Beef. 245-program
+JIT-and-run corpus, all under the live memory-safety guard; 160/160 LLVM verify.
 
-- primitive types, expressions, and Beef operator precedence;
-- full control flow: `if` / `while` / `for` / do-while / `switch`, `break` / `continue`;
-- intra-program calls, direct and mutual recursion;
-- **value `struct`s** — fields, member access, nested aggregates;
-- **heap `class`es** with manual `new` / `delete` (no GC), reference fields, chained access;
-- **constructors + destructors** and **instance methods** (`obj.Method()`, `this`);
-- **generics** (monomorphized value structs, classes, and methods); **inheritance
-  + virtual dispatch** (vtables, multi-level, `override`, `abstract`); **properties**
-  (computed + auto) and **user-defined indexers** (`obj[i]`); int-backed **enums**
-  plus **payload enums + `match`** with payload binding, `when` guards, the
-  `x case .Some(let v)` test operator, **methods + computed properties on enums**,
-  and generic **`Option<T>`** with target-typed `.Some(x)`/`.None` construction;
-- **user-defined operator overloading** — binary (`a + b`), unary (`-v`), and
-  compound (`v += w`);
-- **lambdas, closures, and higher-order functions** (`Map`/`Filter`/`Fold`);
-  function pointers; `sizeof`; scalar `static` fields;
-- a corlib slice — `String`, a growable `List<T>`, a generational `Pool` + typed
-  `Handle<T>`, `Math`, `Console`;
-- Win32 FFI through an embedded ABI oracle; SEH crash dumps with symbolicated
-  stack traces; a compile-time const-evaluator.
+**What works:**
+
+*Type system.* Value `struct`s, heap `class`es (manual `new`/`delete`),
+single inheritance, vtables, `abstract` / `override`, upcasts. Interfaces as
+**generic constraints** (monomorphization) *and* as **dynamic dispatch targets**
+(itable slots in the vtable header, `is`/`as` through an interface reference).
+Generic types and **generic methods**, including generics on generic owners
+(`List<T>.Map<R>()`), transitive monomorphization, const generics.
+Type-based overload resolution. Target-typed construction — `.Case(x)`,
+`.{ f=v }`, `.(args)` as call arguments, two-phase overload with pending-arg
+shapes. Explicit numeric casts, `??` null-coalescing, `?.` null-conditional
+member access.
+
+*Language surface.* Full control flow (`if`/`while`/`for`/`foreach`/`switch` +
+ternary `?:`), `break`/`continue` with labels. `defer` (LIFO, fires on every
+exit edge). `scope` allocations. Properties (computed + auto, compound `+=`).
+`ref`/`out` parameters. Tuples, `params` arrays (variadic). User-defined
+operator overloading (binary/unary/compound). User-defined indexers.
+`base.Method()`, implicit base-ctor/dtor chaining. Struct/object/array/
+collection initializers.
+
+*Algebraic data types.* Payload `enum`s (tagged-union structs), `switch` with
+payload binding, `when` guards, negated `not case`, methods + computed
+properties on enums. Generic `Option<T>`, `Result<T,E>`. Target-typed
+`.Case(x)` in call arguments.
+
+*Functions as values.* Function pointers, lambdas with heap-env capture,
+inline-lambda-as-argument, bound instance method-refs, closures that return
+closures. `Map`/`Filter`/`Fold` in corlib use these directly.
+
+*Manual memory.* `new`/`delete`, `scope` allocations, `defer delete`.
+**Debug guard** (Wave 2): quarantining stomp allocator + tombstone ledger — UAF
+faults deterministically, double-free aborts with a named site
+(`<fn> @ file:line`), live in both JIT and AOT. Compile-time delete-flow pass:
+provable double-free + leak, zero false positives across 401 `.bf` files.
+
+*Comptime.* Width-correct const-fold. `[EmitGenerator]` emits Beef source that
+splices back into resolution via an `extension Owner` fixpoint, termination-
+guarded. The emission sandbox carries full reflection metadata.
+
+*Runtime reflection.* `typeof(T)`, dynamic `GetType()`, field + method
+metadata (`FieldInfo`/`MethodInfo`), policy-gated strip (`[Reflect]`/
+`[AlwaysInclude]`). All via an in-module LLVM-emitted accessor — no Rust runtime
+crate needed.
+
+*Mixins + error handling.* Hygienic AST→IR splices reusing the live `Lowerer`
+(control-flow escape + SSA dominance free). `Result<T,E>` prelude. `Try!`
+early-return end-to-end.
+
+*Corlib.* `Internal` (FFI floor), `Console.WriteLine`, `Math`, `String`
+(`IndexOf`/`Contains`/`Substring`/`Split`/`Replace`/`Sort`), heap arrays
+(`T[]`, `.Count`, `delete`), `List<T>` (full CRUD, `Map`/`Filter`/`Fold`),
+`Option<T>`, `Result<T,E>`, generational `Pool<T>` + `Handle<T>`,
+compile-time `sizeof(T)`.
+
+**Wave 3 — in progress** (generic-constraint enforcement, iterator protocol
+`GetEnumerator`/`MoveNext`/`Current`/`Dispose`, comptime reflection
+`typeof(T).GetFields()` inside an emit generator, custom attributes).
+
+**Remaining (Waves 4+).** Delegates + events; full generic-constraint
+enforcement across the type system; the broad corlib port (`System.IO`,
+`Threading`, `Net`, …); full FFI / Win32 metadata breadth; mixed per-method
+optimization levels; hot code swapping; the iGui IDE (`newbf-ide`).
 
 Behaviour is checked by a JIT-and-run corpus — compile each program, run it,
-assert its result — alongside a curated feature corpus that verifies clean under
-the LLVM verifier. The reasoning behind each step is logged in
+assert its result — alongside the LLVM verifier corpus and a child-process
+guard harness (fault/abort programs whose results the in-process harness can't
+observe). The reasoning behind each step is logged in
 [`NewBF/docs/journals/`](NewBF/docs/journals).
-
-Not yet: comptime metaprogramming, reflection / attributes-as-behaviour, the
-broad standard library, dynamic interface dispatch, delegates + events, and full
-pattern matching (tuple/positional patterns; `when` guards already land). The
-*optional* GC direction
-(conservative roots + precise heap via the sibling **NewGC** collector — no
-safepoints) is designed in [`NewBF/docs/GC.md`](NewBF/docs/GC.md).
 
 ## Building
 
