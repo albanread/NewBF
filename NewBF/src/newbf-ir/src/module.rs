@@ -7,6 +7,7 @@
 //! into the IR — so the same IR serves both.
 
 use crate::func::Function;
+use crate::inst::Const;
 use crate::ty::{IrType, StructId};
 
 /// One field of a [`StructDef`]: its source name (for reports) and IR type.
@@ -90,6 +91,29 @@ pub struct MethodMeta {
     pub param_count: u32,
 }
 
+/// One custom-attribute instance attached to a [`TypeMeta`] (custom-attributes.md
+/// §2.2). Records the dense reflection id of the attribute's *class* plus its
+/// const-folded constructor arguments. Owned data only — no lifetimes (an
+/// `attr_type_id: u32` + `Vec<Const>`), so [`TypeMeta`] keeps holding only `Copy`
+/// `IrType`s and the metadata lives entirely on the [`Module`].
+///
+/// **CA-T0 only declares this** (default-empty on every type); **CA-T1 collects**
+/// the raw simple-name + args, **CA-T3 resolves + densifies** them into this
+/// shape on the [`TypeMeta`] built by sema, and **CA-T4 emits** the matching
+/// `%struct.AttributeInfo` table. Until CA-T3/T4, no `TypeMeta::attributes` is
+/// ever non-empty, so the field is behavior-preserving plumbing.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AttrMeta {
+    /// The dense reflection type-id of the attribute *class* (v1 attribute types
+    /// are classes — only `StructKind::Ref` mints a dense id). Resolved by sema
+    /// via the same `type_id_of` map that backs `typeof(T).GetTypeId()`.
+    pub attr_type_id: u32,
+    /// The const-folded scalar constructor arguments. v1 stores only
+    /// `Const::Int`/`Bool`/`Str` (folded from int/char/bool/string literals);
+    /// `Float`/`Null`/`Undef` and non-literal args are dropped by the collector.
+    pub args: Vec<Const>,
+}
+
 /// One per reflectable type. Recorded by sema (RF-T3) into [`Module::type_meta`]
 /// and emitted (policy-gated) as a constant `%struct.Type` global by the backend
 /// (RF-T4). Owned data only — no lifetimes, so [`IrType`] stays `Copy` and the
@@ -109,6 +133,42 @@ pub struct TypeMeta {
     pub fields: Vec<FieldMeta>,
     /// Empty unless `policy.has(METHODS)`.
     pub methods: Vec<MethodMeta>,
+    /// The type's custom-attribute instances (custom-attributes.md §2.2). **Empty
+    /// unless** the policy gates them in (v1 piggybacks the FIELDS bit). **CA-T0
+    /// only declares this field default-empty**; CA-T3 populates it (resolve +
+    /// densify) and CA-T4 emits the `%struct.AttributeInfo` table from it, so it
+    /// is dead (behavior-preserving) plumbing until then.
+    pub attributes: Vec<AttrMeta>,
+}
+
+impl TypeMeta {
+    /// Construct a [`TypeMeta`] with no custom attributes (`attributes` empty) —
+    /// the default for every reflectable type until CA-T3 populates it. Centralizes
+    /// the `attributes: Vec::new()` default so future field-adds don't re-break every
+    /// construction site (custom-attributes.md §3.2, R3). The real population site in
+    /// sema (`assign_type_ids_and_meta`) builds the literal directly so CA-T3 can fill
+    /// `attributes`; the test/AOT builders funnel through here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        type_id: u32,
+        struct_id: StructId,
+        name: String,
+        policy: ReflectPolicy,
+        is_ref: bool,
+        fields: Vec<FieldMeta>,
+        methods: Vec<MethodMeta>,
+    ) -> Self {
+        Self {
+            type_id,
+            struct_id,
+            name,
+            policy,
+            is_ref,
+            fields,
+            methods,
+            attributes: Vec::new(),
+        }
+    }
 }
 
 /// A mutable module global (a `static` field). Emitted zero-initialized.

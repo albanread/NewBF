@@ -220,15 +220,17 @@ mod tests {
             ],
         });
         m.add_vtable(VtableDef { name: "Widget.$cvdata".into(), entries: vec![], type_id: 7 });
-        m.add_type_meta(TypeMeta {
-            type_id: 0, // dense id 0 (the only entry) — registry index
-            struct_id: c,
-            name: "Widget".into(),
-            policy: ReflectPolicy::TYPE,
-            is_ref: true,
-            fields: vec![],
-            methods: vec![],
-        });
+        // CA-T0: `TypeMeta::new` defaults `attributes` empty (AOT metadata-accessor
+        // test — no custom attributes).
+        m.add_type_meta(TypeMeta::new(
+            0, // dense id 0 (the only entry) — registry index
+            c,
+            "Widget".into(),
+            ReflectPolicy::TYPE,
+            true,
+            vec![],
+            vec![],
+        ));
 
         // i32 main() { Type* t = __newbf_type_by_id(0); return t->mTypeId; }
         // The Type aggregate is { i32 mSize, i32 mTypeId, ... } so mTypeId is the

@@ -36,7 +36,91 @@ pub fn format_ir(m: &Module) -> String {
         out.push('\n');
         format_function(&mut out, f);
     }
+    format_type_meta(&mut out, m);
     out
+}
+
+/// Render the module's per-type reflection metadata ([`Module::type_meta`]) into
+/// the `dump-ir` report. **Emitted only when `type_meta` is non-empty** so a
+/// program with no reflectable types pays nothing and its dump is unchanged.
+///
+/// Deterministic and name-keyed (same ordering discipline as
+/// [`format_reflection`]: types by name, fields by `(field_index, name)`, methods
+/// by `(name, symbol)`, attributes in their recorded order). The dump shows
+/// `type_id` (unlike `format_reflection`, which suppresses it to stay churn-stable
+/// across corlib growth) because the `dump-ir` report is a non-golden, full IR
+/// view.
+///
+/// The **`attr <type_id> [args…]`** rows are the CA-T0 plumbing: they surface the
+/// `attributes` field so a future dump-ir golden can observe attribute data once
+/// CA-T3 populates it. Until then `attributes` is always empty, so no `attr` row
+/// is ever produced and the dump is byte-for-byte unchanged.
+fn format_type_meta(out: &mut String, m: &Module) {
+    if m.type_meta.is_empty() {
+        return;
+    }
+    let mut metas: Vec<&TypeMeta> = m.type_meta.iter().collect();
+    metas.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.fields.len().cmp(&b.fields.len()))
+            .then(a.methods.len().cmp(&b.methods.len()))
+    });
+    let _ = writeln!(out, "\ntype_meta: {} types", metas.len());
+    for tm in metas {
+        let _ = writeln!(
+            out,
+            "type {} #{} [{}] kind={} fields={} methods={} attrs={}",
+            tm.name,
+            tm.type_id,
+            format_policy(tm.policy),
+            if tm.is_ref { "ref" } else { "struct" },
+            tm.fields.len(),
+            tm.methods.len(),
+            tm.attributes.len(),
+        );
+        let mut fields: Vec<_> = tm.fields.iter().collect();
+        fields.sort_by(|a, b| a.field_index.cmp(&b.field_index).then(a.name.cmp(&b.name)));
+        for f in fields {
+            let _ = writeln!(
+                out,
+                "    field {} idx={} ty={}",
+                f.name,
+                f.field_index,
+                f.ty.mnemonic()
+            );
+        }
+        let mut methods: Vec<_> = tm.methods.iter().collect();
+        methods.sort_by(|a, b| (&a.name, &a.symbol).cmp(&(&b.name, &b.symbol)));
+        for mm in methods {
+            let _ = writeln!(
+                out,
+                "    method {} sym={} params={}",
+                mm.name, mm.symbol, mm.param_count
+            );
+        }
+        // Attributes in recorded order (the const-folded args are dumped so the
+        // CA-T3/T4 data is reviewable). Empty in CA-T0 — no row emitted.
+        for a in &tm.attributes {
+            let args: Vec<String> = a.args.iter().map(format_const).collect();
+            let _ = writeln!(out, "    attr <{}> [{}]", a.attr_type_id, args.join(", "));
+        }
+    }
+}
+
+/// A compact, deterministic rendering of a [`Const`] for the `dump-ir` attribute
+/// rows (CA-T0). Only `Int`/`Bool`/`Str` ever appear in `AttrMeta::args` (v1
+/// scope, custom-attributes.md §2.2); the other variants are rendered too so the
+/// dump stays total.
+fn format_const(c: &Const) -> String {
+    match c {
+        Const::Int(v, ty) => format!("{v}:{}", ty.mnemonic()),
+        Const::Float(v, ty) => format!("{v}:{}", ty.mnemonic()),
+        Const::Bool(b) => format!("{b}"),
+        Const::Null => "null".to_string(),
+        Const::Undef(ty) => format!("undef:{}", ty.mnemonic()),
+        Const::Str(s) => format!("{s:?}"),
+    }
 }
 
 fn format_function(out: &mut String, f: &Function) {

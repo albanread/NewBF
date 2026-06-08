@@ -5044,6 +5044,9 @@ fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
             is_ref: true,
             fields,
             methods,
+            // CA-T0: default-empty custom-attribute slot. CA-T3 resolves +
+            // densifies the collected `type_attr_data` into this vec here.
+            attributes: vec![],
         });
     }
 }

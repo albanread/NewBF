@@ -1897,24 +1897,26 @@ mod tests {
             ]
         };
         // Marked: TYPE|FIELDS ⇒ a FieldInfo array. Unmarked: TYPE only ⇒ stripped.
-        m.add_type_meta(TypeMeta {
-            type_id: 0,
-            struct_id: marked,
-            name: "Marked".into(),
-            policy: ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
-            is_ref: true,
-            fields: user_fields(),
-            methods: vec![],
-        });
-        m.add_type_meta(TypeMeta {
-            type_id: 1,
-            struct_id: unmarked,
-            name: "Unmarked".into(),
-            policy: ReflectPolicy::TYPE,
-            is_ref: true,
-            fields: vec![], // sema records none when FIELDS is stripped
-            methods: vec![],
-        });
+        // CA-T0: `TypeMeta::new` defaults `attributes` empty (the test exercises
+        // field reflection only — no custom attributes).
+        m.add_type_meta(TypeMeta::new(
+            0,
+            marked,
+            "Marked".into(),
+            ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            true,
+            user_fields(),
+            vec![],
+        ));
+        m.add_type_meta(TypeMeta::new(
+            1,
+            unmarked,
+            "Unmarked".into(),
+            ReflectPolicy::TYPE,
+            true,
+            vec![], // sema records none when FIELDS is stripped
+            vec![],
+        ));
 
         verify_module(&m).expect("metadata module verifies");
         let ir = lower_to_string(&m);
@@ -1954,15 +1956,15 @@ mod tests {
             ],
         });
         m2.add_vtable(VtableDef { name: "Unmarked.$cvdata".into(), entries: vec![], type_id: 0 });
-        m2.add_type_meta(TypeMeta {
-            type_id: 0,
-            struct_id: only,
-            name: "Unmarked".into(),
-            policy: ReflectPolicy::TYPE,
-            is_ref: true,
-            fields: vec![],
-            methods: vec![],
-        });
+        m2.add_type_meta(TypeMeta::new(
+            0,
+            only,
+            "Unmarked".into(),
+            ReflectPolicy::TYPE,
+            true,
+            vec![],
+            vec![],
+        ));
         let ir2 = lower_to_string(&m2);
         // The `%struct.FieldInfo` named TYPE is always declared, but NO
         // `@.fieldinfo` array GLOBAL is emitted when every type strips fields —
