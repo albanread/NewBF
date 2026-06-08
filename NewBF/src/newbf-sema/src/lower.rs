@@ -97,6 +97,23 @@ enum ScopeAlloc {
         id: StructId,
         bind_slot: Option<Value>,
     },
+    /// IT-T1: a `foreach`-enumerator `Dispose()` cleanup hook. NOT a heap free —
+    /// it emits a direct call to the enumerator's `Dispose` method passing the
+    /// enumerator's `this` pointer, so the protocol's `Dispose()` runs exactly
+    /// once on EVERY loop-exit edge (normal fall-off, `break`, `return`) via the
+    /// same `free_*scopes*` machinery that gives `scope` locals their
+    /// exactly-once cleanup. `this_ptr` is the address-as-`this`: for a
+    /// value-struct enumerator it is the `e_slot` alloca address (so MoveNext's
+    /// state is what Dispose sees — R6); for a `Ref` enumerator it is a slot
+    /// holding the heap body pointer, loaded when `via_load` is set. `full_name`
+    /// is the resolved `Dispose` symbol. This variant carries no `bind_slot` (a
+    /// `foreach` enumerator is never an explicit-`delete` local) and is never
+    /// produced by the `scope T()` path, so the `delete`-deregister sites skip it.
+    DisposeHook {
+        this_ptr: Value,
+        full_name: String,
+        via_load: bool,
+    },
 }
 
 fn struct_kind(td: &TypeDecl) -> Option<StructKind> {
@@ -6540,6 +6557,24 @@ impl<'a> Lowerer<'a> {
                 self.fb.br(join_b);
                 self.fb.switch_to(join_b);
             }
+            // IT-T1: emit the enumerator `Dispose()` call. `this_ptr` is the
+            // address-as-`this` (the `e_slot` alloca for a value struct; a slot
+            // holding the heap body for a `Ref`, loaded here when `via_load`).
+            // A direct, non-virtual call — like the auto-getter / Count/Get
+            // precedent — so no SSA value crosses a block edge (R13).
+            ScopeAlloc::DisposeHook {
+                this_ptr,
+                full_name,
+                via_load,
+            } => {
+                let full_name = full_name.clone();
+                let this_v = if *via_load {
+                    self.fb.load(this_ptr.clone(), IrType::Ptr)
+                } else {
+                    this_ptr.clone()
+                };
+                self.fb.call(full_name, vec![this_v], IrType::Void);
+            }
         }
     }
 
@@ -6760,6 +6795,10 @@ impl<'a> Lowerer<'a> {
                     match last {
                         ScopeAlloc::Direct { bind_slot, .. }
                         | ScopeAlloc::Slot { bind_slot, .. } => *bind_slot = Some(slot),
+                        // A `foreach` Dispose hook is never produced by a `scope
+                        // T()` initializer, so this arm is unreachable on this
+                        // path; leave it untouched (no bind_slot to tag).
+                        ScopeAlloc::DisposeHook { .. } => {}
                     }
                 }
                 if let Some(t) = ty {
@@ -7125,7 +7164,152 @@ impl<'a> Lowerer<'a> {
                     self.fb.br(head);
                     self.switch(exit);
                     self.scopes.pop();
+                    return;
                 }
+                // IT-T1: the FIFTH `foreach` branch — the enumerator protocol over
+                // a USER type exposing `GetEnumerator()`. Reached only when the
+                // Count/Get probe above yields `None` (`coll`/`coll_ty` stay in
+                // scope), so the five pinned Count/Get foreach programs are
+                // byte-identical. Resolve `recv.GetEnumerator()` → an enumerator
+                // `e : Struct(eid)` (value) or `Ref(eid)` (heap); head on
+                // `e.MoveNext() -> bool`, bind the loop var from `e.Current`
+                // (`get_Current`), and `e.Dispose()` on every exit edge via a
+                // scope-cleanup hook (R6). All members resolve by name through the
+                // same `pick_overload` probe; `.cloned()` is mandatory to end the
+                // `self.structs.methods` borrow before emitting (else `&mut self`
+                // calls can't run — exactly as the Count/Get path does).
+                if let IrType::Ref(cid) | IrType::Struct(cid) = coll_ty {
+                    let ge = self.structs.methods[cid.0 as usize]
+                        .get("GetEnumerator")
+                        .and_then(|c| pick_overload(c, &[], true))
+                        .cloned();
+                    if let Some(ge) = ge
+                        && let IrType::Struct(eid) | IrType::Ref(eid) = ge.ret
+                    {
+                        let mn = self.structs.methods[eid.0 as usize]
+                            .get("MoveNext")
+                            .and_then(|c| pick_overload(c, &[], true))
+                            .cloned();
+                        let cur = self.structs.methods[eid.0 as usize]
+                            .get("get_Current")
+                            .and_then(|c| pick_overload(c, &[], true))
+                            .cloned();
+                        // `Dispose` is OPTIONAL — `None` ⇒ no hook, no call emitted.
+                        let disp = self.structs.methods[eid.0 as usize]
+                            .get("Dispose")
+                            .and_then(|c| pick_overload(c, &[], true))
+                            .cloned();
+                        if let (Some(mn), Some(cur)) = (mn, cur) {
+                            let enum_ty = ge.ret;
+                            // `via_load`: a `Ref` enumerator stores a pointer in
+                            // `e_slot`, loaded per use; a value-struct enumerator's
+                            // body IS the `e_slot` alloca address (R6 — the same
+                            // address across MoveNext/Current/Dispose so state
+                            // persists; a reloaded copy would loop forever).
+                            let enum_is_ref = matches!(enum_ty, IrType::Ref(_));
+                            let elem_ty = cur.ret;
+
+                            self.scopes.push(HashMap::new());
+
+                            // (a) Form `GetEnumerator`'s receiver `this`:
+                            //   - `Ref(id)` collection → `coll` IS the heap body.
+                            //   - `Struct(id)` collection (incl. an rvalue value
+                            //     struct) → materialize into an alloca; pass its
+                            //     address (instance methods always want a pointer
+                            //     `this`).
+                            let recv_this = if let IrType::Ref(_) = coll_ty {
+                                coll
+                            } else {
+                                let c_slot = self.fb.alloca(coll_ty);
+                                self.fb.store(c_slot.clone(), coll);
+                                c_slot
+                            };
+                            // (b) Evaluate the enumerator ONCE into its own slot.
+                            let e_slot = self.fb.alloca(enum_ty);
+                            let (e_val, _) =
+                                self.call_instance_on_ptr(&ge, recv_this, Vec::new());
+                            self.fb.store(e_slot.clone(), e_val);
+
+                            // (c) The enumerator `this` for all three calls: the
+                            // SAME pointer every iteration (R6). For a value struct
+                            // it is the `e_slot` address; for a `Ref` it is loaded
+                            // from `e_slot` at each use.
+                            let var_slot = self.fb.alloca(elem_ty);
+                            self.bind(name.text(src), var_slot.clone(), elem_ty, None);
+
+                            // (d) Register `Dispose` as a scope-cleanup hook in a
+                            // dedicated frame BELOW the loop's captured depth (R6).
+                            // `loops.push` captures depth AFTER this frame is pushed
+                            // so `break`/`continue`'s `free_scopes_down_to(depth)`
+                            // frees only the body's inner frames — NOT this one — so
+                            // they never double-Dispose. The hook fires once on:
+                            //   - normal fall-off / `break`: via `free_scope_top` at
+                            //     `exit` (both branch to `exit`),
+                            //   - `return`: via `free_all_scopes` (`lower.rs` return
+                            //     arm) — disposes then `ret`, never reaching `exit`.
+                            self.scope_allocs
+                                .push((self.fb.current_block(), Vec::new()));
+                            if let Some(disp) = &disp {
+                                let frame = &mut self.scope_allocs.last_mut().unwrap().1;
+                                frame.push(ScopeAlloc::DisposeHook {
+                                    this_ptr: e_slot.clone(),
+                                    full_name: disp.full_name.clone(),
+                                    via_load: enum_is_ref,
+                                });
+                            }
+
+                            let head = self.fb.create_block("foreach.head");
+                            let body_b = self.fb.create_block("foreach.body");
+                            let cont = self.fb.create_block("foreach.cont");
+                            let exit = self.fb.create_block("foreach.exit");
+                            self.fb.br(head);
+                            // head: e.MoveNext() ? body : exit
+                            self.switch(head);
+                            let this_mn = if enum_is_ref {
+                                self.fb.load(e_slot.clone(), IrType::Ptr)
+                            } else {
+                                e_slot.clone()
+                            };
+                            let (cond, _) =
+                                self.call_instance_on_ptr(&mn, this_mn, Vec::new());
+                            self.fb.cond_br(cond, body_b, exit);
+                            self.terminated = true;
+                            // body: name = e.Current; <body>
+                            self.switch(body_b);
+                            let this_cur = if enum_is_ref {
+                                self.fb.load(e_slot.clone(), IrType::Ptr)
+                            } else {
+                                e_slot.clone()
+                            };
+                            let (elem, _) =
+                                self.call_instance_on_ptr(&cur, this_cur, Vec::new());
+                            self.fb.store(var_slot.clone(), elem);
+                            // `break`/`continue` target (cont, exit, depth). `depth`
+                            // is the post-enumerator-frame length, so the hook frame
+                            // sits below it (see (d)).
+                            self.loops
+                                .push((cont, exit, self.scope_allocs.len()));
+                            self.stmt(body, src);
+                            self.loops.pop();
+                            if !self.terminated {
+                                self.fb.br(cont);
+                            }
+                            // cont → head (MoveNext advances; no index increment).
+                            self.switch(cont);
+                            self.fb.br(head);
+                            // exit: run the Dispose hook ONCE (normal/break edge),
+                            // then pop the enumerator frame + the loop-var scope.
+                            self.switch(exit);
+                            self.free_scope_top();
+                            self.scope_allocs.pop();
+                            self.scopes.pop();
+                            return;
+                        }
+                    }
+                }
+                // else: a non-iterable collection (no Count/Get, no
+                // GetEnumerator/MoveNext/Current) degrades to a skipped body —
+                // unchanged from before IT-T1.
             }
             Stmt::Break { .. } => {
                 if let Some(&(_, brk, depth)) = self.loops.last() {
@@ -9410,6 +9594,38 @@ impl<'a> Lowerer<'a> {
         Some((fv, IrType::Struct(self.structs.func_struct)))
     }
 
+    /// IT-T1: emit a direct instance-method call against an already-lowered
+    /// receiver *pointer* (a place / body pointer), NOT an `&Expr`. The
+    /// `lower_method_call` entry point recovers its receiver from an AST node
+    /// (`struct_base` → `lvalue`), so it cannot be fed a manufactured `Value`;
+    /// this is the place-based form `foreach`'s enumerator protocol needs
+    /// (`MoveNext`/`Current`/`Dispose` on the `e_slot` address). Models the
+    /// resolution/coercion tail of `lower_method_call` + the auto-getter /
+    /// `try_property_get` precedent: prepend `this_ptr` for an instance method,
+    /// then coerce each explicit arg against `sig.params[1..]`. A single direct
+    /// `fb.call` against the mangled symbol — no SSA value crosses a block edge
+    /// (R13), and the same `this_ptr` is reused across calls so a value-struct
+    /// enumerator's mutated state persists (R6).
+    fn call_instance_on_ptr(
+        &mut self,
+        sig: &MethodSig,
+        this_ptr: Value,
+        args: Vec<(Value, IrType)>,
+    ) -> (Value, IrType) {
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        if sig.is_instance {
+            call_args.push(this_ptr);
+        }
+        for (i, (v, t)) in args.into_iter().enumerate() {
+            // Explicit params start past the leading `this` for an instance method.
+            let pidx = if sig.is_instance { i + 1 } else { i };
+            let pt = sig.params.get(pidx).copied().unwrap_or(t);
+            call_args.push(self.coerce(v, t, pt));
+        }
+        let r = self.fb.call(sig.full_name.clone(), call_args, sig.ret);
+        (r, sig.ret)
+    }
+
     /// `obj.Name` where `Name` is not a field but the receiver's type defines a
     /// `get_Name` instance method (a computed property): emit the getter call.
     /// Uses `struct_base` for the receiver (a *pointer* to the body) — exactly
@@ -10359,6 +10575,9 @@ impl<'a> Lowerer<'a> {
                     ScopeAlloc::Direct { bind_slot, .. } | ScopeAlloc::Slot { bind_slot, .. } => {
                         bind_slot.as_ref()
                     }
+                    // A `foreach` Dispose hook has no bind_slot — never matches a
+                    // `delete x` de-registration.
+                    ScopeAlloc::DisposeHook { .. } => None,
                 };
                 if slot == Some(bind_slot) {
                     found = Some((fi, ei));
@@ -10373,6 +10592,8 @@ impl<'a> Lowerer<'a> {
                 ScopeAlloc::Slot { slot, .. } => {
                     self.fb.store(slot, Value::Const(Const::Null));
                 }
+                // Unreachable: a Dispose hook never has a matching bind_slot.
+                ScopeAlloc::DisposeHook { .. } => {}
             }
         }
     }
