@@ -145,11 +145,57 @@ fn violate_decl_contradiction_diagnoses_once() {
 
 /// Satisfiable single kind constraints (and `class`/`struct` on *distinct*
 /// parameters) emit ZERO constraint diagnostics — the zero-false-positive pin.
+/// CT-T3 extends this fixture with satisfied INSTANTIATIONS (transitive
+/// implements/base, struct/class kinds, primitive-as-struct) — all still ZERO.
 #[test]
 fn satisfied_no_diag_emits_zero() {
     let diags = local_constraint_diags("satisfied_no_diag.bf");
     assert!(
         diags.is_empty(),
         "satisfied_no_diag.bf must emit zero constraint diagnostics, got: {diags:?}"
+    );
+}
+
+// ── CT-T3: method-call instantiation violations ─────────────────────────────
+//
+// Each positive fixture instantiates a generic method whose supported
+// constraint the concrete type-arg PROVABLY violates → EXACTLY ONE diagnostic.
+// Checked via the same direct-`analyze` `constraint_diags` helper (never
+// run-corpus, §3.5).
+
+/// `Use<int32>(…)` against `where T : IFace` — the **primitive** `int32`
+/// provably implements no in-program interface → EXACTLY ONE diagnostic. The
+/// flagship `Use<int32>` check.
+#[test]
+fn violate_iface_diagnoses_once() {
+    let diags = local_constraint_diags("violate_iface.bf");
+    assert_eq!(
+        diags.len(),
+        1,
+        "violate_iface.bf must emit exactly one constraint diagnostic, got: {diags:?}"
+    );
+}
+
+/// A value **struct** arg to a `where T : class` constraint is provably not a
+/// reference type → EXACTLY ONE diagnostic.
+#[test]
+fn violate_class_constraint_diagnoses_once() {
+    let diags = local_constraint_diags("violate_class_constraint.bf");
+    assert_eq!(
+        diags.len(),
+        1,
+        "violate_class_constraint.bf must emit exactly one constraint diagnostic, got: {diags:?}"
+    );
+}
+
+/// A reference **class** arg to a `where T : struct` constraint is provably not
+/// a value type → EXACTLY ONE diagnostic.
+#[test]
+fn violate_struct_constraint_diagnoses_once() {
+    let diags = local_constraint_diags("violate_struct_constraint.bf");
+    assert_eq!(
+        diags.len(),
+        1,
+        "violate_struct_constraint.bf must emit exactly one constraint diagnostic, got: {diags:?}"
     );
 }
