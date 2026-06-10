@@ -727,14 +727,19 @@ fn index_generic_decls<'a>(items: &'a [Item], src: &'a str, out: &mut GenericDec
             // bearing generic payload enum is collected — its methods then emit at
             // the mono id like any generic type's, the precondition for a generic
             // enum *instance* method that `switch (this)` to monomorphize + run.
-            // Generic *interfaces* are EXCLUDED (itables.md §6/§10): they stay on
-            // the generic-constraint static path and are never monomorphized in
-            // v1, so `IFaceD<int16>` must resolve to `Ptr` (the unregistered
-            // fallback), not `Ref(mono_id)`. (Now that `struct_kind` returns
-            // `Some(Interface)`, this exclusion must be explicit.)
+            // Generic *interfaces* ARE collected as of GI-T0 (generic-interfaces.md
+            // §3.1 / SPRINT-PLAN-4 GI-T0): `struct_kind` returns `Some(Interface)`,
+            // so a generic interface enters the `(name, arity)` map and is
+            // monomorphized when requested — `IFaceD<int16>` registers `IFaceD$i16`
+            // (`record_inst` mints `kinds[mono] = Interface` via `struct_kind`,
+            // `lower.rs:1781`) and resolves to `Ref(mono_id)` (`lower_ty_env` /
+            // `ty_of`, `lower.rs:13226`/`:654`) instead of the prior `Ptr` fallback.
+            // The mono is born with EMPTY-but-present itable vecs; its `imethods`
+            // fill (Seam C) is GI-T2 — until then a mono interface in a type
+            // position registers but carries no slots (no dispatch), behavior-neutral
+            // (GI-PRE standalone-isolation: no existing corpus class panics).
             Item::Type(td)
                 if !td.generic_params.is_empty()
-                    && td.kind != TypeKind::Interface
                     && (struct_kind(td).is_some()
                         || (td.kind == TypeKind::Enum
                             && enum_has_payload(td)
@@ -13408,6 +13413,78 @@ mod tests {
         assert_eq!(t.by_name.get("$Func").copied(), Some(StructId(0)));
         // It is a value struct.
         assert!(matches!(t.kinds[0], StructKind::Value));
+    }
+
+    /// GI-T0 (the first domino, generic-interfaces.md §3.1 / SPRINT-PLAN-4 GI-T0):
+    /// after lifting the `td.kind != TypeKind::Interface` conjunct in
+    /// `index_generic_decls` (`lower.rs:737`), a generic interface used in a TYPE
+    /// POSITION (here a class field of type `IFaceX<int16>`) registers a real
+    /// monomorph `IFaceX$i16` whose `kind` is `StructKind::Interface` and which
+    /// `ty_of` resolves to `Ref(mono_id)` — NOT the prior unregistered `Ptr`
+    /// fallback. This proves only the mono REGISTRATION path; the `imethods` fill
+    /// + dispatch are GI-T2/T3 (the mono's itable vecs are empty-but-present here).
+    ///
+    /// The field-type use is the EXISTING `collect_insts_type` `Member::Field` walk
+    /// (`lower.rs:2063`) → `use_in_type` → `record_inst` — NOT Seam B (the `td.bases`
+    /// walk, GI-T1, deliberately absent here). So no class base requests the mono;
+    /// only the field's type position does. Behavior-neutral by GI-PRE's
+    /// standalone-isolation property.
+    #[test]
+    fn gi_t0_generic_interface_in_type_position_registers_interface_mono() {
+        // `int16` mangles to the type code `i16`, so `IFaceX<int16>` → `IFaceX$i16`.
+        let src = r#"
+            interface IFaceX<T> { T GetVal(); }
+            class Holder { public IFaceX<int16> mField; }
+        "#;
+        let unit = parse_file(src, FileId(0)).0;
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+            name: "",
+        }];
+        let t = StructTable::build(&files);
+
+        // The mono `IFaceX$i16` is registered (pre-GI-T0 it never entered the map,
+        // so `by_name` had no such key and the field's type fell to `Ptr`).
+        let mono_id = *t
+            .by_name
+            .get("IFaceX$i16")
+            .expect("GI-T0: a type-position `IFaceX<int16>` must register `IFaceX$i16`");
+
+        // It is minted with `kind = StructKind::Interface` (derived from the
+        // template's `TypeKind::Interface` via `struct_kind`, `record_inst`
+        // `lower.rs:1781`).
+        assert!(
+            matches!(t.kinds[mono_id.0 as usize], StructKind::Interface),
+            "GI-T0: the mono `IFaceX$i16` must be born with `kinds == Interface`"
+        );
+
+        // `ty_of` resolves the registered mono to `Ref(mono_id)` (the
+        // `StructKind::Interface => Ref(id)` arm, `lower.rs:654`) — the prior
+        // unregistered `Ptr` fallback (`lower_ty_env` `lower.rs:13226`) is gone.
+        assert_eq!(
+            t.ty_of("IFaceX$i16"),
+            Some(IrType::Ref(mono_id)),
+            "GI-T0: `IFaceX<int16>` must resolve to Ref(mono_id), not the Ptr fallback"
+        );
+
+        // GI-T0 is registration-only: the mono's itable is empty-but-present
+        // (the `imethods` fill is Seam C / GI-T2). Confirm no slots yet — this is
+        // the "inert until GI-T2" invariant, NOT a dispatch capability.
+        assert!(
+            t.imethods[mono_id.0 as usize].is_empty(),
+            "GI-T0: the mono interface must have EMPTY imethods (the fill is GI-T2)"
+        );
+
+        // The generic TEMPLATE `IFaceX<T>` itself gets NO `by_name` id
+        // (`register_type_struct` registers only `generic_params.is_empty()` decls,
+        // `lower.rs:2599`); only the mono `IFaceX$i16` is a registered type. This
+        // pins that the registration is the MONO, not the template.
+        assert!(
+            t.by_name.get("IFaceX").is_none(),
+            "the generic interface TEMPLATE has no standalone id — only the mono does"
+        );
     }
 
     /// CA-T1: `register_type_struct` collects each type's RAW custom-attribute
