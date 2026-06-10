@@ -219,6 +219,20 @@ struct TypeIndex {
     /// Every type's `TypeKindD` keyed by its own `TypeId` (so CT-T3 can read the
     /// kind of a *resolved* arg directly, independent of first-wins name choice).
     kind_by_id: HashMap<TypeId, TypeKindD>,
+    /// `(simple name, arity)` keys that match **more than one** in-program type
+    /// (a simple-name collision, §6 item 8). Under the per-file ratchet these are
+    /// rare, but a MULTI-FILE configuration (GC-T4: corlib-slice co-analyzed with
+    /// the feature suite, or several feature files together) makes them common:
+    /// e.g. `struct StructA` appears in `Constraints.bf`/`Generics.bf`/
+    /// `Interfaces.bf` with DIFFERENT bases. First-wins would pick ONE of them and
+    /// could `Violated`-mismatch a call that actually instantiates a DIFFERENT
+    /// same-named type (e.g. `Alloc2<StructA>()` in `Generics.bf` where
+    /// `StructA : IDisposable`, but first-wins binds `Constraints.bf`'s base-less
+    /// `StructA`). An ambiguous name is therefore treated as **unresolvable** for
+    /// validation (the `lookup`s below return `None`), so the GC-T3 check SKIPS it
+    /// — a conservative extension of the any-base-unresolvable ⇒ skip rule (§3.2)
+    /// that closes the configuration-dependence false positive R1/§6.7 warns of.
+    ambiguous: HashSet<(String, u32)>,
 }
 
 impl TypeIndex {
@@ -226,24 +240,28 @@ impl TypeIndex {
         let mut by_name_arity = HashMap::new();
         let mut kind_by_name_arity = HashMap::new();
         let mut kind_by_id = HashMap::new();
+        let mut ambiguous = HashSet::new();
         for (i, t) in graph.types.iter().enumerate() {
             let id = TypeId(i as u32);
             kind_by_id.insert(id, t.kind);
             let name = interner.resolve(t.name).to_string();
-            // First-wins within an arity (conservative): an ambiguous simple name
-            // resolves to one TypeId; a violation only fires on a PROVABLE
-            // mismatch (CT-T3), else Skip. Both maps insert under the same guard
-            // so they stay consistent (same chosen entry).
+            // First-wins within an arity for the chosen TypeId/kind, but ALSO
+            // record any second-or-later occurrence as ambiguous: a name matching
+            // >1 type cannot be resolved to a single TypeId without picking
+            // arbitrarily, so the validation treats it as unresolvable (skip).
             let key = (name, t.arity);
             if !by_name_arity.contains_key(&key) {
                 by_name_arity.insert(key.clone(), id);
                 kind_by_name_arity.insert(key, t.kind);
+            } else {
+                ambiguous.insert(key);
             }
         }
         Self {
             by_name_arity,
             kind_by_name_arity,
             kind_by_id,
+            ambiguous,
         }
     }
 
@@ -254,17 +272,26 @@ impl TypeIndex {
 
     /// Look up a bare simple name as an arity-0 entry (a `where T : IFace` with
     /// no `<…>` binds the non-generic entry — mirrors `index_generic_decls` /
-    /// `check_duplicate_types`). Returns `None` when unresolvable in this program.
+    /// `check_duplicate_types`). Returns `None` when unresolvable in this program
+    /// — including when the name is **ambiguous** (matches >1 arity-0 type), the
+    /// conservative skip for a simple-name collision (§6 item 8, GC-T4).
     fn lookup_arity0(&self, name: &str) -> Option<TypeId> {
-        self.by_name_arity.get(&(name.to_string(), 0)).copied()
+        self.lookup(name, 0)
     }
 
     /// Look up a simple name at a specific arity. Used by the transitive base
     /// walk to resolve a base reference (`Singleton<ClassC>` → arity 1; `IFaceB`
-    /// → arity 0). Returns `None` when unresolvable in this (one-file) program —
-    /// the any-base-unresolvable ⇒ skip rule (§3.2) keys off this.
+    /// → arity 0). Returns `None` when unresolvable in this program — including
+    /// when the name is **ambiguous** (matches >1 type at this arity): the
+    /// any-base-unresolvable ⇒ skip rule (§3.2) then fires and the whole check is
+    /// skipped, never a false positive against an arbitrarily-chosen collision
+    /// winner (GC-T4 / R1).
     fn lookup(&self, name: &str, arity: u32) -> Option<TypeId> {
-        self.by_name_arity.get(&(name.to_string(), arity)).copied()
+        let key = (name.to_string(), arity);
+        if self.ambiguous.contains(&key) {
+            return None;
+        }
+        self.by_name_arity.get(&key).copied()
     }
 }
 

@@ -73,6 +73,77 @@ fn constraint_diags(dir: &str, name: &str) -> Vec<Diagnostic> {
     constraint_diags_at(&path)
 }
 
+/// CT-T4 (generic-constraints.md §3.3/§6.7, R1) — analyze SEVERAL files together
+/// in ONE `analyze` call (the multi-file configuration) and return only the
+/// **constraint** diagnostics.
+///
+/// Unlike `constraint_diags_at` (one file as its own one-file program — the
+/// per-file ratchet configuration `tests/corpus.rs` uses), this builds a
+/// multi-file `SourceFile` list and merges it in a single `analyze` (the def
+/// graph then has ALL the types — "open namespaces and extensions span files",
+/// `lib.rs:59`). This is the only way to make corlib interfaces like
+/// `IDisposable`/`IHashable` IN-PROGRAM and RESOLVABLE, so the GC-T3
+/// instantiation check actually RUNS on `Constraints.bf`'s `where K : IHashable`
+/// clause instead of skipping it as unresolvable.
+///
+/// Parse diagnostics are tolerated per file (exactly as `tests/corpus.rs` does):
+/// the corlib slice is large and the pass must classify without panicking on a
+/// partial AST. Each file gets its own `FileId` (span identity) and its own
+/// `src` (so `Span::text(src)` slices the right buffer per file). The returned
+/// diagnostics are filtered to the `constraint` channel so an unrelated
+/// cross-file diagnostic (a duplicate-def across the merged set, a delete-flow
+/// note) cannot perturb the count.
+fn constraint_diags_multi(paths: &[PathBuf]) -> Vec<Diagnostic> {
+    // Read every file's source first (the `SourceFile`s borrow these buffers).
+    let srcs: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+        })
+        .collect();
+    // Parse each with its own `FileId` (distinct so spans stay attributable).
+    let units: Vec<_> = srcs
+        .iter()
+        .enumerate()
+        .map(|(i, src)| {
+            let (unit, _pdiags) = parse_file(src, FileId(i as u32));
+            unit
+        })
+        .collect();
+    let files: Vec<SourceFile<'_>> = srcs
+        .iter()
+        .zip(units.iter())
+        .enumerate()
+        .map(|(i, (src, unit))| SourceFile {
+            file: FileId(i as u32),
+            src,
+            unit,
+            name: "",
+        })
+        .collect();
+    let program = analyze(&files);
+    program
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.message.to_lowercase().contains("constraint"))
+        .collect()
+}
+
+/// Every `.bf` file directly under `beef-tests/corlib-slice/`, sorted for a
+/// deterministic merge order (so the first-wins `(name, arity)` index is stable
+/// run-to-run).
+fn corlib_slice_files() -> Vec<PathBuf> {
+    let dir = beef_tests_root().join("corlib-slice");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("bf"))
+        .collect();
+    out.sort();
+    out
+}
+
 /// The four constraint-dense ratchet files, analyzed each as a one-file program,
 /// must each produce **zero** constraint diagnostics. CT-T1 emits none (the pass
 /// is a no-op classifier), so this is trivially true now — but the pins are
@@ -197,5 +268,92 @@ fn violate_struct_constraint_diagnoses_once() {
         diags.len(),
         1,
         "violate_struct_constraint.bf must emit exactly one constraint diagnostic, got: {diags:?}"
+    );
+}
+
+// ── CT-T4: the multi-file ratchet-safety pin (configuration-dependence guard) ─
+//
+// The four `constraint_diags == 0` pins above analyze each constraint-dense file
+// STANDALONE (the per-file ratchet `tests/corpus.rs` uses). Under that
+// configuration the corlib interfaces `Constraints.bf` references —
+// `IHashable` (`corlib-slice/IHashable.bf`), `IDisposable`
+// (`corlib-slice/System.bf`) — are in SEPARATE files, so they are UNRESOLVABLE →
+// the GC-T3 instantiation check SKIPS those clauses (the
+// any-base-unresolvable ⇒ Skip rule, §3.2).
+//
+// CT-T4 is the MULTI-FILE pin (generic-constraints.md §3.3/§6.7, R1): it
+// co-analyzes the corlib-slice files TOGETHER WITH `Constraints.bf` in ONE
+// `analyze` call, so those interfaces become IN-PROGRAM and RESOLVABLE — at which
+// point GC-T3's transitive implements/base walk ACTUALLY RUNS on
+// `where K : IHashable` (`Constraints.bf:43`) instead of skipping it. The pin
+// asserts STILL ZERO constraint diagnostics: this is the configuration-dependence
+// guard — even with the iface/base resolvable, the conservative GC-T3 check must
+// not false-positive (a `where`-clause whose bound is now resolvable in a
+// multi-file config must still be seen as satisfied/skipped, never violated).
+//
+// This is the load-bearing assertion of the task: the per-file ratchet CANNOT
+// exercise it (it deliberately keeps corlib out of scope), so without this pin a
+// GC-T3 instantiation-check false positive on a now-resolvable constraint would
+// go undetected until a real driver build co-analyzed corlib + the feature suite.
+
+/// ★ CT-T4 ★ — co-analyze the WHOLE corlib slice (defining `IHashable`,
+/// `IDisposable`, `IEnumerator`, `Dictionary`, the value/primitive types, …)
+/// TOGETHER WITH `Constraints.bf` in ONE `analyze` call. The merged def graph
+/// makes `Constraints.bf`'s referenced interfaces RESOLVABLE, so GC-T3's
+/// instantiation check runs on them — and must STILL emit ZERO constraint
+/// diagnostics. The configuration-dependence guard (R1).
+#[test]
+fn corlib_slice_plus_constraints_bf_zero_constraint_diags() {
+    let mut paths = corlib_slice_files();
+    paths.push(beef_tests_root().join("feature-suite/src/Constraints.bf"));
+    let diags = constraint_diags_multi(&paths);
+    assert!(
+        diags.is_empty(),
+        "co-analyzing corlib-slice + Constraints.bf (the multi-file config where \
+         IHashable/IDisposable become in-program and RESOLVABLE) must STILL emit \
+         zero constraint diagnostics — the configuration-dependence guard. got: {diags:?}"
+    );
+}
+
+/// CT-T4 companion — co-analyze the corlib slice with `Generics.bf` too (its
+/// `where T : IDisposable` clauses at `:101/113/119` become resolvable once
+/// `System.bf`'s `IDisposable` is in-program). Still ZERO constraint diagnostics:
+/// the multi-file guard holds for the other corlib-iface-dependent ratchet file
+/// as well, not just `Constraints.bf`.
+#[test]
+fn corlib_slice_plus_generics_bf_zero_constraint_diags() {
+    let mut paths = corlib_slice_files();
+    paths.push(beef_tests_root().join("feature-suite/src/Generics.bf"));
+    let diags = constraint_diags_multi(&paths);
+    assert!(
+        diags.is_empty(),
+        "co-analyzing corlib-slice + Generics.bf (where IDisposable becomes \
+         in-program and RESOLVABLE) must STILL emit zero constraint diagnostics — \
+         the configuration-dependence guard. got: {diags:?}"
+    );
+}
+
+/// CT-T4 — co-analyze the corlib slice with ALL FOUR constraint-dense ratchet
+/// files at once (the maximal driver-build-shaped configuration: every corlib
+/// type AND every feature-suite constraint clause in one merged program). The
+/// strongest form of the guard — every resolvable bound across all four files is
+/// validated by GC-T3 simultaneously, and the count must STILL be zero.
+#[test]
+fn corlib_slice_plus_all_ratchet_files_zero_constraint_diags() {
+    let mut paths = corlib_slice_files();
+    for name in [
+        "Constraints.bf",
+        "Generics.bf",
+        "Generics2.bf",
+        "Interfaces.bf",
+    ] {
+        paths.push(beef_tests_root().join("feature-suite/src").join(name));
+    }
+    let diags = constraint_diags_multi(&paths);
+    assert!(
+        diags.is_empty(),
+        "co-analyzing corlib-slice + all four constraint-dense ratchet files (the \
+         maximal multi-file config) must STILL emit zero constraint diagnostics — \
+         the configuration-dependence guard. got: {diags:?}"
     );
 }
