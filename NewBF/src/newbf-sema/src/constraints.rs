@@ -55,6 +55,7 @@
 
 use std::collections::HashMap;
 
+use newbf_lexer::Span;
 use newbf_parser::{GenericParam, Item, Member, Type, TypeDecl, WhereClause};
 
 use crate::Diagnostic;
@@ -218,11 +219,21 @@ impl TypeIndex {
     }
 }
 
+/// Per-parameter accumulator for CT-T2's clause-internal kind-contradiction
+/// check. Tracks, within ONE declaration, whether a given constrained parameter
+/// name has been seen with the bare `class` and/or `struct` keyword, plus the
+/// span to report the contradiction at (first kind-keyword clause wins).
+#[derive(Default)]
+struct ContradictionState {
+    has_class: bool,
+    has_struct: bool,
+    span: Option<Span>,
+}
+
 struct Cx<'a> {
     index: &'a TypeIndex,
-    /// CT-T1 pushes nothing; the field is here so CT-T2/CT-T3 emit through the
-    /// same context (mirroring `ownership::Cx`).
-    #[allow(dead_code)]
+    /// CT-T2 emits the clause-internal `class`∧`struct` contradiction through
+    /// this channel (mirroring `ownership::Cx`).
     diags: &'a mut Vec<Diagnostic>,
 }
 
@@ -260,25 +271,76 @@ impl Cx<'_> {
         }
     }
 
-    /// Classify every atom of every clause in `clauses`. `generic_params` is the
-    /// set of generic parameters in scope at the constrained entity (used only to
-    /// recognize the `where T : T2` type-parameter-to-type-parameter form). CT-T1
-    /// emits nothing; this just runs the classifier (the work CT-T2/CT-T3 build
-    /// on). The classified kinds are produced for their side-effect of being
-    /// fully recognized — nothing is stored yet.
+    /// Classify every atom of every clause in `clauses`, then run CT-T2's
+    /// declaration-level **clause-internal kind contradiction** check.
+    /// `generic_params` is the set of generic parameters in scope at the
+    /// constrained entity (used only to recognize the `where T : T2`
+    /// type-parameter-to-type-parameter form).
+    ///
+    /// CT-T2 (generic-constraints.md §3.2) is a purely-local, decl-internal
+    /// check: group the clauses of THIS one declaration by the constrained
+    /// parameter NAME (`WhereClause.name`), collect each parameter's classified
+    /// kinds, and emit ONE diagnostic if a parameter carries BOTH
+    /// [`ConstraintKind::Class`] AND [`ConstraintKind::Struct`] (an unsatisfiable
+    /// contradiction — no type is both a reference class and a value struct).
+    ///
+    /// **Conservative — bare keyword paths only.** Only the bare `class`/`struct`
+    /// keyword kinds participate; every other kind (including the `interface`
+    /// keyword kind, named bounds, operator/const/array/generic/primitive forms)
+    /// is ignored for this check. There is deliberately **no** "the constrained
+    /// name isn't a generic parameter" check: in Beef the constrained entity may
+    /// legitimately be a non-parameter type (e.g. `where float : operator T * T`,
+    /// where `WhereClause.name` is `float`), so such a check would fire on every
+    /// operator clause and break the ratchet (§3.2).
     fn classify_clauses(
         &mut self,
         clauses: &[WhereClause],
         generic_params: &[GenericParam],
         src: &str,
     ) {
+        // Group this decl's clauses by the constrained parameter NAME and record,
+        // per name, whether `class` and/or `struct` was seen plus the span to
+        // report against. First-seen span wins (deterministic, points at the
+        // earliest contradicting clause). Insertion order preserved so the
+        // diagnostic order is stable across runs.
+        let mut order: Vec<&str> = Vec::new();
+        let mut seen: HashMap<&str, ContradictionState> = HashMap::new();
         for clause in clauses {
+            let pname = clause.name.text(src);
             for atom in &clause.constraints {
                 // Body-first: read the atom's shape, then (only for a bare path)
                 // disambiguate via the generic-param set + the type index.
-                let _kind = classify_constraint(atom, generic_params, self.index, src);
-                // CT-T1: recognized, but NO diagnostic. CT-T2/CT-T3 act on
-                // `_kind` (and the clause name) here.
+                let kind = classify_constraint(atom, generic_params, self.index, src);
+                // CT-T2: only the bare `class`/`struct` keyword kinds matter here.
+                let (is_class, is_struct) = match kind {
+                    ConstraintKind::Class => (true, false),
+                    ConstraintKind::Struct => (false, true),
+                    _ => continue,
+                };
+                let st = seen.entry(pname).or_insert_with(|| {
+                    order.push(pname);
+                    ContradictionState::default()
+                });
+                st.has_class |= is_class;
+                st.has_struct |= is_struct;
+                // Report at the parameter-name span of the clause that first
+                // makes this name carry a kind keyword — a stable, on-the-decl
+                // location for the contradiction.
+                if st.span.is_none() {
+                    st.span = Some(clause.name);
+                }
+            }
+        }
+        for pname in order {
+            let st = &seen[pname];
+            if st.has_class && st.has_struct {
+                self.diags.push(Diagnostic {
+                    span: st.span.expect("a kind-keyword clause set the span"),
+                    message: format!(
+                        "generic parameter `{pname}` cannot be constrained as both \
+                         `class` and `struct` (unsatisfiable constraint contradiction)"
+                    ),
+                });
             }
         }
     }

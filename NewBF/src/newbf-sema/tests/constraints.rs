@@ -114,3 +114,42 @@ fn interfaces_bf_has_zero_constraint_diags() {
         "Interfaces.bf must emit zero constraint diagnostics, got: {diags:?}"
     );
 }
+
+// ── CT-T2: declaration-level `class` ∧ `struct` contradiction ───────────────
+//
+// Negative fixtures live under `tests/constraints/` (in the sema crate, NOT the
+// auto-collected `beef-tests` corpus) because they are *expected* to diagnose —
+// exactly like `tests/ownership/*.bf` for delete-flow. They are checked via a
+// direct `analyze` `constraint_diags`, never run-corpus (§3.5).
+
+/// Analyze a `tests/constraints/` fixture as its own one-file program and return
+/// only the constraint diagnostics — same filter as `constraint_diags_at`.
+fn local_constraint_diags(name: &str) -> Vec<Diagnostic> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/constraints")
+        .join(name);
+    constraint_diags_at(&path)
+}
+
+/// A parameter constrained both `class` and `struct` across one decl's clauses
+/// is an unsatisfiable contradiction → EXACTLY ONE constraint diagnostic.
+#[test]
+fn violate_decl_contradiction_diagnoses_once() {
+    let diags = local_constraint_diags("violate_decl_contradiction.bf");
+    assert_eq!(
+        diags.len(),
+        1,
+        "violate_decl_contradiction.bf must emit exactly one constraint diagnostic, got: {diags:?}"
+    );
+}
+
+/// Satisfiable single kind constraints (and `class`/`struct` on *distinct*
+/// parameters) emit ZERO constraint diagnostics — the zero-false-positive pin.
+#[test]
+fn satisfied_no_diag_emits_zero() {
+    let diags = local_constraint_diags("satisfied_no_diag.bf");
+    assert!(
+        diags.is_empty(),
+        "satisfied_no_diag.bf must emit zero constraint diagnostics, got: {diags:?}"
+    );
+}
