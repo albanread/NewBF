@@ -205,6 +205,18 @@ class String {
 		this.mPtr[this.mLength] = c;
 		this.mLength = this.mLength + 1;
 	}
+	// Append the bytes of a NUL-terminated C string (`char8*`), up to but not
+	// including the terminator — mirrors the `String(char8*)` ctor's NUL loop,
+	// delegating to Append(char8) per character so growth is handled. Selected
+	// over Append(String)/Append(char8) because `s` is a `char8*` (e.g. a string
+	// literal or `FieldInfo.GetName()`), not a String or char8.
+	public void Append(char8* s) {
+		int i = 0;
+		while (s[i] != 0) {
+			this.Append(s[i]);
+			i = i + 1;
+		}
+	}
 	// Append-overloaded by argument type: this appends a whole String by
 	// delegating to Append(char8) per character — selected over Append(char8)
 	// because `other` is a String, not a char8.
