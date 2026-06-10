@@ -531,6 +531,124 @@ fn comptime_reflect_count_zero_returns_7() {
     newbf_llvm::guard_reset();
 }
 
+// ── CR-T4: name-driven reflection-driven codegen (the name marquee) ───────────
+
+/// The CR-T4 marquee source (the run-corpus `comptime_reflect_field_name.bf`): the
+/// generator reads the FIRST FIELD'S NAME (`typeof(Tagged).GetField(0).GetName()` →
+/// `char8*`) AT COMPILE TIME and EMITS a predicate whose behavior depends on that
+/// name. Both the generator code AND the emitted runtime text BIND a `FieldInfo`
+/// local before `.GetName()` (R5 — the value-struct method-chain trap: a chained
+/// `GetField(0).GetName()` lowers the rvalue receiver to `undef`). The emitted text
+/// contains a NESTED Beef string literal (`"mX"`) the runtime `Internal.StrEq`
+/// compares the re-derived name against; `Append(char8*)` (CR-T2) splices the
+/// reflected name between the quotes. The value 1 is computable only if the sandbox
+/// saw the reflected name "mX" and the runtime-`String` `Compiler.EmitTypeBody(...)`
+/// path (CR-T0) carried the computed text out and re-resolved it.
+const REFLECT_FIELD_NAME_SRC: &str = r#"
+    [Reflect(.Fields)]
+    class Tagged {
+        public int32 mX;
+
+        [Comptime, EmitGenerator]
+        public static void Generate() {
+            String s = new String(
+                "public bool FirstFieldIsMX() { FieldInfo f = typeof(Tagged).GetField(0); return Internal.StrEq(f.GetName(), \"");
+            FieldInfo gf = typeof(Tagged).GetField(0);   // R5: bind the local
+            s.Append(gf.GetName());                      // Append(char8*) — the reflected NAME ("mX")
+            s.Append("\"); }");
+            Compiler.EmitTypeBody(s);                    // runtime String, NOT a literal
+            delete s;                                    // exactly once → no double-free
+        }
+    }
+    class Program {
+        public static int32 Main() {
+            Tagged t = new Tagged();
+            bool ok = t.FirstFieldIsMX();                // the EMITTED predicate: first field IS "mX"
+            delete t;
+            return ok ? 1 : 0;
+        }
+    }
+"#;
+
+/// **CR-T4 — the name-driven reflection-driven-codegen marquee (full frontend).**
+/// The generator reflects the first field's NAME in the emission sandbox and emits
+/// `FirstFieldIsMX()` whose runtime body binds a `FieldInfo` local, re-derives the
+/// name, and StrEqs it against the literal "mX" the generator spliced in; `Main`
+/// calls it → 1. Reflection field NAMES drive codegen: the emitted member's behavior
+/// depends on a compile-time-reflected field name. Running through `run_emission` /
+/// `OrcJit` exercises the generator under the same `GuardMode::Stomp` the run-corpus
+/// harness uses — a double-free in the generator (R10) would fault here.
+#[test]
+fn comptime_reflect_field_name_returns_1() {
+    newbf_llvm::set_guard_mode(newbf_llvm::GuardMode::Stomp);
+    let module = emit_module(REFLECT_FIELD_NAME_SRC);
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links clean");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(
+        main(),
+        1,
+        "the emitted FirstFieldIsMX() re-derives the compile-time-reflected field name → 1"
+    );
+    newbf_llvm::guard_reset();
+}
+
+/// **CR-T4 — the strip + JIT/AOT link-clean assertion for name-driven emission
+/// (R10/R7).** After emission the final module must contain the generated
+/// `Tagged.FirstFieldIsMX` but NEITHER the `[EmitGenerator]` generator NOR the
+/// `__newbf_ct_emit` shim. The corlib reflection methods the generator pulled in
+/// (`Type.GetField`, `FieldInfo.GetName`, `String.Append`) SURVIVE — they are
+/// ordinary corlib code, not `module.comptime`. Asserts the IR shape AND that the
+/// module both JIT-links and AOT-emits cleanly.
+#[test]
+fn comptime_reflect_field_name_strips_generator_and_shim_links_clean() {
+    let module = emit_module(REFLECT_FIELD_NAME_SRC);
+
+    // The generated member is present.
+    assert!(
+        module
+            .funcs
+            .iter()
+            .any(|f| f.name == "Tagged.FirstFieldIsMX"),
+        "generated member `Tagged.FirstFieldIsMX` must be present (have: {:?})",
+        module.funcs.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    // The corlib reflection API the generator reflected through survives the strip
+    // (it is ordinary corlib code, not module.comptime).
+    assert!(
+        module.funcs.iter().any(|f| f.name.contains("Type.GetField")),
+        "corlib `Type.GetField` must survive the strip"
+    );
+    assert!(
+        module
+            .funcs
+            .iter()
+            .any(|f| f.name.contains("FieldInfo.GetName")),
+        "corlib `FieldInfo.GetName` must survive the strip"
+    );
+    // The generator + shim are stripped.
+    assert!(
+        !module.funcs.iter().any(|f| f.name.contains("Generate")),
+        "the [EmitGenerator] generator must be ABSENT from the final IR"
+    );
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+        "the __newbf_ct_emit shim must be ABSENT from the final IR"
+    );
+    assert!(module.emit_jobs.is_empty(), "emit_jobs consumed");
+
+    // JIT-links clean (a surviving `__newbf_ct_emit` extern would fail lookup).
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links with no unresolved symbols");
+    assert!(
+        jit.lookup("Program.Main").is_some(),
+        "Program.Main resolves in the JIT-linked module"
+    );
+    // AOT-emits clean.
+    let obj = newbf_llvm::emit_object_to_memory(&module)
+        .expect("final module AOT-emits an object with no codegen error");
+    assert!(!obj.is_empty(), "AOT object is non-empty");
+}
+
 // ── CB-T5: fixpoint guards + diagnostics (public-API integration) ─────────────
 
 /// **Abort on generated-code analyze diagnostics (CB-T5 acceptance), full
