@@ -428,6 +428,23 @@ impl Cx<'_> {
             // exit edges, so no leak scan: a binding live across a loop iteration
             // is handled by the loop merge.)
             Stmt::Break { .. } | Stmt::Continue { .. } => false,
+            // IT-T2 (R8): a raw `yield` only reaches this walk in the brief window
+            // before `rewrite_generators` desugars the generator (the ownership
+            // pass runs in `analyze`, the rewrite later in `lower_program`), so
+            // these arms must be correct, not just present. `yield return e`
+            // *escapes* `e` into the collected list that the method returns — so
+            // flow it like a `return` value (a bare owning binding is MOVED, never
+            // a leak). Control then falls through (the generator keeps running).
+            Stmt::YieldReturn { value, .. } => {
+                self.flow_return(value, env);
+                true
+            }
+            // `yield break;` returns the accumulated list and diverges, exactly
+            // like a `return;` — scan for `Owned` survivors and stop the fall-off.
+            Stmt::YieldBreak { .. } => {
+                self.exit_scan(env);
+                false
+            }
             Stmt::Defer { body, .. } => {
                 // A deferred body runs at scope exit on an unknown ordering;
                 // walk it for in-body double-frees, then merge conservatively.
@@ -794,6 +811,9 @@ impl Cx<'_> {
             }
             Stmt::Expr { expr, .. } => self.drop_all_idents(expr, env),
             Stmt::Return { value: Some(v), .. } => self.drop_all_idents(v, env),
+            // IT-T2 (R8): a yielded expression inside a lambda body escapes via
+            // capture — drop every binding it mentions, like a `Stmt::Return`.
+            Stmt::YieldReturn { value, .. } => self.drop_all_idents(value, env),
             Stmt::Local { init: Some(i), .. } => self.drop_all_idents(i, env),
             Stmt::If { cond, then, els, .. } => {
                 self.drop_all_idents(cond, env);

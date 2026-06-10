@@ -1032,6 +1032,12 @@ fn register_tuples_in_stmt(stmt: &Stmt, src: &str, t: &mut StructTable) {
             register_tuples_in_stmt(body, src, t);
         }
         Stmt::Defer { body, .. } => register_tuples_in_stmt(body, src, t),
+        // IT-T2 (R8): `yield return e;`/`yield break;` declare no typed local and
+        // carry only an `Expr` (no `Type`), so — exactly like `Stmt::Return`,
+        // which this walker also leaves to the wildcard — there is no tuple TYPE
+        // to register. No-op. (After T3 these never reach this walk anyway, the
+        // generator body having been rewritten to `__yield.Add(e)` / `return`.)
+        Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => {}
         _ => {}
     }
 }
@@ -2215,6 +2221,15 @@ fn collect_insts_stmt<'a>(
         Stmt::Defer { body, .. } => collect_insts_stmt(
             body, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
         ),
+        // IT-T2 (R8): collect monomorph instantiations from a yielded expression
+        // (a `new List<…>()`, a generic call, etc.) exactly as `Stmt::Return`'s
+        // value is collected — so if a raw `yield return f<int32>(x)` ever reaches
+        // this walk (the brief pre-rewrite window), its `List<…>`/`f$int32`
+        // instantiations are still recorded. `yield break;` carries no expression.
+        Stmt::YieldReturn { value, .. } => collect_insts_expr(
+            value, src, generics, gmethods, t, seen, monos, env, cur_owner, locals,
+        ),
+        Stmt::YieldBreak { .. } => {}
         Stmt::For {
             init,
             init_extra,
@@ -3698,6 +3713,11 @@ fn collect_lambdas_stmt<'a>(
                 collect_lambdas_stmt(d, src, structs, emits, inline);
             }
         }
+        // IT-T2 (R8): a yielded expression's INLINE lambdas are reached by the
+        // `for_each_stmt_expr` pass just below (which now feeds `YieldReturn`'s
+        // value to `f`), exactly as `Stmt::Expr`/`Stmt::Return` rely on it. No
+        // local-init lambda can appear in a `yield` form, so this arm is a no-op.
+        Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => {}
         // A statement-scope mixin declaration (MX-T1). Its body is NOT walked
         // for lambdas/local-fns: mixin expansion is MX-T3, and a lambda inside a
         // mixin body is a GATED shape there (`has_lambda_or_localfn`, mixins.md
@@ -3798,6 +3818,12 @@ fn for_each_stmt_expr<'a>(stmt: &'a Stmt, f: &mut dyn FnMut(&'a Expr)) {
             for_each_stmt_expr(body, f);
         }
         Stmt::Defer { body, .. } => for_each_stmt_expr(body, f),
+        // IT-T2 (R8): feed the yielded expression to `f` (mirrors `Stmt::Return`'s
+        // value), so an inline lambda / generic call inside `yield return f(x =>
+        // …)` is reached by every `for_each_stmt_expr`-driven collector (e.g.
+        // inline-lambda collection). `yield break;` carries no expression.
+        Stmt::YieldReturn { value, .. } => f(value),
+        Stmt::YieldBreak { .. } => {}
         // A statement-scope mixin (MX-T1): its body's expressions are NOT fed to
         // `f`. Matches the pre-MX-T1 local mixin (`Stmt::LocalFunction`), which
         // this driver also skipped. Mixin-body walking is MX-T3. Intentional.
@@ -3989,6 +4015,9 @@ fn collect_local_fns_stmt<'a>(
         | Stmt::For { body, .. }
         | Stmt::ForEach { body, .. }
         | Stmt::Defer { body, .. } => collect_local_fns_stmt(body, src, structs, emits),
+        // IT-T2 (R8): a `yield` form carries only an expression (no statement),
+        // so it can host no local-function declaration. No-op.
+        Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => {}
         // A statement-scope mixin (MX-T1). Its body is NOT collected for local
         // functions: mixin expansion is MX-T3, where a local-fn inside a mixin
         // body is a GATED shape (`has_lambda_or_localfn`, mixins.md §6). The
@@ -4141,6 +4170,9 @@ fn collect_mixins_stmt(stmt: &Stmt, src_file: usize, src: &str, t: &mut StructTa
         | Stmt::ForEach { body, .. }
         | Stmt::Defer { body, .. } => collect_mixins_stmt(body, src_file, src, t),
         Stmt::LocalFunction { body, .. } => collect_mixins_stmt(body, src_file, src, t),
+        // IT-T2 (R8): a `yield` form carries only an expression and can host no
+        // statement-scope mixin declaration. No-op.
+        Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => {}
         _ => {}
     }
 }
@@ -5128,6 +5160,257 @@ fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
         });
     }
 }
+// ===========================================================================
+// IT-T3: eager generator rewrite (`yield return` / `yield break` → `List<E>`)
+// ===========================================================================
+//
+// A method is a *generator* iff its body contains a `yield return`/`yield break`
+// (IT-T2's AST variants). v1 materializes the WHOLE sequence eagerly into a
+// `List<E>` — no laziness, no infinite sequences (the lazy coroutine state
+// machine is explicitly deferred, iterators.md §5). The generator MUST declare a
+// `List<E>` return type so `E` is known syntactically (no inference).
+//
+// The rewrite CANNOT fabricate `Span`-backed identifiers (`__yield`, `Add`, …)
+// nor mutate the borrowed-immutable AST in place (R9). The only working
+// precedent is the comptime emission path (`newbf-comptime/src/emit.rs:429-432`):
+// build the new code as an OWNED `String`, re-parse it with a FRESH `FileId`, and
+// keep the `String` alive so the re-parsed spans stay valid. We adopt exactly
+// that, at FILE granularity: for any file containing ≥1 generator, splice the
+// desugar into the file's source text (a span-driven textual edit — every span
+// is a byte range into the file source, token.rs:33) and re-parse the whole file.
+//
+// The desugar is RECURSIVE and CONTROL-FLOW-PRESERVING (R9): a `yield` inside a
+// loop/if stays in situ — only the statement itself is rewritten, never its
+// surrounding structure.
+//   - prepend  `List<E> __yield = new List<E>();`  to the method's top-level block
+//   - `yield return e;`  →  `__yield.Add(e);`   (in situ)
+//   - `yield break;`     →  `return __yield;`    (in situ)
+//   - append   `return __yield;`  to the method's top-level block (fall-off path)
+//
+// Because the re-parsed body is ordinary source, every downstream walk
+// (collect_insts monomorph collection, tuple/lambda collection, ownership) only
+// ever sees `new List<E>()` / `__yield.Add(e)` / `return __yield` — never a raw
+// `YieldReturn`. This pass runs in `lower_program` BEFORE `StructTable::build`.
+
+/// One textual edit: replace the byte range `[lo, hi)` of the file source with
+/// `text`. An insertion is `lo == hi` (a zero-width range). Edits are collected
+/// across a whole file, sorted by `lo`, and spliced in one pass (they never
+/// overlap: yield-statement spans are disjoint, and the two block insertions sit
+/// just inside the block braces, outside every statement span).
+struct SrcEdit {
+    lo: usize,
+    hi: usize,
+    text: String,
+}
+
+/// If `ty` is a `List<E>` path type, return its verbatim source text (e.g.
+/// `List<int32>`), reused for both the `List<E> __yield` declaration and the
+/// `new List<E>()` allocation. Returns `None` for any other return type — a
+/// generator with a non-`List<E>` return is a v1 user error (the raw `yield`
+/// then survives to the lowering diagnostic arm, never a panic).
+fn generator_list_ty_text<'a>(ty: &AstType, src: &'a str) -> Option<&'a str> {
+    if let AstType::Path { segments, .. } = ty
+        && let Some(last) = segments.last()
+        && last.name.text(src) == "List"
+        && last.args.len() == 1
+    {
+        return Some(ty.span().text(src));
+    }
+    None
+}
+
+/// Recursively test whether a statement tree contains a `yield return`/`yield
+/// break` (the generator predicate). Control-flow statements are descended; an
+/// expression position cannot host a `yield` (it is a statement form), so no
+/// expression walk is needed.
+fn stmt_contains_yield(s: &Stmt) -> bool {
+    match s {
+        Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => true,
+        Stmt::Block { stmts, .. } | Stmt::Locals { decls: stmts, .. } => {
+            stmts.iter().any(stmt_contains_yield)
+        }
+        Stmt::If { then, els, .. } => {
+            stmt_contains_yield(then) || els.as_deref().is_some_and(stmt_contains_yield)
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => stmt_contains_yield(body),
+        Stmt::Switch { arms, .. } => arms
+            .iter()
+            .any(|a| a.body.iter().any(stmt_contains_yield)),
+        _ => false,
+    }
+}
+
+/// Walk a statement tree appending one [`SrcEdit`] per `yield` statement (R9 —
+/// recursive, preserving the surrounding control flow). `yield return e;` →
+/// `__yield.Add(<e-text>);` (the yielded expression's verbatim source, so a
+/// generic call / lambda inside it survives for the downstream collectors);
+/// `yield break;` → `return __yield;`. The yield *statement's own span* is what
+/// is replaced, so the enclosing loop/if is untouched.
+fn collect_yield_edits(s: &Stmt, src: &str, edits: &mut Vec<SrcEdit>) {
+    match s {
+        Stmt::YieldReturn { span, value } => {
+            let e_text = value.span().text(src);
+            edits.push(SrcEdit {
+                lo: span.lo as usize,
+                hi: span.hi as usize,
+                text: format!("__yield.Add({e_text});"),
+            });
+        }
+        Stmt::YieldBreak { span } => {
+            edits.push(SrcEdit {
+                lo: span.lo as usize,
+                hi: span.hi as usize,
+                text: "return __yield;".to_string(),
+            });
+        }
+        Stmt::Block { stmts, .. } | Stmt::Locals { decls: stmts, .. } => {
+            for st in stmts {
+                collect_yield_edits(st, src, edits);
+            }
+        }
+        Stmt::If { then, els, .. } => {
+            collect_yield_edits(then, src, edits);
+            if let Some(e) = els {
+                collect_yield_edits(e, src, edits);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. }
+        | Stmt::Defer { body, .. } => collect_yield_edits(body, src, edits),
+        Stmt::Switch { arms, .. } => {
+            for arm in arms {
+                for st in &arm.body {
+                    collect_yield_edits(st, src, edits);
+                }
+            }
+        }
+        // No other statement can lexically contain a `yield`.
+        _ => {}
+    }
+}
+
+/// Append the prologue/epilogue/yield edits for ONE generator method body to
+/// `edits`. `list_ty` is the `List<E>` source text. The body is a
+/// `MethodBody::Block(Stmt::Block { span, .. })`; the block span covers `{ … }`,
+/// so the prologue inserts just after the opening `{` (`span.lo + 1`) and the
+/// epilogue just before the closing `}` (`span.hi - 1`).
+fn collect_generator_edits(body: &MethodBody, list_ty: &str, src: &str, edits: &mut Vec<SrcEdit>) {
+    let MethodBody::Block(block @ Stmt::Block { .. }) = body else {
+        return;
+    };
+    let bspan = block.span();
+    let open = bspan.lo as usize + 1; // just past the `{`
+    let close = bspan.hi as usize - 1; // just before the `}`
+    // Prologue (top-level block only): `List<E> __yield = new List<E>();`.
+    edits.push(SrcEdit {
+        lo: open,
+        hi: open,
+        text: format!(" {list_ty} __yield = new {list_ty}(); "),
+    });
+    // In-situ yield rewrites, recursively (control flow preserved, R9).
+    collect_yield_edits(block, src, edits);
+    // Trailing fall-off return (top-level block only): the empty / no-`yield
+    // break` path returns the accumulated list.
+    edits.push(SrcEdit {
+        lo: close,
+        hi: close,
+        text: " return __yield; ".to_string(),
+    });
+}
+
+/// Apply a set of non-overlapping [`SrcEdit`]s to `src`, returning the rewritten
+/// owned source. Edits are sorted by `lo`; an insertion (`lo == hi`) at the same
+/// position as an adjacent edit keeps stable order (the two block insertions are
+/// always at distinct byte offsets from every statement span).
+fn apply_edits(src: &str, mut edits: Vec<SrcEdit>) -> String {
+    edits.sort_by_key(|e| (e.lo, e.hi));
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut cursor = 0usize;
+    for e in edits {
+        // Copy the untouched run before this edit, then the replacement.
+        if e.lo >= cursor {
+            out.push_str(&src[cursor..e.lo]);
+            out.push_str(&e.text);
+            cursor = e.hi;
+        }
+        // (Overlapping edits are impossible here — disjoint statement spans plus
+        // the two brace-adjacent insertions — so the `else` is unreachable in
+        // practice; skipping keeps us panic-free if a future caller violates it.)
+    }
+    out.push_str(&src[cursor..]);
+    out
+}
+
+/// Walk every method/ctor/dtor body under `items`, appending generator edits for
+/// each yield-bearing `List<E>`-returning method (recursing into namespaces and
+/// nested types so a generator in `Outer.Inner` is reached). A yield-bearing
+/// method whose return type is NOT `List<E>` is LEFT ALONE — its raw `yield`
+/// flows to the lowering diagnostic arm (a user error, not a panic).
+fn collect_file_generator_edits(items: &[Item], src: &str, edits: &mut Vec<SrcEdit>) {
+    for item in items {
+        match item {
+            Item::Namespace { body: Some(body), .. } => {
+                collect_file_generator_edits(body, src, edits);
+            }
+            Item::Type(td) => collect_type_generator_edits(&td.members, src, edits),
+            _ => {}
+        }
+    }
+}
+
+fn collect_type_generator_edits(members: &[Member], src: &str, edits: &mut Vec<SrcEdit>) {
+    for m in members {
+        match m {
+            Member::Method { return_ty, body, .. } => {
+                if let MethodBody::Block(b) = body
+                    && stmt_contains_yield(b)
+                    && let Some(list_ty) = generator_list_ty_text(return_ty, src)
+                {
+                    collect_generator_edits(body, list_ty, src, edits);
+                }
+            }
+            Member::Nested(td) => collect_type_generator_edits(&td.members, src, edits),
+            _ => {}
+        }
+    }
+}
+
+/// IT-T3: for each input `(src, unit)` containing ≥1 generator, return its
+/// rewritten owned source + a fresh re-parse (the comptime `emit.rs` precedent —
+/// owned `String` kept alive, fresh `FileId`). The result is keyed by the input's
+/// index so the caller can substitute the rewritten unit into the matching
+/// `SourceFile`. An input with no generator is absent from the result (the no-op
+/// fast path — non-yield code is byte-identical and untouched, so 160/160 stays
+/// unchanged). The returned `(String, CompUnit)` own all their data (no borrow of
+/// the inputs), so the caller can keep them alive as long as the `SourceFile`s
+/// that point into them.
+fn rewrite_generators(inputs: &[(&str, &CompUnit)]) -> Vec<(usize, String, CompUnit)> {
+    // Fresh FileIds for re-parsed generator files, well above the prelude band
+    // (10_000+) and the user band so spans never collide with an existing file.
+    const GENERATOR_FILE_BASE: u32 = 50_000;
+    let mut out = Vec::new();
+    for (i, (src, unit)) in inputs.iter().enumerate() {
+        let mut edits: Vec<SrcEdit> = Vec::new();
+        collect_file_generator_edits(&unit.items, src, &mut edits);
+        if edits.is_empty() {
+            continue; // no generator in this input — leave it untouched.
+        }
+        let new_src = apply_edits(src, edits);
+        let fid = FileId(GENERATOR_FILE_BASE + i as u32);
+        let (new_unit, _pdiags) = parse_file(&new_src, fid);
+        // A parse error in the desugared source would surface downstream as an
+        // ordinary diagnostic; the rewrite only inserts well-formed `List<E>`
+        // statements, so this is not expected. Keep the (owned) source + unit.
+        out.push((i, new_src, new_unit));
+    }
+    out
+}
 
 pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
     // Prepend the corlib prelude as source — parsed, then composed at the AST
@@ -5139,23 +5422,66 @@ pub fn lower_program(files: &[SourceFile<'_>], _program: &Program) -> Module {
         .enumerate()
         .map(|(i, ns)| parse_file(ns.1, FileId(10_000u32 + i as u32)).0)
         .collect();
+
+    // IT-T3: rewrite every yield-bearing `List<E>`-returning generator into an
+    // eager `List<E>`-building method BEFORE `StructTable::build`/`collect_insts`
+    // (so every downstream walk sees only `new List<E>()` / `__yield.Add(e)`,
+    // never a raw `YieldReturn`). The inputs mirror `all`'s order — prelude units
+    // first, then the user files — so a rewrite's index maps back to its slot. The
+    // owned `(String, CompUnit)` results are kept alive in `gen_rewrites` for the
+    // whole function, so the substituted `SourceFile`s' spans stay valid (R9, the
+    // comptime `emit.rs:429-432` precedent). Empty (the fast path) for every
+    // generator-free program — non-yield code is untouched, so 160/160 + the
+    // existing run-corpus are byte-identical.
+    let gen_inputs: Vec<(&str, &CompUnit)> = prelude_units
+        .iter()
+        .enumerate()
+        .map(|(i, unit)| (prelude[i].1, unit))
+        .chain(files.iter().map(|f| (f.src, f.unit)))
+        .collect();
+    let gen_rewrites = rewrite_generators(&gen_inputs);
+    // Index → position in `gen_rewrites`, so the `all`-build below can substitute
+    // the rewritten unit/source in place of the original.
+    let rewrite_at: HashMap<usize, usize> = gen_rewrites
+        .iter()
+        .enumerate()
+        .map(|(k, (idx, _, _))| (*idx, k))
+        .collect();
+
+    let prelude_count = prelude_units.len();
     let mut all: Vec<SourceFile> = prelude_units
         .iter()
         .enumerate()
-        .map(|(i, unit)| SourceFile {
-            file: FileId(10_000u32 + i as u32),
-            src: prelude[i].1,
-            unit,
-            // Corlib prelude units carry a synthetic name (their allocations are
-            // library code, not user `new`s; named-leak reporting ignores them).
-            name: prelude[i].0,
+        .map(|(i, unit)| {
+            // Substitute the rewritten (src, unit) for a generator-bearing prelude
+            // unit; otherwise the original. (The corlib has no generators today,
+            // so this is the identity in practice — but kept general.)
+            let (src, unit): (&str, &CompUnit) = match rewrite_at.get(&i) {
+                Some(&k) => (gen_rewrites[k].1.as_str(), &gen_rewrites[k].2),
+                None => (prelude[i].1, unit),
+            };
+            SourceFile {
+                file: FileId(10_000u32 + i as u32),
+                src,
+                unit,
+                // Corlib prelude units carry a synthetic name (their allocations
+                // are library code, not user `new`s; named-leak reporting ignores
+                // them).
+                name: prelude[i].0,
+            }
         })
         .collect();
-    for f in files {
+    for (j, f) in files.iter().enumerate() {
+        let idx = prelude_count + j;
+        // Substitute the rewritten (src, unit) for a generator-bearing user file.
+        let (src, unit): (&str, &CompUnit) = match rewrite_at.get(&idx) {
+            Some(&k) => (gen_rewrites[k].1.as_str(), &gen_rewrites[k].2),
+            None => (f.src, f.unit),
+        };
         all.push(SourceFile {
             file: f.file,
-            src: f.src,
-            unit: f.unit,
+            src,
+            unit,
             name: f.name,
         });
     }
@@ -7534,6 +7860,21 @@ impl<'a> Lowerer<'a> {
             // declaration produces nothing, and each `Name!(args)` call site
             // lowers via the `Expr::MixinCall` arm to the old verifiable path.
             Stmt::MixinDecl { .. } => {}
+            // IT-T2 (R8): a raw `yield` reaching lowering means the eager
+            // generator rewrite (`rewrite_generators`) did NOT consume it — i.e.
+            // a `yield` in a method whose return type is not `List<E>` (the v1
+            // generator precondition). That is a USER error, not an internal
+            // invariant, so this arm is a DIAGNOSTIC (a stderr note), never
+            // `unreachable!`/`panic!` (which would turn user input into a compiler
+            // crash and fail the "no panics" verify gate). No IR is emitted — the
+            // statement is skipped, control falls through cleanly.
+            Stmt::YieldReturn { .. } | Stmt::YieldBreak { .. } => {
+                eprintln!(
+                    "newbf: `yield` outside a `List<E>`-returning generator — a generator \
+                     must declare a `List<E>` return type for v1 eager materialization; \
+                     this `yield` is ignored"
+                );
+            }
             // local-function — not in the kernel yet. Skipped (no IR
             // emitted), never panicking.
             _ => {}
@@ -7664,6 +8005,12 @@ impl<'a> Lowerer<'a> {
                 bound.insert(name.text(src).to_string());
                 self.caps_stmt(body, src, bound, seen, caps);
             }
+            // IT-T2 (R8): a yielded expression can reference caller locals (a
+            // lambda body could contain a `yield return capturedVar`), so flow
+            // its value through capture analysis exactly as `Stmt::Return` does.
+            // `yield break;` references nothing.
+            Stmt::YieldReturn { value, .. } => self.caps_expr(value, src, bound, seen, caps),
+            Stmt::YieldBreak { .. } => {}
             // A statement-scope mixin (MX-T1). Capture analysis (for a lambda
             // closing over caller locals) does NOT descend into a mixin body:
             // a lambda inside a mixin body is GATED in MX-T3 (mixins.md §6), and

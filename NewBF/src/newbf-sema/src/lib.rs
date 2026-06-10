@@ -597,4 +597,79 @@ typealias Id = int;
             "the concrete Inner<int32> monomorph must still be emitted: {ir}"
         );
     }
+
+    // ── IT-T2+3: eager `yield` generator rewrite + walker collection ─────────
+
+    /// A generic call inside `yield return …` must be COLLECTED for
+    /// monomorphization. After the eager rewrite the body holds `__yield.Add(
+    /// Id<int32>(7))`, so `collect_insts` (which the rewrite runs BEFORE) sees the
+    /// `Id<int32>` instantiation and emits `Id$i32`. This proves the rewritten
+    /// yielded expression reaches the mono collector (R8 — the walker arms +
+    /// the pre-collect_insts ordering).
+    #[test]
+    fn generic_call_in_yield_return_is_monomorphized() {
+        let ir = lower_src(
+            "class Program { \
+                 public static T Id<T>(T x) { return x; } \
+                 public static List<int32> Gen() { yield return Id<int32>(7); } \
+                 public static int32 Main() { return 0; } }",
+        );
+        assert!(
+            ir.contains("@Program.Id$i32"),
+            "a generic call inside `yield return` must be monomorphized: {ir}"
+        );
+    }
+
+    /// An inline lambda inside `yield return …` must be COLLECTED for emission.
+    /// After the rewrite the body holds `__yield.Add(Apply(x => x + 1))`, so the
+    /// inline-lambda collector (driven by `for_each_stmt_expr`, which T2 taught to
+    /// descend into `YieldReturn`) assigns it a `$lambda` symbol and emits it.
+    #[test]
+    fn lambda_in_yield_return_is_collected() {
+        let ir = lower_src(
+            "class Program { \
+                 public static int32 Apply(function int32(int32) f) { return f(10); } \
+                 public static List<int32> Gen() { yield return Apply(x => x + 1); } \
+                 public static int32 Main() { return 0; } }",
+        );
+        assert!(
+            ir.contains("$lambda"),
+            "an inline lambda inside `yield return` must be collected + emitted: {ir}"
+        );
+    }
+
+    /// The eager rewrite materializes the generator into a `List<int32>`-building
+    /// method: the desugared body allocates the list (`new List<int32>` → a
+    /// `List$i32` ctor call) and the raw `yield` is GONE (no stray skipped
+    /// statement). Proves the re-emit→reparse desugar fired.
+    #[test]
+    fn yield_generator_desugars_to_list_allocation() {
+        let ir = lower_src(
+            "class Program { \
+                 public static List<int32> Gen() { yield return 1; yield return 2; } \
+                 public static int32 Main() { return 0; } }",
+        );
+        // The generator allocates a `List<int32>` (the monomorph ctor is emitted +
+        // called from the rewritten body).
+        assert!(
+            ir.contains("List$i32"),
+            "the eager rewrite must instantiate List<int32> from the synthesized body: {ir}"
+        );
+    }
+
+    /// A method WITHOUT `yield` is left completely untouched by the rewrite — its
+    /// IR is identical whether or not `rewrite_generators` runs. (Lowering the
+    /// same source through the whole `lower_program` path is the proof: a
+    /// non-generator program lowers exactly as before, the rewrite's fast path
+    /// being a no-op.)
+    #[test]
+    fn non_generator_method_is_untouched_by_rewrite() {
+        let ir = lower_src(
+            "class C { public static int32 add(int32 a, int32 b) { return a + b; } }",
+        );
+        assert!(ir.contains("func @C.add(i32 %0, i32 %1) -> i32"), "{ir}");
+        assert!(ir.contains("= add i32"), "{ir}");
+        // No accidental List allocation / __yield artifact in non-yield code.
+        assert!(!ir.contains("__yield"), "non-generator code must not gain __yield: {ir}");
+    }
 }

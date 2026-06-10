@@ -490,6 +490,14 @@ pub enum Stmt {
     },
     /// `return [value];`
     Return { span: Span, value: Option<Expr> },
+    /// `yield return expr;` — a generator yield (IT-T2). v1 is desugared
+    /// eagerly into a `List<E>`-building method by `rewrite_generators`
+    /// (newbf-sema, before `collect_insts`/ownership), so this variant is
+    /// inert by the time lowering runs; the lowering arm is a diagnostic.
+    YieldReturn { span: Span, value: Expr },
+    /// `yield break;` — ends a generator's sequence early (IT-T2). Desugars
+    /// to `return __yield;` in the eager rewrite.
+    YieldBreak { span: Span },
     /// `break [label];`
     Break { span: Span, label: Option<Span> },
     /// `continue [label];`
@@ -557,6 +565,8 @@ impl Stmt {
             | Stmt::For { span, .. }
             | Stmt::ForEach { span, .. }
             | Stmt::Return { span, .. }
+            | Stmt::YieldReturn { span, .. }
+            | Stmt::YieldBreak { span, .. }
             | Stmt::Break { span, .. }
             | Stmt::Continue { span, .. }
             | Stmt::Defer { span, .. }

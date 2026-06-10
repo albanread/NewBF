@@ -1350,6 +1350,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Keyword(Keyword::For) => self.for_stmt(),
             TokenKind::Keyword(Keyword::Return) => self.return_stmt(),
+            TokenKind::Keyword(Keyword::Yield) => self.yield_stmt(),
             TokenKind::Keyword(Keyword::Break) => self.break_continue(true),
             TokenKind::Keyword(Keyword::Continue) => self.break_continue(false),
             TokenKind::Keyword(Keyword::Defer) => self.defer_stmt(),
@@ -2064,6 +2065,34 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::Semicolon, "`;` after return");
         Stmt::Return {
+            span: self.finish(lo),
+            value,
+        }
+    }
+
+    /// `yield return <expr>;` / `yield break;` (IT-T2). `yield` is a reserved
+    /// keyword (`token.rs`), but had no `stmt()` arm before this, so `yield x`
+    /// previously mis-parsed as a bogus expression statement. The two forms are
+    /// the only ones Beef permits: `yield return e;` produces a `YieldReturn`,
+    /// `yield break;` produces a `YieldBreak`. The eager-materialization rewrite
+    /// (`rewrite_generators`, newbf-sema) desugars these before lowering.
+    fn yield_stmt(&mut self) -> Stmt {
+        let lo = self.start();
+        self.bump(); // yield
+        if self.at_kw(Keyword::Break) {
+            self.bump(); // break
+            self.expect(TokenKind::Semicolon, "`;` after `yield break`");
+            return Stmt::YieldBreak {
+                span: self.finish(lo),
+            };
+        }
+        // `yield return <expr>;` — `return` is required (Beef has no bare
+        // `yield e;`). If it's absent, still consume an expression for recovery
+        // so a malformed `yield` doesn't cascade.
+        self.expect(TokenKind::Keyword(Keyword::Return), "`return` or `break` after `yield`");
+        let value = self.expr();
+        self.expect(TokenKind::Semicolon, "`;` after `yield return <expr>`");
+        Stmt::YieldReturn {
             span: self.finish(lo),
             value,
         }

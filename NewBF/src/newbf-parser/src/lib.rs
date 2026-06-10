@@ -336,6 +336,8 @@ mod tests {
                 Some(e) => format!("(return {})", sx(src, e)),
                 None => "(return)".into(),
             },
+            Stmt::YieldReturn { value, .. } => format!("(yield-return {})", sx(src, value)),
+            Stmt::YieldBreak { .. } => "(yield-break)".into(),
             Stmt::Break { .. } => "(break)".into(),
             Stmt::Continue { .. } => "(continue)".into(),
             Stmt::Defer { body, .. } => format!("(defer {})", sxs(src, body)),
@@ -603,6 +605,24 @@ mod tests {
         );
         assert_eq!(ok_stmt("defer delete x;"), "(defer (expr (delete x)))");
         assert_eq!(ok_stmt(";"), "empty");
+    }
+
+    /// IT-T2: `yield return e;` / `yield break;` parse into the new `YieldReturn`/
+    /// `YieldBreak` AST variants (before this, `yield` had no `stmt()` arm and
+    /// mis-parsed as a bogus expression statement). A `yield return` inside a loop
+    /// keeps its surrounding control flow — the rewrite (IT-T3) relies on that.
+    #[test]
+    fn yield_statements() {
+        assert_eq!(ok_stmt("yield return 1;"), "(yield-return 1)");
+        assert_eq!(ok_stmt("yield return a + b;"), "(yield-return (+ a b))");
+        assert_eq!(ok_stmt("yield return f(x);"), "(yield-return (call f x))");
+        assert_eq!(ok_stmt("yield break;"), "(yield-break)");
+        // In situ inside a loop + an `if` — the control flow is preserved in the
+        // parse tree (the foreach/if survive, the yields are nested).
+        assert_eq!(
+            ok_stmt("for (var i in xs) { if (i > 2) yield break; yield return i; }"),
+            "(foreach i xs (block (if (> i 2) (yield-break)) (yield-return i)))"
+        );
     }
 
     #[test]

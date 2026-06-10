@@ -850,6 +850,11 @@ impl Printer<'_> {
                     self.expr(e, d + 1);
                 }
             }
+            Stmt::YieldReturn { value, .. } => {
+                self.line(d, "YieldReturn");
+                self.expr(value, d + 1);
+            }
+            Stmt::YieldBreak { .. } => self.line(d, "YieldBreak"),
             Stmt::Break { label, .. } => match label {
                 Some(s) => self.line(d, &format!("Break {}", self.txt(*s))),
                 None => self.line(d, "Break"),
