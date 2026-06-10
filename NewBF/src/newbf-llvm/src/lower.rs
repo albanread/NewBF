@@ -2152,6 +2152,89 @@ mod tests {
         );
     }
 
+    /// CA-T5 ptrtoint-of-cstr emission pin (the one genuinely new ABI decision,
+    /// custom-attributes.md §2.4): a string attribute arg is emitted as a
+    /// `ptrtoint`/`const_to_int` of the `.rodata` cstr global into the uniform
+    /// `[n x i64]` arg array — the i64 slot holds the char8* address, which
+    /// `AttributeInfo.GetStrArg` `inttoptr`s back. This pins the constant-
+    /// expression emit shape deterministically (non-JIT): the `.attrargs` `[1 x
+    /// i64]` global's initializer is a `ptrtoint (... .str.meta* ... to i64)`
+    /// over the emitted cstr. An int arg, by contrast, is a plain i64 literal.
+    #[test]
+    fn emit_metadata_string_attr_arg_is_ptrtoint_of_cstr() {
+        use newbf_ir::{
+            AttrMeta, Const, FieldDef, IrType, ReflectPolicy, StructDef, TypeMeta, VtableDef,
+        };
+
+        let mut m = IrModule::new("t");
+        // The annotated type `Widget` + the attribute class `Named` (id 1).
+        let widget = m.add_struct(StructDef {
+            name: "Widget".into(),
+            fields: vec![FieldDef { name: "$header".into(), ty: IrType::Ptr }],
+        });
+        let named = m.add_struct(StructDef {
+            name: "Named".into(),
+            fields: vec![FieldDef { name: "$header".into(), ty: IrType::Ptr }],
+        });
+        m.add_vtable(VtableDef { name: "Widget.$cvdata".into(), entries: vec![], type_id: 0 });
+        m.add_vtable(VtableDef { name: "Named.$cvdata".into(), entries: vec![], type_id: 1 });
+
+        // `Widget` carries one attribute (Named, dense id 1) with a SINGLE string
+        // arg "hi" — `attr_arg_const` folds the literal to `Const::Str` (CA-T1),
+        // and CA-T4's emit must lower it to a `ptrtoint` of the `.str.meta` cstr.
+        let mut widget_tm = TypeMeta::new(
+            0,
+            widget,
+            "Widget".into(),
+            ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            true,
+            vec![],
+            vec![],
+        );
+        widget_tm.attributes = vec![AttrMeta {
+            attr_type_id: 1,
+            args: vec![Const::Str("hi".into())],
+        }];
+        m.add_type_meta(widget_tm);
+        m.add_type_meta(TypeMeta::new(
+            1,
+            named,
+            "Named".into(),
+            ReflectPolicy::TYPE,
+            true,
+            vec![],
+            vec![],
+        ));
+
+        verify_module(&m).expect("string-arg attribute metadata module verifies");
+        let ir = lower_to_string(&m);
+
+        // The string arg lands in a `[1 x i64]` `.attrargs` global whose single
+        // slot is a `ptrtoint` constant expression over the emitted `.str.meta`
+        // cstr — NOT a runtime cast, NOT a plain integer literal. (LLVM prints the
+        // constant expr as `ptrtoint (ptr @.str.meta... to i64)`.)
+        assert!(
+            ir.contains("@.attrargs = private constant [1 x i64]"),
+            "a single string arg emits a [1 x i64] .attrargs global:\n{ir}"
+        );
+        assert!(
+            ir.contains("ptrtoint") && ir.contains(".str.meta"),
+            "the i64 slot for a string arg is a ptrtoint of the .rodata cstr:\n{ir}"
+        );
+        // The "hi" bytes are present in a private cstr (the .rodata pointer the
+        // ptrtoint targets): `[3 x i8] c"hi\00"`.
+        assert!(
+            ir.contains("c\"hi\\00\""),
+            "the string arg's \"hi\" cstr is emitted in .rodata:\n{ir}"
+        );
+        // And the AttributeInfo array itself is non-null (argCount 1, the slot a
+        // ptr to the `.attrargs` array).
+        assert!(
+            ir.contains("%struct.AttributeInfo") && ir.contains("@.attrinfo"),
+            "a string-arg attribute still emits the %struct.AttributeInfo array:\n{ir}"
+        );
+    }
+
     /// MS-T7: `Module::alloc_sites` lowers to the `__newbf_alloc_sites` table the
     /// runtime guard registers — `%struct.AllocSite = { ptr function, ptr file,
     /// i32 line }`, a constant array of those, plus an `i32` count. The runtime's
