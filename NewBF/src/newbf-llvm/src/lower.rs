@@ -538,6 +538,79 @@ impl<'ctx> Codegen<'ctx, '_> {
                 (ptr_ty.const_null(), 0)
             };
 
+            // CA-T4: the policy-gated `[k x %struct.AttributeInfo]` array (the
+            // exact FieldInfo model above). `tm.attributes` is ALREADY FIELDS-
+            // gated by sema (CA-T3 only pushes an `AttrMeta` when the type carries
+            // the FIELDS bit), so an empty vec == no attributes == null/0 here —
+            // no extra policy check needed, and the strip differential
+            // (GetCustomAttributeCount == 0 for an unmarked type) falls out for
+            // free. For each `AttrMeta`: emit its uniform `[n x i64]` arg array
+            // (the §2.4 encoding), then an `%AttributeInfo { attrTypeId, argCount,
+            // args }` const; collect into one private `[k x %AttributeInfo]`
+            // global and point `mAttributes` at it.
+            let i64_ty = self.ctx.i64_type();
+            let (attrs_ptr, attr_count) = if !tm.attributes.is_empty() {
+                let infos: Vec<_> = tm
+                    .attributes
+                    .iter()
+                    .map(|a| {
+                        // The uniform `[n x i64]` arg array (custom-attributes.md
+                        // §2.4): int/bool widen to i64; a string slot is the
+                        // `.rodata` cstr pointer `ptrtoint`'d into the i64 slot
+                        // (GetStrArg `inttoptr`s it back). The collector
+                        // (`attr_arg_const`) only ever produces Int/Bool/Str, so
+                        // any other Const variant is `unreachable!`.
+                        let (args_ptr, arg_count) = if a.args.is_empty() {
+                            (ptr_ty.const_null(), 0u32)
+                        } else {
+                            let slots: Vec<IntValue<'ctx>> = a
+                                .args
+                                .iter()
+                                .map(|c| match c {
+                                    // Sign-extended for ints (the value as i128 →
+                                    // the low 64 bits, sign-correct for i64).
+                                    Const::Int(v, _) => {
+                                        i64_ty.const_int(*v as u64, true)
+                                    }
+                                    Const::Bool(b) => {
+                                        i64_ty.const_int(u64::from(*b), false)
+                                    }
+                                    // The char8* `.rodata` pointer, `ptrtoint`'d
+                                    // (a constant expression) into the i64 slot.
+                                    Const::Str(s) => {
+                                        self.emit_cstr(s).const_to_int(i64_ty)
+                                    }
+                                    other => unreachable!(
+                                        "attr arg must be Int/Bool/Str (collector \
+                                         drops the rest); got {other:?}"
+                                    ),
+                                })
+                                .collect();
+                            let arr = i64_ty.const_array(&slots);
+                            let g =
+                                self.module.add_global(arr.get_type(), None, ".attrargs");
+                            g.set_initializer(&arr);
+                            g.set_constant(true);
+                            g.set_linkage(inkwell::module::Linkage::Private);
+                            (g.as_pointer_value(), slots.len() as u32)
+                        };
+                        attribute_ty.const_named_struct(&[
+                            i32_ty.const_int(u64::from(a.attr_type_id), false).into(),
+                            i32_ty.const_int(u64::from(arg_count), false).into(),
+                            args_ptr.into(),
+                        ])
+                    })
+                    .collect();
+                let arr = attribute_ty.const_array(&infos);
+                let g = self.module.add_global(arr.get_type(), None, ".attrinfo");
+                g.set_initializer(&arr);
+                g.set_constant(true);
+                g.set_linkage(inkwell::module::Linkage::Private);
+                (g.as_pointer_value(), infos.len() as u32)
+            } else {
+                (ptr_ty.const_null(), 0)
+            };
+
             // mFlags: bit0 = is_ref (class). (Reserved for richer flags later.)
             let flags = u64::from(tm.is_ref);
             let init = type_ty.const_named_struct(&[
@@ -549,10 +622,12 @@ impl<'ctx> Codegen<'ctx, '_> {
                 name_ptr.into(),
                 fields_ptr.into(),
                 methods_ptr.into(),
-                // mAttrCount / mAttributes — null/0 in CA-T2 (no attribute data
-                // emitted yet; CA-T4 populates these from `tm.attributes`).
-                i32_ty.const_zero().into(),
-                ptr_ty.const_null().into(),
+                // mAttrCount / mAttributes — CA-T4 fills the fields CA-T2 left
+                // null/0: the attribute count + a pointer to the `[k x
+                // %AttributeInfo]` array above (null + 0 when `tm.attributes` is
+                // empty / the type is unmarked — the strip differential).
+                i32_ty.const_int(u64::from(attr_count), false).into(),
+                attrs_ptr.into(),
             ]);
             // The global name is keyed by the struct PREFIX (== sema's
             // `type_global_name`); recover it from the ClassVData name we emitted
@@ -1993,6 +2068,87 @@ mod tests {
         assert!(
             !ir2.contains("@.fieldinfo"),
             "an unmarked-only module emits no FieldInfo array global (strip):\n{ir2}"
+        );
+    }
+
+    /// CA-T4 strip differential (the deterministic, non-JIT detector, mirroring
+    /// `emit_metadata_strips_fields_unless_marked`): a type carrying a populated
+    /// `attributes` vec emits a non-null `%struct.AttributeInfo` array (`.attrinfo`
+    /// global) and a non-zero `mAttrCount`; a type with empty `attributes` emits NO
+    /// array (its `mAttributes` is null, `mAttrCount` 0). `tm.attributes` is already
+    /// FIELDS-gated by sema (CA-T3), so "empty vec" is exactly the unmarked/stripped
+    /// case — proving CA-T4 fills the CA-T2 fields and the strip is observable in the
+    /// emitted IR, independent of running the JIT.
+    #[test]
+    fn emit_metadata_fills_attributes_when_present() {
+        use newbf_ir::{AttrMeta, FieldDef, ReflectPolicy, StructDef, TypeMeta, VtableDef};
+
+        let mut m = IrModule::new("t");
+        // Two classes: the annotated type `Marked`, and the attribute class
+        // `MyAttr` (a class, so it has a dense type-id — id 1 here).
+        let marked = m.add_struct(StructDef {
+            name: "Marked".into(),
+            fields: vec![FieldDef { name: "$header".into(), ty: IrType::Ptr }],
+        });
+        let myattr = m.add_struct(StructDef {
+            name: "MyAttr".into(),
+            fields: vec![FieldDef { name: "$header".into(), ty: IrType::Ptr }],
+        });
+        m.add_vtable(VtableDef { name: "Marked.$cvdata".into(), entries: vec![], type_id: 0 });
+        m.add_vtable(VtableDef { name: "MyAttr.$cvdata".into(), entries: vec![], type_id: 1 });
+
+        // `Marked` carries one attribute (MyAttr, dense id 1) with no args — the
+        // canonical CA-T4 shape. `MyAttr` carries none (empty attributes).
+        let mut marked_tm = TypeMeta::new(
+            0,
+            marked,
+            "Marked".into(),
+            ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            true,
+            vec![],
+            vec![],
+        );
+        marked_tm.attributes = vec![AttrMeta { attr_type_id: 1, args: vec![] }];
+        m.add_type_meta(marked_tm);
+        m.add_type_meta(TypeMeta::new(
+            1,
+            myattr,
+            "MyAttr".into(),
+            ReflectPolicy::TYPE,
+            true,
+            vec![],
+            vec![],
+        ));
+
+        verify_module(&m).expect("attribute metadata module verifies");
+        let ir = lower_to_string(&m);
+        // The marked type emits a `%struct.AttributeInfo` array global.
+        assert!(
+            ir.contains("%struct.AttributeInfo") && ir.contains("@.attrinfo"),
+            "a type with attributes emits a %struct.AttributeInfo array:\n{ir}"
+        );
+
+        // The clean strip side: a module whose types ALL have empty `attributes`
+        // emits NO `%struct.AttributeInfo` array global (`mAttributes` null).
+        let mut m2 = IrModule::new("t2");
+        let only = m2.add_struct(StructDef {
+            name: "Plain".into(),
+            fields: vec![FieldDef { name: "$header".into(), ty: IrType::Ptr }],
+        });
+        m2.add_vtable(VtableDef { name: "Plain.$cvdata".into(), entries: vec![], type_id: 0 });
+        m2.add_type_meta(TypeMeta::new(
+            0,
+            only,
+            "Plain".into(),
+            ReflectPolicy(ReflectPolicy::TYPE.0 | ReflectPolicy::FIELDS.0),
+            true,
+            vec![],
+            vec![], // no attributes ⇒ mAttributes null, no .attrinfo global
+        ));
+        let ir2 = lower_to_string(&m2);
+        assert!(
+            !ir2.contains("@.attrinfo"),
+            "a module with no attributes emits no AttributeInfo array global:\n{ir2}"
         );
     }
 
