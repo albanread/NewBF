@@ -14530,14 +14530,17 @@ mod tests {
         );
     }
 
-    /// RF-T4: the corlib `Type` value-`struct`'s lowered layout MUST be
+    /// RF-T4 / CA-T2: the corlib `Type` value-`struct`'s lowered layout MUST be
     /// ABI-identical to the `%struct.Type` aggregate `emit_metadata` writes:
-    ///   { i32, i32, i32, i32, i32, ptr, ptr, ptr }
-    ///   = { mSize, mTypeId, mFlags, mFieldCount, mMethodCount, mName, mFields, mMethods }
+    ///   { i32, i32, i32, i32, i32, ptr, ptr, ptr, i32, ptr }
+    ///   = { mSize, mTypeId, mFlags, mFieldCount, mMethodCount, mName, mFields,
+    ///       mMethods, mAttrCount, mAttributes }
+    /// CA-T2 APPENDED `mAttrCount`@8 + `mAttributes`@9 (custom attributes) — the
+    /// existing field indices (mFieldCount@3, mFields@6, mMethods@7) are STABLE.
     /// As a `struct` (not a class) `Type` carries NO `$header`, so its field
     /// order starts at index 0 and matches the headerless emitted constant — the
     /// §4.5 off-by-one hazard is eliminated. If this drifts, `typeof(T).Field`
-    /// reads the wrong offset.
+    /// reads the wrong offset (the verify-clean-but-wrong slot-shift detector).
     #[test]
     fn corlib_type_layout_matches_struct_type_aggregate() {
         let src = "class Program { public static int32 Main() { return 0; } }";
@@ -14559,7 +14562,8 @@ mod tests {
 
         // The exact field IR types `emit_metadata`'s `%struct.Type` uses, in
         // order. A value struct has NO `$header`, so field 0 is `mSize`.
-        let expected: [IrType; 8] = [
+        // CA-T2 appended mAttrCount@8 + mAttributes@9 (10 fields total).
+        let expected: [IrType; 10] = [
             IrType::I32, // mSize
             IrType::I32, // mTypeId
             IrType::I32, // mFlags
@@ -14568,6 +14572,8 @@ mod tests {
             IrType::Ptr, // mName : char8*
             IrType::Ptr, // mFields : %FieldInfo*
             IrType::Ptr, // mMethods : %MethodInfo*
+            IrType::I32, // mAttrCount
+            IrType::Ptr, // mAttributes : %AttributeInfo*
         ];
         assert_eq!(
             ty.fields.len(),
@@ -14695,6 +14701,63 @@ mod tests {
         assert_ne!(
             mi.fields[0].name, "$header",
             "corlib `MethodInfo` must be a value struct (no $header), else field indices shift"
+        );
+    }
+
+    /// CA-T2: the corlib `AttributeInfo` value-`struct`'s lowered layout MUST be
+    /// ABI-identical to the `%struct.AttributeInfo` aggregate `emit_metadata`
+    /// writes:
+    ///   { i32, i32, ptr } = { mAttrTypeId, mArgCount, mArgs(i64*) }
+    /// As a `struct` (not a class) `AttributeInfo` carries NO `$header`, so field
+    /// 0 is `mAttrTypeId` and the struct's ABI size (16 bytes: i32+i32=8 + ptr=8)
+    /// matches the array element the backend packs (CA-T4) — so
+    /// `Type.mAttributes[i]` (an `AttributeInfo*` index) strides correctly over
+    /// the emitted `[k x %AttributeInfo]` array. If this drifts,
+    /// `typeof(T).GetCustomAttribute(i)` reads the wrong entry — the AttributeInfo
+    /// slot-shift detector (symmetric with the FieldInfo/MethodInfo layout pins).
+    #[test]
+    fn corlib_attributeinfo_layout_matches_struct_attributeinfo_aggregate() {
+        let src = "class Program { public static int32 Main() { return 0; } }";
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile { file: FileId(0), src, unit: &unit, name: "" }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        // The corlib `AttributeInfo` struct (registered by the prelude).
+        let ai = module
+            .structs
+            .iter()
+            .find(|s| s.name == "AttributeInfo" || s.name.ends_with(".AttributeInfo"))
+            .unwrap_or_else(|| panic!(
+                "corlib `AttributeInfo` struct present (have: {:?})",
+                module.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+            ));
+
+        // The exact field IR types `emit_metadata`'s `%struct.AttributeInfo` uses,
+        // in order. A value struct has NO `$header`, so field 0 is `mAttrTypeId`.
+        let expected: [IrType; 3] = [
+            IrType::I32, // mAttrTypeId
+            IrType::I32, // mArgCount
+            IrType::Ptr, // mArgs : int64*
+        ];
+        assert_eq!(
+            ai.fields.len(),
+            expected.len(),
+            "corlib `AttributeInfo` field count must match %struct.AttributeInfo (no $header): got {:?}",
+            ai.fields.iter().map(|f| (&f.name, f.ty)).collect::<Vec<_>>()
+        );
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                ai.fields[i].ty, *want,
+                "corlib `AttributeInfo` field {} ({}) IR type must match %struct.AttributeInfo",
+                i, ai.fields[i].name
+            );
+        }
+        // The first field must NOT be a `$header` (the value-struct guarantee).
+        assert_ne!(
+            ai.fields[0].name, "$header",
+            "corlib `AttributeInfo` must be a value struct (no $header), else field indices shift"
         );
     }
 

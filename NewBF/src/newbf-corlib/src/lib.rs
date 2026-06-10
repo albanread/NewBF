@@ -26,6 +26,16 @@ pub fn prelude() -> &'static [(&'static str, &'static str)] {
         // value `struct` whose layout mirrors the emitted `%struct.MethodInfo`.
         // `Type.mMethods` is `MethodInfo*`, so it must register BEFORE `Type.bf`.
         ("MethodInfo.bf", include_str!("../bf/MethodInfo.bf")),
+        // System.Reflection.AttributeInfo — a reflected custom attribute's
+        // metadata (CA-T2). A value `struct` whose layout mirrors the emitted
+        // `%struct.AttributeInfo` ({i32, i32, ptr}). `Type.mAttributes` is
+        // `AttributeInfo*`, so it MUST register BEFORE `Type.bf`.
+        ("AttributeInfo.bf", include_str!("../bf/AttributeInfo.bf")),
+        // System.Attribute — the conventional base class for user attribute types
+        // (CA-T2). An empty `class` (NOT a struct — must resolve to `IrType::Ref`
+        // for a `: Attribute` base clause to be recorded). No corlib dependents,
+        // so order is free; placed here before any user code.
+        ("Attribute.bf", include_str!("../bf/Attribute.bf")),
         // System.Type — the reflection metatype (RF-T4). A value `struct` whose
         // layout mirrors the emitted `%struct.Type`; uses `char8*` + `FieldInfo`
         // + `MethodInfo`, so it lands after Internal/String/FieldInfo/MethodInfo

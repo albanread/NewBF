@@ -403,7 +403,13 @@ impl<'ctx> Codegen<'ctx, '_> {
         // 1. The metadata aggregate types. `%struct.Type` field order MUST match
         //    corlib `Type.bf` (the layout unit test pins this):
         //      { mSize, mTypeId, mFlags, mFieldCount, mMethodCount,
-        //        mName(ptr), mFields(ptr), mMethods(ptr) }
+        //        mName(ptr), mFields(ptr), mMethods(ptr),
+        //        mAttrCount(i32), mAttributes(ptr) }
+        // CA-T2 APPENDS `mAttrCount`@8 + `mAttributes`@9 — existing field indices
+        // (mFieldCount@3, mFields@6, mMethods@7) stay stable. `mAttributes` is
+        // null everywhere in CA-T2 (no attribute data emitted yet; CA-T4 fills
+        // it). All THREE %struct.Type sites (set_body, per-type init, sentinel)
+        // move atomically or LLVM rejects the module.
         let type_ty = self.ctx.opaque_struct_type("struct.Type");
         type_ty.set_body(
             &[
@@ -415,6 +421,8 @@ impl<'ctx> Codegen<'ctx, '_> {
                 ptr_ty.into(), // mName : char8*
                 ptr_ty.into(), // mFields : %FieldInfo*
                 ptr_ty.into(), // mMethods : %MethodInfo*
+                i32_ty.into(), // mAttrCount
+                ptr_ty.into(), // mAttributes : %AttributeInfo*
             ],
             false,
         );
@@ -424,6 +432,13 @@ impl<'ctx> Codegen<'ctx, '_> {
         // %struct.MethodInfo = { name(char8*), symbol(char8*), paramCount(i32) }
         let method_ty = self.ctx.opaque_struct_type("struct.MethodInfo");
         method_ty.set_body(&[ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false);
+        // %struct.AttributeInfo = { attrTypeId(i32), argCount(i32), args(i64*) }
+        // The args pointer is the uniform `[n x i64]` arg array (custom-
+        // attributes.md §2.4); defined here so corlib `AttributeInfo.bf` has a
+        // matching ABI. CA-T4 emits actual instances — CA-T2 only DEFINES the
+        // type (no instances built; `mAttributes` is null everywhere).
+        let attribute_ty = self.ctx.opaque_struct_type("struct.AttributeInfo");
+        attribute_ty.set_body(&[i32_ty.into(), i32_ty.into(), ptr_ty.into()], false);
 
         // A dense type-id → struct-id map so a FieldInfo's `typeId` can name the
         // field type's own reflection id (0 when the field type isn't reflected).
@@ -534,6 +549,10 @@ impl<'ctx> Codegen<'ctx, '_> {
                 name_ptr.into(),
                 fields_ptr.into(),
                 methods_ptr.into(),
+                // mAttrCount / mAttributes — null/0 in CA-T2 (no attribute data
+                // emitted yet; CA-T4 populates these from `tm.attributes`).
+                i32_ty.const_zero().into(),
+                ptr_ty.const_null().into(),
             ]);
             // The global name is keyed by the struct PREFIX (== sema's
             // `type_global_name`); recover it from the ClassVData name we emitted
@@ -564,6 +583,8 @@ impl<'ctx> Codegen<'ctx, '_> {
             unknown_name.into(),
             ptr_ty.const_null().into(),
             ptr_ty.const_null().into(),
+            i32_ty.const_zero().into(),  // mAttrCount = 0
+            ptr_ty.const_null().into(),  // mAttributes = null
         ]);
         let unknown = self
             .module

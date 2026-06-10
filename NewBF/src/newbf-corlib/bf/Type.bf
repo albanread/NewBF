@@ -6,8 +6,9 @@
 // backend emits (`emit_metadata`). As a `struct`, its lowered layout has no
 // `$header`, so its field order is BYTE-IDENTICAL to the emitted aggregate:
 //
-//   %struct.Type = type { i32, i32, i32, i32, i32, ptr, ptr, ptr }
+//   %struct.Type = type { i32, i32, i32, i32, i32, ptr, ptr, ptr, i32, ptr }
 //   ;             mSize mTypeId mFlags mFieldCount mMethodCount mName mFields mMethods
+//   ;                                          mAttrCount(i32) mAttributes(AttributeInfo*)
 //
 // `typeof(T)` returns `Ref(Type)` — a pointer to the per-type `%struct.Type`
 // constant the backend emits — and these accessors `field_addr` through it. The
@@ -35,6 +36,12 @@ struct Type {
 	char8* mName;
 	FieldInfo* mFields;
 	MethodInfo* mMethods;
+	// Custom attributes (CA-T2). APPENDED at indices 8/9 — existing field indices
+	// (mFieldCount@3, mFields@6, mMethods@7) are unchanged. `mAttributes` is null
+	// and `mAttrCount` 0 everywhere in CA-T2 (no attribute data emitted yet;
+	// CA-T4 populates them from the policy-gated `[k x %AttributeInfo]` array).
+	int32 mAttrCount;
+	AttributeInfo* mAttributes;
 
 	// The type's simple name (a NUL-terminated `char8*` into .rodata). Compare
 	// it with `Internal.StrEq` (a char8*-vs-char8* compare), not String.Equals.
@@ -80,5 +87,29 @@ struct Type {
 		if (i < 0) { return empty; }
 		if (i >= this.mMethodCount) { return empty; }
 		return this.mMethods[i];
+	}
+
+	// The number of custom attributes surfaced on this type (CA-T2). 0 unless the
+	// type is [Reflect]-marked (the FIELDS policy gates attribute surfacing in
+	// v1); 0 everywhere in CA-T2 (no attribute data emitted yet — CA-T4 fills it,
+	// so this observes the strip differential exactly like GetFieldCount).
+	public int32 GetCustomAttributeCount() { return this.mAttrCount; }
+
+	// The i-th custom attribute's metadata (CA-T2 — symmetric with GetField).
+	// Indexes the policy-gated `[k x %AttributeInfo]` array `mAttributes` points
+	// at; `mAttributes[i]` strides by AttributeInfo's ABI size. For an
+	// out-of-range `i` (i < 0 or i >= count) or a stripped/unmarked type
+	// (`mAttributes == null`), returns a sentinel/empty AttributeInfo
+	// (mAttrTypeId -1, no args) rather than dereferencing out of bounds — never
+	// faults.
+	public AttributeInfo GetCustomAttribute(int32 i) {
+		AttributeInfo empty;
+		empty.mAttrTypeId = -1;
+		empty.mArgCount = 0;
+		empty.mArgs = null;
+		if (this.mAttributes == null) { return empty; }
+		if (i < 0) { return empty; }
+		if (i >= this.mAttrCount) { return empty; }
+		return this.mAttributes[i];
 	}
 }
