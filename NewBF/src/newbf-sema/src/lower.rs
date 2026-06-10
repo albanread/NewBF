@@ -18,8 +18,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use newbf_ir::{
-    AllocSite, BinOp as IrBin, BlockId, CastKind, CmpPred, Const, EmitJob, FieldDef, FieldMeta,
-    Function, FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam,
+    AllocSite, AttrMeta, BinOp as IrBin, BlockId, CastKind, CmpPred, Const, EmitJob, FieldDef,
+    FieldMeta, Function, FunctionBuilder, GlobalDef, IrType, MethodMeta, Module, Param as IrParam,
     ReflectPolicy, StructDef, StructId, TypeMeta, Value, VtableDef,
 };
 use newbf_lexer::{FileId, Span};
@@ -5074,6 +5074,27 @@ fn explicit_param_count(sig: &MethodSig) -> u32 {
 /// policy is observable in `type_meta` (and downstream emission) without the
 /// backend re-deriving it. The synthetic `$header` field (a class's offset-0
 /// `ClassVData*`) is never recorded — only user-declared fields are reflected.
+///
+/// **CA-T3 custom attributes**: each reflectable type's RAW collected
+/// `type_attr_data` (CA-T1: simple-name + folded args) is resolved + densified
+/// into `TypeMeta.attributes` here — gated by the same FIELDS bit (v1 piggybacks
+/// it, custom-attributes.md §3.2). Each raw attribute's `name` resolves via
+/// `by_name` → `StructId` → `type_id_of` → the dense `attr_type_id`. Built-in
+/// markers (no backing class), unresolved names, and value-`struct` attributes
+/// (no dense id — v1 class-only) are skipped. Behavior-preserving in CA-T3:
+/// populated but NOT emitted (CA-T4 emits the `%struct.AttributeInfo` table).
+const ATTR_BUILTIN_MARKERS: &[&str] = &[
+    // The compiler-recognized marker attributes — short-form spellings with no
+    // backing class (custom-attributes.md §3.2 Seam 3 step 1). Skipping them is
+    // defense-in-depth: they would already fail the `by_name` lookup below.
+    "Reflect",
+    "AlwaysInclude",
+    "Comptime",
+    "EmitGenerator",
+    "Intrinsic",
+    "LinkName",
+];
+
 fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
     // 1. Collect the reflectable ids (every `Ref`), then sort by mangled name
     //    (the per-id prefix) so the dense ids are deterministic and stable.
@@ -5146,6 +5167,34 @@ fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
             Vec::new()
         };
 
+        // Custom attributes (CA-T3) — policy-gated by the SAME FIELDS bit (v1
+        // piggybacks it, custom-attributes.md §3.2). For each raw attribute
+        // (CA-T1's `type_attr_data`): skip built-in markers, resolve the simple
+        // name `by_name → StructId → type_id_of → dense attr_type_id`, then push
+        // an `AttrMeta` carrying that dense id + the folded args. Skipped:
+        //   - built-in markers (no backing class);
+        //   - unresolved names (an undeclared attr / a typo — v1 tolerates,
+        //     lowering has no diagnostic sink);
+        //   - value-`struct` attributes (not in `type_id_of`, which only holds
+        //     `StructKind::Ref` classes — the v1 class-only constraint, §1/§8).
+        // Order is preserved (the source order of the brackets).
+        let attributes: Vec<AttrMeta> = if policy.has(ReflectPolicy::FIELDS) {
+            structs.type_attr_data[i]
+                .iter()
+                .filter(|raw| !ATTR_BUILTIN_MARKERS.contains(&raw.name.as_str()))
+                .filter_map(|raw| {
+                    let attr_struct_id = *structs.by_name.get(&raw.name)?;
+                    let attr_type_id = *type_id_of.get(&attr_struct_id)?;
+                    Some(AttrMeta {
+                        attr_type_id,
+                        args: raw.args.clone(),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         m.add_type_meta(TypeMeta {
             type_id,
             struct_id: *id,
@@ -5154,9 +5203,11 @@ fn assign_type_ids_and_meta(structs: &StructTable, m: &mut Module) {
             is_ref: true,
             fields,
             methods,
-            // CA-T0: default-empty custom-attribute slot. CA-T3 resolves +
-            // densifies the collected `type_attr_data` into this vec here.
-            attributes: vec![],
+            // CA-T3: the resolved + densified custom-attribute metadata. Empty
+            // unless the FIELDS policy gates it in (and every raw attribute
+            // resolved to a reflectable class). NOT emitted yet — CA-T4 lowers
+            // this into the `%struct.AttributeInfo` table.
+            attributes,
         });
     }
 }
@@ -14875,6 +14926,95 @@ mod tests {
             marked.type_id,
             unmarked.type_id
         );
+    }
+
+    /// CA-T3: `assign_type_ids_and_meta` resolves each reflectable type's RAW
+    /// `type_attr_data` (CA-T1: simple-name + folded args) into `TypeMeta.attributes`
+    /// — built-in markers (`Reflect`) skipped, user CLASS attrs resolved to their
+    /// dense `attr_type_id`, ctor args carried through, and the whole thing gated by
+    /// the FIELDS policy (unmarked ⇒ empty). Behavior-preserving: populated, not yet
+    /// emitted (CA-T4 lowers the `%struct.AttributeInfo` table).
+    #[test]
+    fn custom_attributes_resolve_into_type_meta() {
+        let src = r#"
+            class MyAttr { }
+            class Priority { public this(int32 p) { } }
+            [Reflect, MyAttr, Priority(42)]
+            class C { public int32 mX; }
+                     [MyAttr]
+            class Unmarked { public int32 mX; }
+            class Program { public static int32 Main() { return 0; } }
+        "#;
+        let (unit, pd) = parse_file(src, FileId(0));
+        assert!(pd.is_empty(), "parse diagnostics: {pd:?}");
+        let files = [SourceFile {
+            file: FileId(0),
+            src,
+            unit: &unit,
+            name: "",
+        }];
+        let program = crate::analyze(&files);
+        let module = lower_program(&files, &program);
+
+        let find = |name: &str| -> &TypeMeta {
+            module
+                .type_meta
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "type_meta entry for {name} (have: {:?})",
+                        module.type_meta.iter().map(|t| &t.name).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        // The dense ids of the two user attribute CLASSES — both are
+        // `StructKind::Ref`, so both are in `type_id_of`.
+        let my_attr_id = find("MyAttr").type_id;
+        let priority_id = find("Priority").type_id;
+
+        // The marked type `C` records its attributes: `Reflect` SKIPPED (built-in
+        // marker, no backing class), `MyAttr` resolved to its dense id (no args),
+        // `Priority(42)` resolved with the folded `Int(42, I64)` ctor arg carried
+        // through — IN SOURCE ORDER.
+        let c = find("C");
+        assert!(
+            c.policy.has(ReflectPolicy::FIELDS),
+            "C is [Reflect]-marked (FIELDS policy gates attributes in)"
+        );
+        assert_eq!(
+            c.attributes,
+            vec![
+                AttrMeta {
+                    attr_type_id: my_attr_id,
+                    args: vec![],
+                },
+                AttrMeta {
+                    attr_type_id: priority_id,
+                    args: vec![Const::Int(42, IrType::I64)],
+                },
+            ],
+            "C: Reflect skipped; MyAttr + Priority(42) resolved with args carried"
+        );
+
+        // An UNMARKED class (no FIELDS policy) strips its attributes — the same
+        // gating as fields/methods.
+        let unmarked = find("Unmarked");
+        assert_eq!(
+            unmarked.policy,
+            ReflectPolicy::TYPE,
+            "Unmarked gets the default (TYPE) policy — no FIELDS bit"
+        );
+        assert!(
+            unmarked.attributes.is_empty(),
+            "Unmarked's attributes are policy-gated empty (the strip differential)"
+        );
+
+        // The attribute classes themselves carry no attributes (they are unmarked,
+        // and they have none anyway).
+        assert!(find("MyAttr").attributes.is_empty());
+        assert!(find("Priority").attributes.is_empty());
     }
 
     /// RF-T4 / CA-T2: the corlib `Type` value-`struct`'s lowered layout MUST be
