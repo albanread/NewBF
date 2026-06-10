@@ -1,5 +1,11 @@
 # Custom Attributes — User Attribute Types, Queryable via Reflection
 
+> **Status: v1 LANDED (wave 3).** User attribute types `[MyAttr(args)] class` are
+> recorded in the metadata; `typeof(T).GetCustomAttribute(i)` round-trips the dense
+> type-id + reads scalar args (`attr_present_typeid.bf → 1`, `attr_int_arg.bf → 42`,
+> `attr_str_arg.bf → 1`). v1 defers value-struct attribute types + comptime-attribute
+> composition.
+
 *Wave-3 design. Companion to [`reflection.md`](reflection.md) (the metadata
 pipeline this rides on), [`comptime-breadth.md`](comptime-breadth.md) (the
 deferred comptime-reflection composition), and

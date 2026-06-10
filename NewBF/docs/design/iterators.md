@@ -1,5 +1,13 @@
 # Iterators — `foreach` over user types + a restricted `yield`
 
+> **Status: v1 LANDED (wave 3).** `foreach` over a user type via
+> `GetEnumerator()`/`MoveNext`/`Current`/`Dispose` (`foreach_getenumerator.bf → 60`,
+> `foreach_dispose_once.bf → 1`) + **eager** `yield return`/`yield break`
+> (`yield_eager_basic.bf → 6`, `yield_break.bf → 3`, `yield_empty.bf → 0`) ship. The
+> loop IR shape is pinned in the verify corpus by
+> `beef-tests/feature-suite/src/ForeachEnumerator.bf`. v1 `yield` is eager (List<E>
+> materialization); the lazy coroutine state-machine is deferred (§5).
+
 ## 1. Overview
 
 NewBF's `foreach` today is **structural duck-typing on hard-coded method names**: the

@@ -628,8 +628,14 @@ pinned by run-corpus coverage.
   resolves either way).
 - **Per-module vs whole-program registry**: v1 emits one registry per module (single-module
   programs); cross-module merging is an AOT-phase (Phase 11) concern.
-- **Comptime reflection** (`[Comptime] typeof(T).GetFields()`): requires the comptime callback to
-  reach metadata; deferred to comptime-breadth (§2.5c). Out of v1 scope.
+- **Comptime reflection** (`[Comptime] typeof(T).GetFields()`): **v1 landed (fields)** — a
+  `[Comptime, EmitGenerator]` generator can now read `typeof(T).GetFieldCount()` /
+  `typeof(T).GetField(i).GetName()` in the emission sandbox (the sandbox clone's `emit_metadata`
+  already builds the metadata) and emit a member built from it, via the runtime-`String`
+  `EmitTypeBody` path. No comptime callback was needed — the generator reads reflection through the
+  *emitted* corlib `.bf` API in the sandbox, the same surface runtime code uses. Methods/attributes
+  at comptime, generic-`T` reflection, and field-*value* reads stay deferred. See
+  [`comptime-reflection.md`](comptime-reflection.md) and [`../COMPTIME.md` §3.5](../COMPTIME.md).
 - **Attribute args beyond enum flags** (string/typeof args, general `AttributeInfo` table): deferred —
   v1 evaluates only `[Reflect(flags)]`/`[AlwaysInclude]`.
 

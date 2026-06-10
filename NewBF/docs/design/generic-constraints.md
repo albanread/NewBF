@@ -1,5 +1,10 @@
 # Generic Constraints — `where`-clause Enforcement + Constrained-`T` Operations — Design
 
+> **Status: v1 LANDED (wave 3).** `where T : class/struct/IFace/BaseClass` violation
+> diagnostics (the `Use<int32>` check) + the decl-internal `class ∧ struct`
+> contradiction ship with zero false positives. v1 defers operator/const/delete/
+> array/pointer/generic-interface/`T:T2`/`new` enforcement (see §scope below).
+
 ## 1. Overview
 
 NewBF fully **parses** every Beef `where`-clause form and **captures** each as a

@@ -260,6 +260,111 @@ guarantee** (A emits B, B re-emits B-identical → no new unit → fixpoint).
   dispatches `a.Speak()` through the vtable to the emitted override (42), not
   Animal's body (7). Proves emitted virtuals participate in dynamic dispatch.
 
+### 3.5 Comptime reflection (v1) — reflection-driven codegen
+
+Wave-3 lifts the emission path one step further: a `[Comptime, EmitGenerator]`
+generator can now **reflect over a type at compile time** — read `typeof(T)`'s
+field metadata inside the sandbox — and emit a member built from what it read. This
+turns the emitter from "splice a fixed string" into "splice a string *computed* from
+the reflected shape of the type." Design rationale and the full risk analysis live
+in [`docs/design/comptime-reflection.md`](design/comptime-reflection.md); this
+section is the developer-facing description of what shipped.
+
+**The enabling insight.** The emission sandbox JIT **already contains the full
+reflection metadata**, because the *same* `emit_module` builds it for every module —
+including the sandbox clone `run_generators` hands to `OrcJit::from_ir`. `emit_module`
+calls `emit_metadata` **unconditionally**, so the sandbox holds every `%struct.Type`
+global, the `__newbf_type_table`, the `__newbf_type_unknown` sentinel, and the
+in-module `__newbf_type_by_id` accessor (a pure in-module LLVM function — **no host
+symbol to bind**). So the sandbox can already *run* `typeof(T)` (a constant
+`GlobalAddr`) and the `Type`/`FieldInfo` query methods (ordinary corlib Beef). The
+**only** thing that was blocking reflection-driven codegen was that the
+`EmitTypeBody` seam demanded a *string literal*. v1 = relax that one wall.
+
+**The runtime-`String` `EmitTypeBody` path** (`try_lower_emit_type_body`,
+`newbf-sema/src/lower.rs`). The seam now accepts **two** text-argument shapes for the
+single `Compiler.EmitTypeBody(text)` argument:
+
+- **Literal fast path (unchanged, back-compat).** `Expr::Str(s)` → a static `.rodata`
+  `Const::Str` + a compile-time `text.len()` literal, decided from the AST *before*
+  any emission (so no double-evaluation), byte-identical to CB-T3. The whole existing
+  literal corpus (e.g. `comptime_emit_member.bf → 42`) is untouched.
+- **Runtime `Ref(String)` path (new).** Any expression that lowers to `Ref(String)`
+  is lowered **exactly once** to a `Value`; its bytes are then obtained by calling its
+  `Ptr()` (→ `char8*`) and `Length()` (→ `int` = i64) methods **via the methods-table
+  lookup** (the `append_to_string` pattern), with the length narrowed to `i32` via
+  `coerce(I64, I32)` — *not* a direct `field_addr`, because `String` is a class whose
+  field 0 is the `%ClassVData` header (reading `mPtr`/`mLength` by index is off-by-one
+  and layout-fragile). The result feeds `__newbf_ct_emit(<owner-id literal>, ptr, len)`
+  — the same length-based shim, which never cared whether the text was literal.
+
+Single-evaluation is load-bearing: the arg is lowered once and `Ptr()`/`Length()` are
+emitted as direct `fb.call`s on the already-lowered `Value`, never by re-passing the
+`Expr` through `lower_method_call` (which would re-lower the receiver and double-emit
+any side-effecting builder). **Anything that is neither a literal nor a `Ref(String)`
+is a real user error**, not a silent decline: the seam emits an `__newbf_ct_emit_error`
+diagnostic marker (carrying the message, surfaced into `EmitOutcome.diagnostics` if the
+generator runs) and recovers — it must not `return None` after lowering (the
+fall-through would re-lower → double-emit) and must not let the arg resolve against the
+empty `Compiler.EmitTypeBody(String)` stub (the emission would silently vanish).
+
+**The value-struct method-chain caveat.** `typeof(T)` is a `Ref(Type)` rvalue, so
+`typeof(T).GetFieldCount()` resolves directly. But `GetField(i)` returns a value-struct
+`FieldInfo` **by value** (an `IrType::Struct` rvalue that `struct_base` rejects), so you
+may **not** chain `typeof(T).GetField(0).GetName()` — you must bind a `FieldInfo` local
+first (`FieldInfo f = typeof(T).GetField(0); f.GetName()`), in both the generator code
+*and* the emitted runtime text.
+
+**`sema ⊥ llvm` is preserved.** This adds no new IR, no new ABI, no new metadata, and no
+metadata-reading Rust code in sema. The generator reads reflection *through the emitted
+corlib `.bf` API in the sandbox* — the **same** surface ordinary runtime code uses — not
+through a host shim. The only thing the host shim (`__newbf_ct_emit`) carries is the
+emitted text bytes, unchanged.
+
+**Worked examples** (run-corpus, JIT full-i32 under the Stomp guard). All three pin
+reflection reaching the *emission sandbox*; the existing `reflect_field_*.bf` programs
+prove the same metadata in the *app* JIT.
+
+- **`comptime_reflect_field_count.bf`** (expect: **2**) — the marquee. A
+  `[Reflect(.Fields)]` class `Pair { mA; mB; }` has a generator that reads
+  `int n = typeof(Pair).GetFieldCount();` (widened to `int`/i64 so `s.Append(int)` is
+  the unambiguous decimal overload, not a tying `Append(char8)`), builds
+  `"public int32 FieldCount() { return 2; }"` in a `String`, and emits it. `2` is
+  computable only if the generator saw the two reflected fields and emitted a member
+  that re-resolves (spliced as `extension Pair { … }`, re-analyzed, re-lowered) and runs.
+- **`comptime_reflect_count_zero.bf`** (expect: **7**) — the strip differential. An
+  **unmarked** `Plain { mA; mB; }` (no `[Reflect(.Fields)]`) has its FieldInfo array
+  stripped, so `typeof(Plain).GetFieldCount()` reflects **0** — yet the `%struct.Type`
+  global still exists (only the FieldInfo array is policy-gated), so the read returns a
+  real `0`, not a fault. The generator emits a member returning `0 + 7 = 7`, proving
+  the generator observes the *policy-gated* metadata at comptime (a marked type would
+  emit a different constant).
+- **`comptime_reflect_field_name.bf`** (expect: **1**) — name-driven emission. A
+  `[Reflect(.Fields)] Tagged { mX; }` generator reads the first field's *name*
+  (`FieldInfo gf = typeof(Tagged).GetField(0); gf.GetName()` → a `char8*`) and emits a
+  predicate `FirstFieldIsMX()` that **binds its own `FieldInfo` local**, re-derives the
+  same name at runtime, and `Internal.StrEq`s it against the `"mX"` literal the
+  generator read at compile time. Uses the `String.Append(char8*)` overload for the
+  reflected name; proves `GetField(i).GetName()` flows through the sandbox into emitted
+  code (with the value-struct local-binding discipline on both sides).
+
+**Memory under the guard.** Each generator's `new String` *object body* routes through
+`newbf_alloc` → the Stomp ledger *during compilation* (the run-corpus harness runs the
+whole pipeline, sandbox generators included, under `GuardMode::Stomp`). The acceptance
+property is **`delete s` exactly once → no double-free** (a double-free faults the
+compiler; a pure leak is tolerated — run-corpus never calls `report_leaks`). The
+String's `char8*` buffer uses CRT `malloc`/`free` and is not guard-tracked. The strip
+keeps the shared corlib `Type`/`FieldInfo`/`String` methods (they are not
+`module.comptime`) while dropping the generator + `__newbf_ct_emit`, so the final
+app/AOT module links clean.
+
+**v1 boundary — FIELDS only.** Methods (`typeof(T).GetMethod(i)`) and attribute
+reflection at comptime, generic-`T`-param reflection (a generator inside `List<T>`
+reflecting `typeof(T)` — the generic-comptime guard stays), reading field *values* by
+offset, and reflecting over members emitted *this round* are all deferred (see
+comptime-reflection.md §5). Reflection stays strictly on the `run_generators`
+void+shim path — never on the value-fold path (`eval_const` rejects struct returns).
+
 ---
 
 ## 4. The `__newbf_ct_emit` FFI shim and the strip
@@ -460,6 +565,9 @@ design doc §9/§10.
 - Emitted methods (including `virtual` overrides) and fields that read pre-existing
   members; emitted members participate in vtables exactly like hand-written ones.
 - The strip that makes the final module JIT-link and AOT-link clean.
+- **Comptime reflection (fields)** — a generator may read `typeof(T).GetFieldCount()` /
+  `typeof(T).GetField(i).GetName()` in the sandbox and emit a member built from it, via
+  the runtime-`String` `EmitTypeBody` path ([§3.5](#35-comptime-reflection-v1--reflection-driven-codegen)).
 
 **Deferred (out of v1):**
 
@@ -470,10 +578,14 @@ design doc §9/§10.
   miscompile. Revisited independently (JITLink / a float-constant materialization
   pass).
 - **`Ptr`/`Ref`/`Struct` const-eval** — no heap-value marshalling; typed `Err`.
-- **A reflection FFI table / `[Comptime] typeof(T)` / `Type` / `StringView`** — none
-  of these lower in the emission path today. The v1 emit surface is
-  **primitives-only**: the owner id is *injected by sema* as a literal, not read
-  from a `Type`. `typeof` parses but is not lowered.
+- **Comptime reflection beyond fields** — `typeof(T)` and field metadata
+  (`GetFieldCount`/`GetField(i).GetName()`) now lower in the emission sandbox
+  ([§3.5](#35-comptime-reflection-v1--reflection-driven-codegen)), but **methods**
+  (`GetMethod(i)`) and **attribute** reflection at comptime, generic-`T`-param
+  reflection (the generic-comptime guard stays), and field-*value* reads by offset are
+  deferred. The owner id the `__newbf_ct_emit` shim carries is still *injected by sema*
+  as a literal, not read from a `Type`. Reflection stays on the `run_generators`
+  void+shim path, never on the value-fold path.
 - **Generic emit generators** — the generic-comptime guard (`lower.rs`) keeps them
   rejected.
 - **`EmitAddInterface` / `EmitMixin`** — adding an interface via emission (itable
@@ -505,5 +617,8 @@ design doc §9/§10.
 | Corlib emit surface | `src/newbf-corlib/bf/Compiler.bf` |
 | Driver wiring (`dump-ir`/`dump-llvm`/`compile`) | `src/newbf-driver/src/main.rs` |
 | Authoritative run-corpus gate | `tests/newbf-tests/tests/run_corpus.rs` |
-| Worked-example programs | `beef-tests/run-corpus/comptime_*.bf` |
+| Comptime-reflection emit seam (runtime-`String` `EmitTypeBody`) | `src/newbf-sema/src/lower.rs` (`try_lower_emit_type_body`) |
+| Reflection metadata built for every module incl. sandbox | `src/newbf-llvm/src/lower.rs` (`emit_metadata`) |
+| Worked-example programs | `beef-tests/run-corpus/comptime_*.bf` (incl. `comptime_reflect_*.bf`) |
 | Design doc (rationale, alternatives, risks) | [`docs/design/comptime-breadth.md`](design/comptime-breadth.md) |
+| Design doc (comptime reflection) | [`docs/design/comptime-reflection.md`](design/comptime-reflection.md) |
