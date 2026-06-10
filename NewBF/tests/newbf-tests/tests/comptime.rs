@@ -382,6 +382,155 @@ fn comptime_emit_dead_member_still_links() {
     assert_eq!(main(), 7);
 }
 
+// ── CR-T3: reflection-driven codegen (the comptime-reflection marquee) ────────
+
+/// The CR-T3 marquee source (the run-corpus `comptime_reflect_field_count.bf`):
+/// the generator reads `typeof(Pair).GetFieldCount()` AT COMPILE TIME and emits a
+/// member whose body returns that count. The emitted `FieldCount()`'s return value
+/// is itself a compile-time reflection read — reflection drives code generation.
+const REFLECT_FIELD_COUNT_SRC: &str = r#"
+    [Reflect(.Fields)]
+    class Pair {
+        public int32 mA;
+        public int32 mB;
+
+        [Comptime, EmitGenerator]
+        public static void Generate() {
+            int n = typeof(Pair).GetFieldCount();      // 2 (widened to int = i64)
+            String s = new String("public int32 FieldCount() { return ");
+            s.Append(n);                               // "...return 2" (Append(int), decimal)
+            s.Append("; }");
+            Compiler.EmitTypeBody(s);                  // runtime String, NOT a literal
+            delete s;                                  // exactly once → no double-free
+        }
+    }
+    class Program {
+        public static int32 Main() {
+            Pair p = new Pair();
+            int32 r = p.FieldCount();                  // the EMITTED member returns 2
+            delete p;
+            return r;
+        }
+    }
+"#;
+
+/// **CR-T3 — the reflection-driven-codegen marquee (full frontend).** The
+/// generator reflects `typeof(Pair).GetFieldCount()` in the emission sandbox and
+/// emits `FieldCount() { return 2; }`; `Main` calls it → 2. The value is
+/// computable only if the sandbox saw the two reflected fields AND the runtime-
+/// `String` `Compiler.EmitTypeBody(...)` path (CR-T0) carried the computed text out
+/// and re-resolved it as `extension Pair { … }`. Running through `run_emission` /
+/// `OrcJit` exercises the generator under the same `GuardMode::Stomp` the
+/// run-corpus harness uses — a double-free in the generator (R10) would fault here.
+#[test]
+fn comptime_reflect_field_count_returns_2() {
+    newbf_llvm::set_guard_mode(newbf_llvm::GuardMode::Stomp);
+    let module = emit_module(REFLECT_FIELD_COUNT_SRC);
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links clean");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(
+        main(),
+        2,
+        "the emitted FieldCount() returns the compile-time-reflected field count"
+    );
+    newbf_llvm::guard_reset();
+}
+
+/// **CR-T3 — the strip + JIT/AOT link-clean assertion for reflection-driven
+/// emission (R10/R7).** After emission the final module must contain the generated
+/// `Pair.FieldCount` but NEITHER the `[EmitGenerator]` generator NOR the
+/// `__newbf_ct_emit` shim (the app/run JIT and the AOT link do NOT register the
+/// shim, so a survivor would fail link). The corlib reflection methods the
+/// generator pulled in (`Type.GetFieldCount`, …) SURVIVE — they are ordinary corlib
+/// code, not `module.comptime`. Asserts the IR shape AND that the module both
+/// JIT-links and AOT-emits cleanly.
+#[test]
+fn comptime_reflect_field_count_strips_generator_and_shim_links_clean() {
+    let module = emit_module(REFLECT_FIELD_COUNT_SRC);
+
+    // The generated member is present.
+    assert!(
+        module.funcs.iter().any(|f| f.name == "Pair.FieldCount"),
+        "generated member `Pair.FieldCount` must be present (have: {:?})",
+        module.funcs.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    // The corlib reflection API the generator reflected through survives the strip
+    // (it is ordinary corlib code, not module.comptime).
+    assert!(
+        module
+            .funcs
+            .iter()
+            .any(|f| f.name.contains("Type.GetFieldCount")),
+        "corlib `Type.GetFieldCount` must survive the strip"
+    );
+    // The generator + shim are stripped.
+    assert!(
+        !module.funcs.iter().any(|f| f.name.contains("Generate")),
+        "the [EmitGenerator] generator must be ABSENT from the final IR"
+    );
+    assert!(
+        !module.funcs.iter().any(|f| f.name == "__newbf_ct_emit"),
+        "the __newbf_ct_emit shim must be ABSENT from the final IR"
+    );
+    assert!(module.emit_jobs.is_empty(), "emit_jobs consumed");
+
+    // JIT-links clean (a surviving `__newbf_ct_emit` extern would fail lookup).
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links with no unresolved symbols");
+    assert!(
+        jit.lookup("Program.Main").is_some(),
+        "Program.Main resolves in the JIT-linked module"
+    );
+    // AOT-emits clean.
+    let obj = newbf_llvm::emit_object_to_memory(&module)
+        .expect("final module AOT-emits an object with no codegen error");
+    assert!(!obj.is_empty(), "AOT object is non-empty");
+}
+
+/// **CR-T3 — the strip differential at comptime (R10).** An UNMARKED type reflects
+/// `GetFieldCount() == 0` (the `%struct.Type` global still exists, only the
+/// FieldInfo array is policy-gated), so the generator emits `Code() { return 7; }`
+/// (0 + 7). Mirrors the run-corpus `comptime_reflect_count_zero.bf`; proves the
+/// generator observes the policy-gated metadata at comptime (a marked type emits a
+/// different constant).
+#[test]
+fn comptime_reflect_count_zero_returns_7() {
+    let src = r#"
+        class Plain {
+            public int32 mA;
+            public int32 mB;
+            [Comptime, EmitGenerator]
+            public static void Generate() {
+                int n = typeof(Plain).GetFieldCount();   // 0 (stripped; Type global present)
+                String s = new String("public int32 Code() { return ");
+                s.Append(n + 7);                         // (i64) 0 + 7 = 7 → Append(int)
+                s.Append("; }");
+                Compiler.EmitTypeBody(s);
+                delete s;                                // exactly once
+            }
+        }
+        class Program {
+            public static int32 Main() {
+                Plain p = new Plain();
+                int32 r = p.Code();
+                delete p;
+                return r;
+            }
+        }
+    "#;
+    newbf_llvm::set_guard_mode(newbf_llvm::GuardMode::Stomp);
+    let module = emit_module(src);
+    let jit = OrcJit::from_ir(&module).expect("final module JIT-links clean");
+    let addr = jit.lookup("Program.Main").expect("Program.Main resolves");
+    let main: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+    assert_eq!(
+        main(),
+        7,
+        "an unmarked type reflects field count 0 at comptime → emitted Code() returns 0 + 7 = 7"
+    );
+    newbf_llvm::guard_reset();
+}
+
 // ── CB-T5: fixpoint guards + diagnostics (public-API integration) ─────────────
 
 /// **Abort on generated-code analyze diagnostics (CB-T5 acceptance), full
